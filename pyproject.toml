@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "US Equities News Intelligence & Trading Signal System"
+requires-python = ">=3.11"
+
+dependencies = [
+    # Kafka / Redpanda
+    "confluent-kafka>=2.3.0",
+
+    # Database
+    "sqlalchemy[asyncio]>=2.0.0",
+    "alembic>=1.13.0",
+    "asyncpg>=0.29.0",
+    "psycopg2-binary>=2.9.0",
+
+    # Redis
+    "redis[asyncio]>=5.0.0",
+
+    # HTTP
+    "aiohttp>=3.9.0",
+    "httpx>=0.26.0",
+
+    # Data validation
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+
+    # Environment
+    "python-dotenv>=1.0.0",
+
+    # Logging
+    "structlog>=24.1.0",
+
+    # Observability
+    "prometheus-client>=0.19.0",
+
+    # Anthropic API
+    "anthropic>=0.23.0",
+
+    # Polygon
+    "polygon-api-client>=1.13.0",
+    "websocket-client>=1.7.0",
+
+    # MinIO
+    "minio>=7.2.0",
+
+    # Date/time
+    "python-dateutil>=2.8.0",
+    "pytz>=2024.1",
+    "zoneinfo; python_version < '3.9'",
+
+    # Utilities
+    "tenacity>=8.2.0",       # Retry logic
+    "click>=8.1.0",          # CLI scripts
+    "rich>=13.7.0",          # Pretty terminal output
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "httpx>=0.26.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+trading-connector = "app.cli:connector"
+trading-check = "app.cli:check"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

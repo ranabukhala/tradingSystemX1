@@ -1,0 +1,69 @@
+# ─────────────────────────────────────────────
+#  Default ticker watchlist for price connector
+#  One ticker per line. # = comment. Blank lines ignored.
+#  Polygon WebSocket subscribes to A.TICKER for each.
+# ─────────────────────────────────────────────
+
+# ── Mega Cap Tech ──────────────────────────────
+AAPL
+MSFT
+NVDA
+GOOGL
+GOOG
+META
+AMZN
+TSLA
+AVGO
+ORCL
+
+# ── ETFs (indices) ─────────────────────────────
+SPY
+QQQ
+IWM
+DIA
+VIX
+
+# ── High-volume / high-news tickers ───────────
+AMD
+INTC
+NFLX
+CRM
+SHOP
+SNAP
+UBER
+LYFT
+COIN
+MSTR
+
+# ── Financials ────────────────────────────────
+JPM
+GS
+MS
+BAC
+C
+WFC
+V
+MA
+
+# ── Healthcare / Biotech ──────────────────────
+JNJ
+LLY
+PFE
+MRNA
+BNTX
+ABBV
+
+# ── Energy ────────────────────────────────────
+XOM
+CVX
+OXY
+SLB
+
+# ── Consumer ──────────────────────────────────
+COST
+WMT
+TGT
+HD
+NKE
+
+# ── Add your own below ────────────────────────

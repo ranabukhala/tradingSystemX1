@@ -1,0 +1,83 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: 'local'
+    system: 'trading'
+
+scrape_configs:
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'redpanda'
+    static_configs:
+      - targets: ['redpanda:9644']
+
+  # Python connectors — addressed by Docker service name inside trading_net
+  - job_name: 'connector_benzinga'
+    static_configs:
+      - targets: ['connector_benzinga:8001']
+        labels:
+          connector: 'benzinga'
+
+  - job_name: 'connector_polygon_news'
+    static_configs:
+      - targets: ['connector_polygon_news:8002']
+        labels:
+          connector: 'polygon_news'
+
+  - job_name: 'connector_polygon_prices'
+    static_configs:
+      - targets: ['connector_polygon_prices:8003']
+        labels:
+          connector: 'polygon_prices'
+
+  - job_name: 'connector_earnings'
+    static_configs:
+      - targets: ['connector_earnings:8004']
+        labels:
+          connector: 'earnings_whispers'
+
+  - job_name: 'connector_fred'
+    static_configs:
+      - targets: ['connector_fred:8005']
+        labels:
+          connector: 'fred_calendar'
+
+  - job_name: 'pipeline_normalizer'
+    static_configs:
+      - targets: ['pipeline_normalizer:8011']
+        labels:
+          service: 'normalizer'
+
+  - job_name: 'pipeline_deduplicator'
+    static_configs:
+      - targets: ['pipeline_deduplicator:8012']
+        labels:
+          service: 'deduplicator'
+
+  - job_name: 'pipeline_entity_resolver'
+    static_configs:
+      - targets: ['pipeline_entity_resolver:8013']
+        labels:
+          service: 'entity_resolver'
+
+  - job_name: 'signals_ai_summarizer'
+    static_configs:
+      - targets: ['signals_ai_summarizer:8021']
+        labels:
+          service: 'ai_summarizer'
+
+  - job_name: 'signals_aggregator'
+    static_configs:
+      - targets: ['signals_signal_aggregator:8022']
+        labels:
+          service: 'signal_aggregator'
+
+  - job_name: 'signals_telegram'
+    static_configs:
+      - targets: ['signals_telegram_alerts:8023']
+        labels:
+          service: 'telegram_alerts'

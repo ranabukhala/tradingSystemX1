@@ -1,0 +1,46 @@
+# Environment — NEVER commit
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Alembic
+alembic/versions/__pycache__/
+
+# Logs
+*.log
+logs/
+
+# Data files (keep config, ignore data)
+*.csv
+*.parquet
+data/
+
+# Docker local overrides
+docker-compose.override.yml

@@ -1,0 +1,562 @@
+# ─────────────────────────────────────────────────────────────
+#  US Equities News Intelligence System
+#  Full Local Docker Stack — Infrastructure + All Connectors
+#
+#  Startup order:
+#    1. postgres, redis, redpanda, minio  (infrastructure)
+#    2. topic_setup, migrate              (one-time init)
+#    3. All connectors                    (live services)
+# ─────────────────────────────────────────────────────────────
+
+# Shared config for all Python connector services
+x-connector: &connector
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  env_file: .env
+  networks:
+    - trading_net
+  volumes:
+    - ./app:/app/app          # Mount code — no rebuild needed for code changes
+    - ./config:/app/config
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+    topic_setup:
+      condition: service_completed_successfully
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 1 — INFRASTRUCTURE
+  # ══════════════════════════════════════════════════════════
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: trading_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-trading}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tradingpass}
+      POSTGRES_DB: ${POSTGRES_DB:-trading_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trading} -d ${POSTGRES_DB:-trading_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - trading_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: trading_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save 60 1000
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - trading_net
+
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: trading_redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1
+      - --memory 512M
+      - --mode dev-container
+      - --default-log-level=warn
+    ports:
+      - "19092:19092"
+      - "18082:18082"
+      - "18081:18081"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - trading_net
+
+  redpanda_console:
+    image: redpandadata/console:latest
+    container_name: trading_redpanda_console
+    restart: unless-stopped
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_SCHEMAREGISTRY_ENABLED: "true"
+      KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
+    ports:
+      - "8088:8080"
+    networks:
+      - trading_net
+
+  minio:
+    image: minio/minio:latest
+    container_name: trading_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - trading_net
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: trading_prometheus
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trading_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: trading_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - trading_net
+
+  adminer:
+    image: adminer:latest
+    container_name: trading_adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - trading_net
+
+  # ── MinIO bucket setup ──────────────────────
+  minio_setup:
+    image: minio/mc:latest
+    container_name: trading_minio_setup
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin123};
+        mc mb --ignore-existing local/news-fulltext;
+        mc mb --ignore-existing local/news-raw-payloads;
+        mc mb --ignore-existing local/summaries;
+        mc mb --ignore-existing local/snapshots;
+        echo 'MinIO buckets ready';
+      "
+    networks:
+      - trading_net
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 2 — ONE-TIME INIT (run then exit)
+  # ══════════════════════════════════════════════════════════
+
+  # Creates all 8 Kafka topics with correct retention settings
+  topic_setup:
+    image: redpandadata/redpanda:latest
+    container_name: trading_topic_setup
+    restart: "no"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Creating Kafka topics...';
+        rpk topic create news.raw        --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=86400000   2>/dev/null || echo 'news.raw exists';
+        rpk topic create news.raw.dlq    --brokers redpanda:9092 --partitions 1 --replicas 1 --topic-config retention.ms=604800000  2>/dev/null || echo 'news.raw.dlq exists';
+        rpk topic create news.normalized --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=172800000  2>/dev/null || echo 'news.normalized exists';
+        rpk topic create news.deduped    --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=172800000  2>/dev/null || echo 'news.deduped exists';
+        rpk topic create news.enriched   --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=604800000  2>/dev/null || echo 'news.enriched exists';
+        rpk topic create news.summarized --brokers redpanda:9092 --partitions 3 --replicas 1 --topic-config retention.ms=604800000  2>/dev/null || echo 'news.summarized exists';
+        rpk topic create events.calendar --brokers redpanda:9092 --partitions 1 --replicas 1 --topic-config retention.ms=2592000000 2>/dev/null || echo 'events.calendar exists';
+        rpk topic create prices.bars     --brokers redpanda:9092 --partitions 6 --replicas 1 --topic-config retention.ms=604800000  2>/dev/null || echo 'prices.bars exists';
+        echo 'Done. Topics:';
+        rpk topic list --brokers redpanda:9092;
+      "
+    networks:
+      - trading_net
+
+  # Runs Alembic migrations — waits for Postgres, exits when done
+  migrate:
+    <<: *connector
+    container_name: trading_migrate
+    restart: "no"
+    entrypoint: ["python", "-m", "alembic"]
+    command: ["upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Override the connector depends_on — migrate only needs postgres
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+      LOG_LEVEL: INFO
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 3 — PYTHON CONNECTORS
+  # ══════════════════════════════════════════════════════════
+
+  connector_benzinga:
+    <<: *connector
+    container_name: trading_connector_benzinga
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["benzinga"]
+    environment:
+      CONNECTOR_NAME: benzinga
+      METRICS_PORT: "8001"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8001:8001"             # Prometheus metrics scrape port
+
+  connector_polygon_news:
+    <<: *connector
+    container_name: trading_connector_polygon_news
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["polygon_news"]
+    environment:
+      CONNECTOR_NAME: polygon_news
+      METRICS_PORT: "8002"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8002:8002"
+
+  connector_polygon_prices:
+    <<: *connector
+    container_name: trading_connector_polygon_prices
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["polygon_prices"]
+    environment:
+      CONNECTOR_NAME: polygon_prices
+      METRICS_PORT: "8003"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8003:8003"
+
+  connector_earnings:
+    <<: *connector
+    container_name: trading_connector_earnings
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["earnings_whispers"]
+    environment:
+      CONNECTOR_NAME: earnings_whispers
+      METRICS_PORT: "8004"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8004:8004"
+
+  connector_fred:
+    <<: *connector
+    container_name: trading_connector_fred
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["fred_calendar"]
+    environment:
+      CONNECTOR_NAME: fred_calendar
+      METRICS_PORT: "8005"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8005:8005"
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 4 — PIPELINE SERVICES (Phase 2)
+  # ══════════════════════════════════════════════════════════
+
+  pipeline_normalizer:
+    <<: *connector
+    container_name: trading_pipeline_normalizer
+    entrypoint: ["python", "-m", "app.pipeline.__main__"]
+    command: ["normalizer"]
+    environment:
+      SERVICE_NAME: normalizer
+      METRICS_PORT: "8011"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8011:8011"
+
+  pipeline_deduplicator:
+    <<: *connector
+    container_name: trading_pipeline_deduplicator
+    entrypoint: ["python", "-m", "app.pipeline.__main__"]
+    command: ["deduplicator"]
+    environment:
+      SERVICE_NAME: deduplicator
+      METRICS_PORT: "8012"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8012:8012"
+
+  pipeline_entity_resolver:
+    <<: *connector
+    container_name: trading_pipeline_entity_resolver
+    entrypoint: ["python", "-m", "app.pipeline.__main__"]
+    command: ["entity_resolver"]
+    environment:
+      SERVICE_NAME: entity_resolver
+      METRICS_PORT: "8013"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+    ports:
+      - "8013:8013"
+
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 5 — SIGNAL SERVICES (Phase 3)
+  # ══════════════════════════════════════════════════════════
+
+  signals_ai_summarizer:
+    <<: *connector
+    container_name: trading_signals_ai_summarizer
+    entrypoint: ["python", "-m", "app.signals.__main__"]
+    command: ["ai_summarizer"]
+    environment:
+      SERVICE_NAME: ai_summarizer
+      METRICS_PORT: "8021"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LLM_DAILY_BUDGET_USD: ${LLM_DAILY_BUDGET_USD:-25.0}
+      LLM_T2_IMPACT_THRESHOLD: ${LLM_T2_IMPACT_THRESHOLD:-0.6}
+    ports:
+      - "8021:8021"
+
+  signals_signal_aggregator:
+    <<: *connector
+    container_name: trading_signals_aggregator
+    entrypoint: ["python", "-m", "app.signals.__main__"]
+    command: ["signal_aggregator"]
+    environment:
+      SERVICE_NAME: signal_aggregator
+      METRICS_PORT: "8022"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+    ports:
+      - "8022:8022"
+
+  signals_telegram_alerts:
+    <<: *connector
+    container_name: trading_signals_telegram
+    entrypoint: ["python", "-m", "app.signals.__main__"]
+    command: ["telegram_alerts"]
+    environment:
+      SERVICE_NAME: telegram_alerts
+      METRICS_PORT: "8023"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8023:8023"
+
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 6 — ADMIN SERVICES (Watchdog + Admin Bot)
+  # ══════════════════════════════════════════════════════════
+
+  admin_watchdog:
+    <<: *connector
+    container_name: trading_admin_watchdog
+    entrypoint: ["python", "-m", "app.admin.__main__"]
+    command: ["watchdog"]
+    environment:
+      SERVICE_NAME: watchdog
+      METRICS_PORT: "8031"
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:-}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+      LLM_DAILY_BUDGET_USD: ${LLM_DAILY_BUDGET_USD:-5.0}
+    volumes:
+      - ./app:/app/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8031:8031"
+
+  admin_bot:
+    <<: *connector
+    container_name: trading_admin_bot
+    entrypoint: ["python", "-m", "app.admin.__main__"]
+    command: ["admin_bot"]
+    environment:
+      SERVICE_NAME: admin_bot
+      METRICS_PORT: "8032"
+      REDIS_URL: redis://redis:6379/0
+      ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:-}
+      ADMIN_CHAT_ID: ${ADMIN_CHAT_ID:-}
+    volumes:
+      - ./app:/app/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "8032:8032"
+
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 7 — EXECUTION ENGINE (Phase 4)
+  # ══════════════════════════════════════════════════════════
+
+  execution_engine:
+    <<: *connector
+    container_name: trading_execution_engine
+    entrypoint: ["python", "-m", "app.execution.__main__"]
+    command: ["execution_engine"]
+    environment:
+      SERVICE_NAME: execution_engine
+      METRICS_PORT: "8041"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      # Broker selection: alpaca_paper | alpaca_live | ibkr_paper | ibkr_live
+      BROKER: ${BROKER:-alpaca_paper}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-1}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Risk controls
+      RISK_MAX_POSITION_PCT: ${RISK_MAX_POSITION_PCT:-0.02}
+      RISK_MAX_POSITION_USD: ${RISK_MAX_POSITION_USD:-5000}
+      RISK_MAX_DAILY_LOSS_PCT: ${RISK_MAX_DAILY_LOSS_PCT:-0.05}
+      RISK_MAX_OPEN_POSITIONS: ${RISK_MAX_OPEN_POSITIONS:-10}
+      RISK_MIN_CONVICTION: ${RISK_MIN_CONVICTION:-0.40}
+      RISK_ALLOW_PREMARKET: ${RISK_ALLOW_PREMARKET:-true}
+      RISK_TAKE_PROFIT_PCT: ${RISK_TAKE_PROFIT_PCT:-0.10}
+      RISK_STOP_LOSS_PCT: ${RISK_STOP_LOSS_PCT:-0.04}
+      RISK_USE_BRACKET_ORDERS: ${RISK_USE_BRACKET_ORDERS:-true}
+    ports:
+      - "8041:8041"
+
+  position_monitor:
+    <<: *connector
+    container_name: trading_position_monitor
+    entrypoint: ["python", "-m", "app.execution.__main__"]
+    command: ["position_monitor"]
+    environment:
+      SERVICE_NAME: position_monitor
+      METRICS_PORT: "8042"
+      BROKER: ${BROKER:-alpaca_paper}
+      ALPACA_API_KEY: ${ALPACA_API_KEY:-}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:-}
+      IBKR_HOST: ${IBKR_HOST:-host.docker.internal}
+      IBKR_PORT: ${IBKR_PORT:-4002}
+      IBKR_CLIENT_ID: ${IBKR_CLIENT_ID:-2}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8042:8042"
+
+
+# ══════════════════════════════════════════════════════════
+#  VOLUMES & NETWORKS
+# ══════════════════════════════════════════════════════════
+
+volumes:
+  postgres_data:
+  redis_data:
+  redpanda_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  trading_net:
+    driver: bridge
