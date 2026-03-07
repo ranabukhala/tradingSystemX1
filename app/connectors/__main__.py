@@ -26,6 +26,9 @@ async def run_connector(name: str) -> None:
     elif name == "fred_calendar":
         from app.connectors.fred_calendar import FredCalendarConnector
         connector = FredCalendarConnector()
+    elif name == "alphavantage":
+        from app.connectors.alphavantage import AlphaVantageConnector
+        connector = AlphaVantageConnector()
     else:
         _log("error", "unknown_connector", name=name)
         sys.exit(1)

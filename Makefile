@@ -26,7 +26,7 @@ up:           ## Build image + start full stack
 	@echo "🗄️  Running migrations..."
 	docker compose up migrate
 	@echo "🔌 Starting connectors..."
-	docker compose up -d connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred
+	docker compose up -d connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred connector_alphavantage
 	@echo ""
 	@echo "✅ Full stack running. Access points:"
 	@echo "   Grafana:          http://localhost:3000  (admin / admin123)"
@@ -42,16 +42,19 @@ up-infra:     ## Start infrastructure only (no connectors)
 	docker compose up migrate
 
 up-connectors: ## Start connectors only (infra must already be running)
-	docker compose up -d connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred
+	docker compose up -d connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred connector_alphavantage
 
 down:          ## Stop all containers (keep data volumes)
 	docker compose down
 
 restart:       ## Restart all connector services (picks up code changes)
-	docker compose restart connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred
+	docker compose restart connector_benzinga connector_polygon_news connector_polygon_prices connector_earnings connector_fred connector_alphavantage
 
 restart-benzinga:   ## Restart Benzinga connector only
 	docker compose restart connector_benzinga
+
+restart-alphavantage: ## Restart Alpha Vantage connector only
+	docker compose restart connector_alphavantage
 
 reset:         ## ⚠️  Destroy ALL data and start fresh
 	@echo "⚠️  This deletes ALL data (Postgres, Redis, Redpanda, MinIO)."
@@ -89,6 +92,9 @@ logs-prices:   ## Tail price connector logs
 
 logs-earnings: ## Tail earnings connector logs
 	docker compose logs -f --tail=100 connector_earnings
+
+logs-alphavantage: ## Tail Alpha Vantage connector logs
+	docker compose logs -f --tail=100 connector_alphavantage
 
 logs-infra:    ## Tail infrastructure logs (postgres, redis, redpanda)
 	docker compose logs -f --tail=50 postgres redis redpanda

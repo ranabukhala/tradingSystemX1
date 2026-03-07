@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, model_validator
 class NewsSource(str, Enum):
     BENZINGA = "benzinga"
     POLYGON = "polygon"
+    ALPHAVANTAGE = "alphavantage"
     TIINGO = "tiingo"
     DJNEWS = "djnews"
     UNKNOWN = "unknown"

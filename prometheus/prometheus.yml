@@ -46,6 +46,12 @@ scrape_configs:
         labels:
           connector: 'fred_calendar'
 
+  - job_name: 'connector_alphavantage'
+    static_configs:
+      - targets: ['connector_alphavantage:8006']
+        labels:
+          connector: 'alphavantage'
+
   - job_name: 'pipeline_normalizer'
     static_configs:
       - targets: ['pipeline_normalizer:8011']

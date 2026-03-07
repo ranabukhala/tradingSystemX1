@@ -197,19 +197,159 @@ class AISummarizerService(BaseConsumer):
         cost = (tokens / 1000) * COST_PER_1K_T1
         return parsed, tokens, cost
 
-    async def _run_t2(self, record: EnrichedRecord, t1: dict) -> tuple[dict, int, float]:
+    async def _get_fmp_context(self, record: EnrichedRecord, raw_record: dict) -> dict:
+        """Pull FMP context from record fields and Redis."""
+        ctx = {
+            "float_shares": raw_record.get("float_shares", "unknown"),
+            "float_sensitivity": raw_record.get("float_sensitivity",
+                record.float_sensitivity.value if record.float_sensitivity else "normal"),
+            "beta": raw_record.get("fmp_beta", "unknown"),
+            "sector": raw_record.get("fmp_sector", "unknown"),
+            "market_cap_tier": raw_record.get("market_cap_tier",
+                record.market_cap_tier.value if record.market_cap_tier else "unknown"),
+            "sector_return": "unknown",
+            "analyst_context": "",
+            "insider_context": "",
+            "technical_context": "",
+        }
+
+        try:
+            import redis.asyncio as aioredis, os
+            r = await aioredis.from_url(
+                os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
+
+            # Sector return
+            sectors_raw = await r.get("fmp:sectors")
+            if sectors_raw:
+                sd = json.loads(sectors_raw)
+                ctx["sector_return"] = sd.get("sectors", {}).get(ctx["sector"], "unknown")
+
+            # Technical indicators
+            ticker = record.tickers[0] if record.tickers else ""
+            if ticker:
+                tech_raw = await r.get(f"fmp:technical:{ticker}")
+                if tech_raw:
+                    tech = json.loads(tech_raw)
+                    rsi = tech.get("rsi", "")
+                    ctx["technical_context"] = (
+                        f"RSI: {rsi} ({tech.get('rsi_signal','')}) | "
+                        f"MACD: {tech.get('macd_bias','')}\n"
+                    )
+            await r.aclose()
+        except Exception:
+            pass
+
+        # Analyst context
+        analyst = raw_record.get("fmp_analyst")
+        if analyst:
+            avg_pt = analyst.get("avg_price_target", "")
+            num = analyst.get("num_analysts", "")
+            sentiment = analyst.get("analyst_sentiment", 0)
+            sentiment_str = "bullish" if sentiment > 0 else "bearish" if sentiment < 0 else "neutral"
+            ctx["analyst_context"] = (
+                f"Analyst: avg PT ${avg_pt}, {num} analysts, sentiment: {sentiment_str}\n"
+            )
+            recent = analyst.get("recent_ratings", [])
+            if recent:
+                ratings_str = " | ".join(
+                    f"{r['firm']} {r.get('action','')} ({r.get('from_grade','')}→{r.get('to_grade','')})"
+                    for r in recent[:3]
+                )
+                ctx["analyst_context"] += f"Recent: {ratings_str}\n"
+
+        # Insider context
+        insider = raw_record.get("fmp_insider")
+        if insider and insider.get("notable"):
+            ctx["insider_context"] = (
+                f"Insiders (30d): buys ${insider.get('total_buy_value',0):,.0f} "
+                f"sells ${insider.get('total_sell_value',0):,.0f} "
+                f"net: {insider.get('net_sentiment','neutral')}\n"
+            )
+
+        return ctx
+
+    async def _get_finnhub_context(self, ticker: str, catalyst_type: str) -> dict:
+        """Pull Finnhub earnings history + analyst consensus from Redis."""
+        ctx = {
+            "earnings_history": "",
+            "analyst_consensus": "",
+            "sentiment_score": "",
+        }
+        try:
+            import redis.asyncio as aioredis, os
+            r = await aioredis.from_url(
+                os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
+
+            # Earnings history — inject for earnings catalyst
+            if catalyst_type == "earnings":
+                raw = await r.get(f"finnhub:earnings:{ticker}")
+                if raw:
+                    d = json.loads(raw)
+                    ctx["earnings_history"] = f"Earnings history: {d.get('summary', '')}\n"
+
+            # Analyst consensus — inject for analyst catalyst
+            if catalyst_type in ("analyst", "earnings"):
+                raw = await r.get(f"finnhub:analyst:{ticker}")
+                if raw:
+                    d = json.loads(raw)
+                    ctx["analyst_consensus"] = (
+                        f"Analyst consensus: {d.get('consensus','').replace('_',' ')} "
+                        f"({d.get('buy',0)} buy / {d.get('hold',0)} hold / {d.get('sell',0)} sell), "
+                        f"trend: {d.get('trend','stable')}\n"
+                    )
+
+            # News sentiment score
+            raw = await r.get(f"finnhub:sentiment:{ticker}")
+            if raw:
+                d = json.loads(raw)
+                bias  = d.get("bias", "neutral")
+                score = d.get("score", 0)
+                ctx["sentiment_score"] = f"Finnhub NLP sentiment: {bias} (score {score:.2f})\n"
+
+            await r.aclose()
+        except Exception:
+            pass
+        return ctx
+
+    async def _run_t2(self, record: EnrichedRecord, t1: dict, raw_record: dict | None = None) -> tuple[dict, int, float]:
         """
-        Run T2 trader analysis. Returns (parsed_dict, tokens, cost_usd).
+        Run T2 trader analysis with FMP fundamental context.
+        Returns (parsed_dict, tokens, cost_usd).
         """
+        raw = raw_record or {}
+        ticker = record.tickers[0] if record.tickers else ""
+        catalyst = record.catalyst_type.value
+
+        # Gather FMP + Finnhub context in parallel
+        fmp_ctx, finnhub_ctx = await asyncio.gather(
+            self._get_fmp_context(record, raw),
+            self._get_finnhub_context(ticker, catalyst),
+        )
+
+        float_str = (f"{fmp_ctx['float_shares']:,}" if isinstance(fmp_ctx["float_shares"], (int, float))
+                     else str(fmp_ctx["float_shares"]))
+
         user_prompt = T2_USER.format(
             title=record.title,
             snippet=record.snippet or "",
             tickers=", ".join(record.tickers) if record.tickers else "unknown",
-            catalyst_type=record.catalyst_type.value,
+            catalyst_type=catalyst,
             session_context=record.session_context.value,
             t1_summary=t1.get("t1_summary", ""),
             impact_day=round(t1.get("impact_day", 0.0), 2),
             impact_swing=round(t1.get("impact_swing", 0.0), 2),
+            float_shares=float_str,
+            float_sensitivity=fmp_ctx["float_sensitivity"],
+            market_cap_tier=fmp_ctx["market_cap_tier"],
+            beta=fmp_ctx["beta"],
+            sector=fmp_ctx["sector"],
+            sector_return=fmp_ctx["sector_return"],
+            analyst_context=fmp_ctx["analyst_context"],
+            insider_context=fmp_ctx["insider_context"],
+            technical_context=fmp_ctx["technical_context"],
+            earnings_history=finnhub_ctx["earnings_history"],
+            analyst_consensus=finnhub_ctx["analyst_consensus"],
+            sentiment_score=finnhub_ctx["sentiment_score"],
         )
 
         text, tokens = await self._call_claude(
@@ -282,7 +422,7 @@ class AISummarizerService(BaseConsumer):
         if impact_day >= settings.llm_t2_impact_threshold:
             if self._budget.can_spend(0.05):  # T2 cost estimate
                 try:
-                    t2_result, t2_tokens, t2_cost = await self._run_t2(enriched, t1_result)
+                    t2_result, t2_tokens, t2_cost = await self._run_t2(enriched, t1_result, raw_record=record)
                     total_tokens += t2_tokens
                     total_cost += t2_cost
                     self._budget.record(t2_cost)

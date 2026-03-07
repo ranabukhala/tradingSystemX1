@@ -3,12 +3,9 @@ Prompt templates for the AI summarizer.
 All prompts versioned — bump PROMPT_VERSION when changing.
 """
 
-PROMPT_VERSION = "v1.0"
+PROMPT_VERSION = "v1.2"
 
 # ── T1 Prompt: Fast facts extraction ─────────────────────────────────────────
-# Input: title + snippet only. Must be cheap and fast (<200 tokens output).
-# Used for ALL enriched items regardless of impact score.
-
 T1_SYSTEM = """You are a financial news analyst. Extract structured facts from news headlines.
 Be extremely concise. Never add commentary or opinions.
 Respond ONLY with valid JSON. No markdown, no explanation."""
@@ -57,11 +54,7 @@ Rules:
 - For macro: fill actual_value, estimate_value"""
 
 
-# ── T2 Prompt: Trader intelligence ───────────────────────────────────────────
-# Input: title + snippet + t1_summary + price context.
-# Only called when impact_day >= llm_t2_impact_threshold (default 0.6).
-# Produces actionable "so what" for traders.
-
+# ── T2 Prompt: Trader intelligence (with FMP context) ────────────────────────
 T2_SYSTEM = """You are a senior equity trader with 20 years experience.
 You analyze news for immediate trading implications.
 Be direct, specific, and actionable. Think like a trader, not an analyst.
@@ -77,6 +70,13 @@ Session: {session_context}
 Key facts: {t1_summary}
 Impact score: {impact_day} (day), {impact_swing} (swing)
 
+--- Fundamental Context ---
+Float: {float_shares} shares ({float_sensitivity} sensitivity)
+Market cap tier: {market_cap_tier} | Beta: {beta}
+Sector: {sector} | Sector today: {sector_return}%
+{analyst_context}{insider_context}{technical_context}{earnings_history}{analyst_consensus}{sentiment_score}
+--- End Context ---
+
 Respond with this exact JSON structure:
 {{
   "t2_summary": "2-3 sentences max: what happened, likely market reaction, key levels to watch",
@@ -89,17 +89,20 @@ Respond with this exact JSON structure:
 
 Rules:
 - t2_summary: lead with the trade idea, not background
+- Factor float sensitivity: small float = amplified move expected
+- Factor sector momentum: tailwind or headwind from sector direction
+- Factor insider activity if provided: recent buys = bullish lean
+- Factor RSI if provided: overbought near resistance = fade, oversold near support = buy
+- Factor Finnhub NLP sentiment if provided: cross-validates Claude's own read — conflicts = reduce conviction
+- Factor earnings history if provided: serial beater with large avg surprise = higher confidence on earnings plays
 - regime_flag: risk_on=bullish catalyst, risk_off=bearish/fear catalyst, high_vol=vol expansion expected, compression=range-bound
-- source_credibility: 0.0-1.0 (1.0=SEC filing/earnings release, 0.7=major outlet, 0.4=blog/rumor)
+- source_credibility: 0.0-1.0 (1.0=SEC filing/earnings, 0.7=major outlet, 0.4=blog/rumor)
 - signal_bias: directional lean for primary ticker
 - key_levels: list of important price levels mentioned or implied (numbers only)
 - watch_for: what to monitor in next 30 minutes"""
 
 
 # ── Regime Prompt: Market context ────────────────────────────────────────────
-# Called once per hour to assess overall market regime.
-# Uses recent macro news + price action summary.
-
 REGIME_SYSTEM = """You are a macro strategist. Assess the current market regime from recent news.
 Respond ONLY with valid JSON."""
 
@@ -107,6 +110,9 @@ REGIME_USER = """Based on these recent macro/market headlines, assess the curren
 
 Headlines:
 {headlines}
+
+Sector performance today:
+{sector_performance}
 
 Respond with:
 {{

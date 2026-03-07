@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     # ── Vendor API Keys ───────────────────────────────────────
     benzinga_api_key: str = ""
     polygon_api_key: str = ""
+    alphavantage_api_key: str = ""
     earnings_whispers_api_key: str = ""
     fred_api_key: str = ""
     anthropic_api_key: str = ""
@@ -59,6 +60,8 @@ class Settings(BaseSettings):
     # ── Pipeline Settings ─────────────────────────────────────
     benzinga_poll_interval_seconds: int = 30
     polygon_news_poll_interval_seconds: int = 60
+    # Alpha Vantage: free tier = 25 req/day → set to 3600 if on free plan
+    alphavantage_poll_interval_seconds: int = 300
     earnings_sync_hour_et: int = 6
     earnings_lookahead_days: int = 30
 

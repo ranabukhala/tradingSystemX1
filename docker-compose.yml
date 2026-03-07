@@ -545,6 +545,130 @@ services:
       - "8042:8042"
 
 
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 8 — FMP DATA ENRICHMENT (Phase 4B)
+  # ══════════════════════════════════════════════════════════
+
+  fmp_enrichment:
+    <<: *connector
+    container_name: trading_fmp_enrichment
+    entrypoint: ["python", "-m", "app.connectors.fmp"]
+    command: ["enrichment"]
+    environment:
+      SERVICE_NAME: fmp_enrichment
+      METRICS_PORT: "8051"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      FMP_PLAN: ${FMP_PLAN:-free}
+    ports:
+      - "8051:8051"
+
+  fmp_earnings:
+    <<: *connector
+    container_name: trading_fmp_earnings
+    entrypoint: ["python", "-m", "app.connectors.fmp"]
+    command: ["earnings"]
+    environment:
+      SERVICE_NAME: fmp_earnings
+      METRICS_PORT: "8052"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      FMP_PLAN: ${FMP_PLAN:-free}
+    ports:
+      - "8052:8052"
+
+  fmp_technical:
+    <<: *connector
+    container_name: trading_fmp_technical
+    entrypoint: ["python", "-m", "app.connectors.fmp"]
+    command: ["technical"]
+    environment:
+      SERVICE_NAME: fmp_technical
+      METRICS_PORT: "8053"
+      REDIS_URL: redis://redis:6379/0
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      FMP_PLAN: ${FMP_PLAN:-free}
+    ports:
+      - "8053:8053"
+
+  fmp_sectors:
+    <<: *connector
+    container_name: trading_fmp_sectors
+    entrypoint: ["python", "-m", "app.connectors.fmp"]
+    command: ["sectors"]
+    environment:
+      SERVICE_NAME: fmp_sectors
+      METRICS_PORT: "8054"
+      REDIS_URL: redis://redis:6379/0
+      FMP_API_KEY: ${FMP_API_KEY:-}
+      FMP_PLAN: ${FMP_PLAN:-free}
+    ports:
+      - "8054:8054"
+
+
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 9 — FINNHUB CONNECTORS (Phase 4C)
+  # ══════════════════════════════════════════════════════════
+
+  finnhub_news:
+    <<: *connector
+    container_name: trading_finnhub_news
+    entrypoint: ["python", "-m", "app.connectors.finnhub"]
+    command: ["news"]
+    environment:
+      SERVICE_NAME: finnhub_news
+      METRICS_PORT: "8061"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      FINNHUB_POLL_INTERVAL: "30"
+    ports:
+      - "8061:8061"
+
+  finnhub_websocket:
+    <<: *connector
+    container_name: trading_finnhub_websocket
+    entrypoint: ["python", "-m", "app.connectors.finnhub"]
+    command: ["websocket"]
+    environment:
+      SERVICE_NAME: finnhub_websocket
+      METRICS_PORT: "8062"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+    ports:
+      - "8062:8062"
+
+  finnhub_sentiment:
+    <<: *connector
+    container_name: trading_finnhub_sentiment
+    entrypoint: ["python", "-m", "app.connectors.finnhub"]
+    command: ["sentiment"]
+    environment:
+      SERVICE_NAME: finnhub_sentiment
+      METRICS_PORT: "8063"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      FINNHUB_INPUT_TOPIC: ${FINNHUB_INPUT_TOPIC:-news.fmp_enriched}
+    ports:
+      - "8063:8063"
+
+  finnhub_fundamentals:
+    <<: *connector
+    container_name: trading_finnhub_fundamentals
+    entrypoint: ["python", "-m", "app.connectors.finnhub"]
+    command: ["fundamentals"]
+    environment:
+      SERVICE_NAME: finnhub_fundamentals
+      METRICS_PORT: "8064"
+      REDIS_URL: redis://redis:6379/0
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+    ports:
+      - "8064:8064"
+
+
 # ══════════════════════════════════════════════════════════
 #  VOLUMES & NETWORKS
 # ══════════════════════════════════════════════════════════
