@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone, timedelta
+import pytz
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -39,6 +40,7 @@ CATALYST_WEIGHT: dict[CatalystType, float] = {
     CatalystType.ANALYST:     0.9,
     CatalystType.FILING:      0.6,
     CatalystType.MACRO:       0.7,
+    CatalystType.LEGAL:       0.3,   # Lawsuits = lagging catalyst, deeply discounted
     CatalystType.OTHER:       0.5,
 }
 
@@ -50,6 +52,21 @@ SESSION_WEIGHT: dict[SessionContext, float] = {
     SessionContext.AFTERHOURS: 1.1,
     SessionContext.OVERNIGHT:  0.7,
 }
+
+ET = pytz.timezone("America/New_York")
+
+# Time-of-day windows with conviction multiplier and label
+# Observe mode: multiplier logged but NOT applied to conviction yet
+TIME_WINDOWS: list[tuple[tuple[int,int], tuple[int,int], float, str, str]] = [
+    # (start_hhmm, end_hhmm, multiplier, label, emoji)
+    ((9, 30),  (9, 45),  0.50, "Open shakeout — high noise, fades quickly",    "🔴"),
+    ((9, 45),  (11, 30), 1.10, "Prime window — best intraday trend quality",   "🟢"),
+    ((11, 30), (12, 0),  1.00, "Late morning — decent, momentum slowing",      "🟡"),
+    ((12, 0),  (14, 0),  0.70, "Dead zone — low volume, false breakouts",      "🔴"),
+    ((14, 0),  (15, 30), 1.00, "Afternoon trend — ok if volume confirms",      "🟡"),
+    ((15, 30), (16, 0),  0.80, "MOC noise — order imbalances distort moves",   "🟠"),
+    ((16, 0),  (20, 0),  0.90, "After-hours — wider spreads, thin liquidity",  "🟡"),
+]
 
 # Float sensitivity multiplier
 FLOAT_WEIGHT: dict[FloatSensitivity, float] = {
@@ -89,6 +106,18 @@ class TradingSignal(BaseModel):
     # Risk
     market_cap_tier: str | None = None
     float_sensitivity: str
+
+    # Catalyst intelligence (v1.3)
+    priced_in: str | None = None            # yes | partially | no
+    priced_in_reason: str | None = None
+    sympathy_plays: list[str] = Field(default_factory=list)
+    is_sympathy: bool = False               # True = secondary signal from sympathy
+
+    # Timing intelligence (observe only — not applied to conviction yet)
+    time_window_label: str | None = None
+    time_window_emoji: str | None = None
+    time_window_mult: float | None = None   # What multiplier WOULD apply if enabled
+    time_window_quality: str | None = None  # good / caution / poor
 
     # Metadata
     impact_day: float
@@ -130,6 +159,18 @@ def compute_conviction(record: SummarizedRecord) -> float:
             conviction *= 1.3
         elif proximity_h <= 24:
             conviction *= 1.1
+
+    # Legal filings (class actions, lawsuits) are always lagging — auto mark priced in
+    if record.catalyst_type == CatalystType.LEGAL:
+        if not getattr(record, "priced_in", None):
+            record.priced_in = "yes"
+
+    # Priced-in penalty: if market already moved on this, reduce conviction
+    priced_in = getattr(record, "priced_in", None)
+    if priced_in == "yes":
+        conviction *= 0.60      # Heavy discount — likely to fade or not extend
+    elif priced_in == "partially":
+        conviction *= 0.85      # Moderate discount
 
     return min(1.0, round(conviction, 3))
 
@@ -206,6 +247,69 @@ def classify_direction(record: SummarizedRecord) -> str:
     return "neutral"
 
 
+def get_time_window(dt_utc: datetime) -> dict:
+    """
+    Classify current ET time into a named trading window.
+    Returns label, emoji, and multiplier for display purposes.
+    """
+    et_now = dt_utc.astimezone(ET)
+    h, m = et_now.hour, et_now.minute
+    current_mins = h * 60 + m
+
+    for (sh, sm), (eh, em), mult, label, emoji in TIME_WINDOWS:
+        start_mins = sh * 60 + sm
+        end_mins   = eh * 60 + em
+        if start_mins <= current_mins < end_mins:
+            return {
+                "window_label":  label,
+                "window_emoji":  emoji,
+                "multiplier":    mult,
+                "time_et":       et_now.strftime("%H:%M ET"),
+                "quality":       "good" if mult >= 1.0 else ("caution" if mult >= 0.8 else "poor"),
+            }
+
+    # Pre-market or overnight
+    return {
+        "window_label":  "Pre-market / Overnight",
+        "window_emoji":  "🌙",
+        "multiplier":    0.90,
+        "time_et":       et_now.strftime("%H:%M ET"),
+        "quality":       "caution",
+    }
+
+
+def build_sympathy_signal(primary: TradingSignal, sympathy_ticker: str) -> TradingSignal:
+    """
+    Build a reduced-conviction signal for a sympathy play ticker.
+    Inherits direction and catalyst from primary, discounted conviction.
+    """
+    return TradingSignal(
+        ticker=sympathy_ticker,
+        signal_type="sympathy",
+        direction=primary.direction,
+        conviction=round(primary.conviction * 0.70, 3),  # 30% discount vs primary
+        catalyst_type=primary.catalyst_type,
+        session_context=primary.session_context,
+        regime_flag=primary.regime_flag,
+        news_id=primary.news_id,
+        news_title=primary.news_title,
+        t1_summary=primary.t1_summary,
+        t2_summary=f"[Sympathy play on {primary.ticker}] {primary.t2_summary or ''}",
+        key_levels=[],
+        decay_minutes=primary.decay_minutes,
+        market_cap_tier=None,
+        float_sensitivity="normal",
+        priced_in=primary.priced_in,
+        priced_in_reason=primary.priced_in_reason,
+        sympathy_plays=[],
+        is_sympathy=True,
+        impact_day=primary.impact_day * 0.6,
+        impact_swing=primary.impact_swing * 0.6,
+        source=primary.source,
+        prompt_version=primary.prompt_version,
+    )
+
+
 class SignalAggregatorService(BaseConsumer):
 
     @property
@@ -219,6 +323,42 @@ class SignalAggregatorService(BaseConsumer):
     @property
     def output_topic(self) -> str:
         return "signals.actionable"
+
+    async def _log_signal(self, summarized, conviction: float, passed: bool,
+                          direction: str = "neutral", signal_type: str = "other") -> None:
+        """Persist every evaluated signal to signal_log table."""
+        try:
+            import asyncpg, os
+            dsn = os.environ.get("DATABASE_URL",
+                "postgresql://trading:trading@postgres:5432/trading_db")
+            # asyncpg requires postgresql:// not postgresql+asyncpg://
+            dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
+            conn = await asyncpg.connect(dsn)
+            await conn.execute("""
+                INSERT INTO signal_log (
+                    ticker, direction, signal_type,
+                    conviction, conviction_threshold, passed_gate,
+                    catalyst_type, session_context,
+                    market_cap_tier, float_sensitivity,
+                    impact_day, impact_swing,
+                    news_id, news_title, news_source,
+                    t1_summary, t2_summary, prompt_version
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                """,
+                summarized.tickers[0] if summarized.tickers else "UNKNOWN",
+                direction, signal_type, conviction, CONVICTION_THRESHOLD, passed,
+                summarized.catalyst_type.value if summarized.catalyst_type else None,
+                summarized.session_context.value if summarized.session_context else None,
+                summarized.market_cap_tier.value if summarized.market_cap_tier else None,
+                summarized.float_sensitivity.value if summarized.float_sensitivity else None,
+                summarized.impact_day, summarized.impact_swing,
+                summarized.id, summarized.title,
+                summarized.source.value if summarized.source else None,
+                summarized.t1_summary, summarized.t2_summary, summarized.prompt_version,
+            )
+            await conn.close()
+        except Exception as e:
+            _log("warning", "signal_aggregator.log_error", error=str(e))
 
     async def process(self, record: dict) -> dict | None:
         try:
@@ -249,6 +389,7 @@ class SignalAggregatorService(BaseConsumer):
                  vendor_id=summarized.vendor_id,
                  conviction=conviction,
                  threshold=CONVICTION_THRESHOLD)
+            await self._log_signal(summarized, conviction, passed=False)
             return None
 
         # Primary ticker = first resolved ticker
@@ -264,6 +405,15 @@ class SignalAggregatorService(BaseConsumer):
              signal_type=signal_type,
              catalyst=summarized.catalyst_type.value,
              title=summarized.title[:80])
+
+        # Time window assessment (observe only — not modifying conviction)
+        tw = get_time_window(summarized.published_at or datetime.now(timezone.utc))
+        _log("info", "signal_aggregator.time_window",
+             ticker=primary_ticker,
+             time_et=tw["time_et"],
+             window=tw["window_label"],
+             multiplier=tw["multiplier"],
+             quality=tw["quality"])
 
         signal = TradingSignal(
             ticker=primary_ticker,
@@ -285,5 +435,25 @@ class SignalAggregatorService(BaseConsumer):
             source=summarized.source.value,
             prompt_version=summarized.prompt_version,
         )
+
+        await self._log_signal(summarized, conviction, passed=True,
+                               direction=direction, signal_type=signal_type)
+
+        # Emit sympathy signals for secondary tickers (only if not priced in)
+        if summarized.sympathy_plays and summarized.priced_in != "yes":
+            for sym_ticker in summarized.sympathy_plays:
+                if sym_ticker == primary_ticker:
+                    continue
+                sym_signal = build_sympathy_signal(signal, sym_ticker)
+                if sym_signal.conviction >= CONVICTION_THRESHOLD:
+                    _log("info", "signal_aggregator.sympathy_signal",
+                         primary=primary_ticker,
+                         sympathy=sym_ticker,
+                         conviction=sym_signal.conviction)
+                    # Publish sympathy signal to same topic
+                    await self._producer.send(
+                        self.output_topic,
+                        value=sym_signal.to_kafka_dict()
+                    )
 
         return signal.to_kafka_dict()

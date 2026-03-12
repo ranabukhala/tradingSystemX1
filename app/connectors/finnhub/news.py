@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 from datetime import datetime, timezone, timedelta
 
 import httpx
 
+from app.config import settings
 from app.connectors.base import BaseConnector, _log
 from app.kafka import get_producer
 from app.models.news import NewsSource, RawNewsRecord
@@ -60,7 +60,7 @@ class FinnhubNewsConnector(BaseConnector):
     def __init__(self) -> None:
         self._seen_ids: set[str] = set()
         self._http: httpx.AsyncClient | None = None
-        self._api_key = os.environ.get("FINNHUB_API_KEY", "")
+        self._api_key = settings.finnhub_api_key
         super().__init__()
 
     @property
@@ -69,7 +69,7 @@ class FinnhubNewsConnector(BaseConnector):
 
     @property
     def poll_interval_seconds(self) -> int:
-        return int(os.environ.get("FINNHUB_POLL_INTERVAL", "30"))
+        return settings.finnhub_poll_interval
 
     def validate_config(self) -> None:
         if not self._api_key:
@@ -93,22 +93,13 @@ class FinnhubNewsConnector(BaseConnector):
         producer = get_producer()
         emitted = 0
 
-        # ── 1. General market news ────────────────────────────────────────────
-        try:
-            resp = await http.get("/news", params={"category": "general"})
-            if resp.status_code == 200:
-                articles = resp.json()
-                emitted += await self._process_articles(articles, producer)
-        except Exception as e:
-            _log("error", "finnhub.general_news_error", error=str(e))
-
-        await asyncio.sleep(0.3)  # Rate limit spacing
+        # General news disabled - geopolitical noise
 
         # ── 2. Company-specific news for watchlist ────────────────────────────
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        for ticker in WATCHLIST_TICKERS[:10]:  # Cap to avoid hitting rate limit
+        for ticker in WATCHLIST_TICKERS:  # Cap to avoid hitting rate limit
             try:
                 resp = await http.get("/company-news", params={
                     "symbol": ticker,
@@ -189,7 +180,7 @@ class FinnhubNewsConnector(BaseConnector):
         sentiment = article.get("sentiment", {})
 
         return RawNewsRecord(
-            source=NewsSource.UNKNOWN,   # We'll extend NewsSource below
+            source=NewsSource.FINNHUB,   # We'll extend NewsSource below
             vendor_id=f"finnhub_{article_id}",
             published_at=published_at,
             url=article.get("url", ""),

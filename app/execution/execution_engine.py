@@ -86,7 +86,11 @@ class ExecutionEngine(BaseConsumer):
 
     @property
     def input_topic(self) -> str:
-        return "signals.actionable"
+        # Consume from filtered signals if pre-trade filter is deployed,
+        # fall back to actionable if not (controlled by env var)
+        import os
+        use_filter = os.environ.get("USE_PRETRADE_FILTER", "true").lower() == "true"
+        return "signals.filtered" if use_filter else "signals.actionable"
 
     @property
     def output_topic(self) -> str:
@@ -213,6 +217,9 @@ class ExecutionEngine(BaseConsumer):
         if not self._telegram_token or not self._telegram_chat:
             return
 
+        # Fetch order flow context — informational only, no effect on execution
+        flow = await self._broker.get_order_flow_context(signal.ticker, price)
+
         if result.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
             emoji = "❌"
             header = f"Order REJECTED: {signal.ticker}"
@@ -240,6 +247,43 @@ class ExecutionEngine(BaseConsumer):
             f"Conviction: {conviction_pct}%",
             f"",
             f"📰 _{signal.t1_summary or signal.news_title[:80]}_",
+        ]
+
+        # ── Order flow info block (observe only) ─────────────────────────────
+        flow_lines = []
+        if flow.get("spread_pct") is not None:
+            spread_warn = " ⚠️" if flow["spread_pct"] > 0.5 else ""
+            flow_lines.append(
+                f"Spread: {flow['spread_pct']:.3f}% ({flow['spread_label']}){spread_warn}"
+            )
+        if flow.get("vwap") is not None:
+            vwap_warn = " ⚠️" if "below" in (flow.get("vwap_bias") or "") and signal.direction == "long" else ""
+            vwap_warn = vwap_warn or (" ⚠️" if "above" in (flow.get("vwap_bias") or "") and signal.direction == "short" else "")
+            flow_lines.append(
+                f"VWAP:   ${flow['vwap']:.2f} ({flow['vwap_gap_pct']:+.2f}%) — {flow['vwap_bias']}{vwap_warn}"
+            )
+        if flow_lines:
+            msg_lines.append("")
+            msg_lines.append("📊 _Order Flow (observe only)_")
+            msg_lines.extend(flow_lines)
+        # ── End order flow block ──────────────────────────────────────────────
+
+        # ── Timing window block (observe only) ───────────────────────────────
+        tw_label   = getattr(signal, "time_window_label", None)
+        tw_emoji   = getattr(signal, "time_window_emoji", "")
+        tw_mult    = getattr(signal, "time_window_mult", None)
+        tw_quality = getattr(signal, "time_window_quality", None)
+        if tw_label:
+            tw_warn = " ⚠️" if tw_quality == "poor" else ""
+            mult_str = f"  (would {'+' if tw_mult >= 1.0 else ''}{(tw_mult-1)*100:.0f}% conviction)" if tw_mult else ""
+            msg_lines.append("")
+            msg_lines.append("🕐 _Timing (observe only)_")
+            msg_lines.append(f"{tw_emoji} {tw_label}{tw_warn}")
+            if mult_str:
+                msg_lines.append(f"_{mult_str.strip()}_")
+        # ── End timing block ──────────────────────────────────────────────────
+
+        msg_lines += [
             f"",
             f"Broker: `{self._broker.name}`",
         ]

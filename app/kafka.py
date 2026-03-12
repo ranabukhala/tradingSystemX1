@@ -96,12 +96,28 @@ class KafkaProducer:
             kafka_produce_errors.labels(topic=topic).inc()
             raise
 
-    def produce_to_dlq(self, original_topic: str, value: dict[str, Any], error: str) -> None:
-        """Send failed message to dead letter queue."""
+    def produce_to_dlq(
+        self,
+        original_topic: str,
+        value: dict[str, Any],
+        error: str,
+        error_type: str = "unknown",
+        event_id: str | None = None,
+    ) -> None:
+        """Send failed message to dead letter queue with structured envelope."""
+        from app.models.news import DLQMessage
         dlq_topic = f"{original_topic}.dlq"
-        dlq_payload = {"original_topic": original_topic, "error": error, "payload": value}
-        self.produce(dlq_topic, dlq_payload)
-        log.warning("kafka.dlq.sent", original_topic=original_topic, dlq=dlq_topic)
+        dlq_msg = DLQMessage(
+            original_topic=original_topic,
+            error=error,
+            error_type=error_type,
+            event_id=event_id or value.get("event_id"),
+            payload=value,
+        )
+        self.produce(dlq_topic, dlq_msg.to_kafka_dict())
+        log.warning("kafka.dlq.sent",
+                     original_topic=original_topic, dlq=dlq_topic,
+                     event_id=dlq_msg.event_id)
 
     def flush(self, timeout: float = 10.0) -> None:
         """Flush all pending messages."""

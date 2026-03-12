@@ -25,12 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone, timedelta
 
 import httpx
 import redis.asyncio as aioredis
 
+from app.config import settings
 from app.pipeline.base_consumer import BaseConsumer, _log
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -49,7 +49,7 @@ class FinnhubSentimentService(BaseConsumer):
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
         self._redis: aioredis.Redis | None = None
-        self._api_key = os.environ.get("FINNHUB_API_KEY", "")
+        self._api_key = settings.finnhub_api_key
         super().__init__()
 
     @property
@@ -58,8 +58,7 @@ class FinnhubSentimentService(BaseConsumer):
 
     @property
     def input_topic(self) -> str:
-        # Consume from FMP-enriched if available, else plain enriched
-        return os.environ.get("FINNHUB_INPUT_TOPIC", "news.fmp_enriched")
+        return settings.finnhub_input_topic
 
     @property
     def output_topic(self) -> str:
@@ -72,7 +71,7 @@ class FinnhubSentimentService(BaseConsumer):
             timeout=10.0,
         )
         self._redis = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
         _log("info", "finnhub_sentiment.ready",

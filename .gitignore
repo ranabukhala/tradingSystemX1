@@ -44,3 +44,12 @@ data/
 
 # Docker local overrides
 docker-compose.override.yml
+
+# SQLite state DBs
+*.db
+*.sqlite
+
+# Release archives
+release/
+*.zip
+*.tar.gz

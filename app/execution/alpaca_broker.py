@@ -250,6 +250,75 @@ class AlpacaBroker(BaseBroker):
             _log("warning", "alpaca.quote_error", ticker=ticker, error=str(e))
         return 0.0
 
+    async def get_order_flow_context(self, ticker: str, current_price: float) -> dict:
+        """
+        Fetch bid/ask spread and compute VWAP from today's 1-min bars.
+        Returns informational dict — not used for execution decisions.
+        """
+        result = {
+            "bid": None, "ask": None,
+            "spread_pct": None, "spread_label": None,
+            "vwap": None, "vwap_bias": None,
+            "vwap_gap_pct": None,
+        }
+        try:
+            # Bid/ask spread from latest quote
+            resp = await self._data_http.get(
+                f"/v2/stocks/{ticker}/quotes/latest",
+                params={"feed": "iex"},
+            )
+            if resp.status_code == 200:
+                q = resp.json().get("quote", {})
+                bid = float(q.get("bp", 0) or 0)
+                ask = float(q.get("ap", 0) or 0)
+                if bid > 0 and ask > 0:
+                    spread = ask - bid
+                    spread_pct = round((spread / ask) * 100, 3)
+                    result["bid"] = round(bid, 2)
+                    result["ask"] = round(ask, 2)
+                    result["spread_pct"] = spread_pct
+                    result["spread_label"] = (
+                        "wide — caution" if spread_pct > 0.5 else
+                        "moderate"       if spread_pct > 0.2 else
+                        "tight — ok"
+                    )
+
+            # VWAP from today's 1-min bars (last 390 bars = full trading day)
+            from datetime import date
+            today = date.today().isoformat()
+            resp2 = await self._data_http.get(
+                f"/v2/stocks/{ticker}/bars",
+                params={
+                    "timeframe": "1Min",
+                    "start": f"{today}T09:30:00Z",
+                    "limit": 390,
+                    "feed": "iex",
+                    "adjustment": "raw",
+                },
+            )
+            if resp2.status_code == 200:
+                bars = resp2.json().get("bars", [])
+                if bars:
+                    # VWAP = sum(typical_price * volume) / sum(volume)
+                    cum_tp_vol = sum(
+                        ((b["h"] + b["l"] + b["c"]) / 3) * b["v"]
+                        for b in bars if b.get("v", 0) > 0
+                    )
+                    cum_vol = sum(b["v"] for b in bars if b.get("v", 0) > 0)
+                    if cum_vol > 0:
+                        vwap = round(cum_tp_vol / cum_vol, 2)
+                        vwap_gap = round(((current_price - vwap) / vwap) * 100, 2)
+                        result["vwap"] = vwap
+                        result["vwap_gap_pct"] = vwap_gap
+                        result["vwap_bias"] = (
+                            "bullish — above VWAP" if vwap_gap > 0.15 else
+                            "bearish — below VWAP" if vwap_gap < -0.15 else
+                            "neutral — at VWAP"
+                        )
+        except Exception as e:
+            _log("warning", "alpaca.order_flow_error", ticker=ticker, error=str(e))
+        return result
+
     async def is_market_open(self) -> bool:
         try:
             resp = await self._http.get("/v2/clock")

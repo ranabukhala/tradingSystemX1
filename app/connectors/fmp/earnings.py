@@ -15,13 +15,13 @@ Polls: once at startup, then every 6 hours.
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import datetime, date, timezone, timedelta
 
 import redis.asyncio as aioredis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.connectors.fmp.client import FMPClient
 from app.connectors.base import BaseConnector, _log
 
@@ -37,27 +37,26 @@ class FMPEarningsConnector(BaseConnector):
         return 3600 * 6  # Every 6 hours
 
     def validate_config(self) -> None:
-        if not os.environ.get("FMP_API_KEY"):
+        if not settings.fmp_api_key:
             _log("warning", "fmp_earnings.no_key",
                  msg="FMP_API_KEY not set — earnings calendar disabled")
 
     async def fetch(self) -> int:
-        api_key = os.environ.get("FMP_API_KEY", "")
-        if not api_key:
+        if not settings.fmp_api_key:
             return 0
 
         redis_conn = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
-        fmp = FMPClient(api_key=api_key, redis=redis_conn)
+        fmp = FMPClient(api_key=settings.fmp_api_key, redis=redis_conn)
 
-        # Fetch next 30 days of earnings
+        # Fetch next 60 days of earnings
         today = date.today()
-        end_date = today + timedelta(days=30)
+        end_date = today + timedelta(days=60)
 
         data = await fmp.get(
-            "/stable/earning-calendar",
+            "/stable/earnings-calendar",
             from_=today.isoformat(),
             to=end_date.isoformat(),
         )
@@ -88,13 +87,18 @@ class FMPEarningsConnector(BaseConnector):
                     continue
 
                 # Determine timing
-                timing = item.get("time", "")
-                if timing in ("bmo", "before market open", "BMO"):
+                timing = (item.get("time") or item.get("reportTime") or "").strip().lower()
+                if timing in ("bmo", "before market open", "pre-market", "pre market"):
                     event_time = "BMO"
-                elif timing in ("amc", "after market close", "AMC"):
+                elif timing in ("amc", "after market close", "post-market", "post market", "after market"):
                     event_time = "AMC"
+                elif timing in ("dmh", "during market hours"):
+                    event_time = "DMH"
                 else:
                     event_time = "Unknown"
+                    if timing:
+                        _log("debug", "fmp_earnings.unknown_timing",
+                             ticker=ticker, raw_time=timing)
 
                 eps_estimate    = item.get("epsEstimated")
                 revenue_estimate = item.get("revenueEstimated")

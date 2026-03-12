@@ -76,6 +76,9 @@ class FMPClient:
         endpoint: e.g. "/stable/shares-float"
         params: query parameters (symbol=AAPL, etc.)
         """
+        # Strip trailing underscores from param names (e.g. from_ → from)
+        params = {k.rstrip("_"): v for k, v in params.items()}
+
         # Build cache key
         params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         cache_key = f"fmp:{endpoint}:{params_str}"

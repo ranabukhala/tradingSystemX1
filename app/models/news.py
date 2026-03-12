@@ -24,9 +24,11 @@ from pydantic import BaseModel, Field, model_validator
 class NewsSource(str, Enum):
     BENZINGA = "benzinga"
     POLYGON = "polygon"
-    ALPHAVANTAGE = "alphavantage"
     TIINGO = "tiingo"
     DJNEWS = "djnews"
+    FINNHUB = "finnhub"
+    FINNHUB = "finnhub"
+    FINNHUB = "finnhub"
     UNKNOWN = "unknown"
 
 
@@ -37,6 +39,7 @@ class CatalystType(str, Enum):
     REGULATORY = "regulatory"
     MACRO = "macro"
     MA = "ma"                  # Mergers & Acquisitions
+    LEGAL = "legal"            # Lawsuits, class actions, SEC enforcement
     OTHER = "other"
 
 
@@ -258,6 +261,11 @@ class SummarizedRecord(EnrichedRecord):
     impact_swing: float | None = None      # 0–1, multi-day impact
     regime_flag: RegimeFlag | None = None
     source_credibility: float | None = None  # 0–1, source tier weight
+
+    # New catalyst intelligence fields (v1.3)
+    priced_in: str | None = None            # yes | partially | no
+    priced_in_reason: str | None = None     # one-sentence explanation
+    sympathy_plays: list[str] = Field(default_factory=list)  # sector sympathy tickers
 
     # AI metadata
     prompt_version: str | None = None

@@ -22,12 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone
 
 import httpx
 import redis.asyncio as aioredis
 
+from app.config import settings
 from app.connectors.base import BaseConnector, _log
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -57,16 +57,16 @@ class FinnhubFundamentalsConnector(BaseConnector):
         return 3600 * 6  # Every 6 hours
 
     def validate_config(self) -> None:
-        if not os.environ.get("FINNHUB_API_KEY"):
+        if not settings.finnhub_api_key:
             _log("warning", "finnhub_fundamentals.no_key")
 
     async def fetch(self) -> int:
-        api_key = os.environ.get("FINNHUB_API_KEY", "")
+        api_key = settings.finnhub_api_key
         if not api_key:
             return 0
 
         redis_conn = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
         http = httpx.AsyncClient(

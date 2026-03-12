@@ -89,7 +89,7 @@ class AISummarizerService(BaseConsumer):
 
     @property
     def input_topic(self) -> str:
-        return settings.topic_news_enriched
+        return settings.topic_news_fmp_enriched
 
     @property
     def output_topic(self) -> str:
@@ -211,6 +211,7 @@ class AISummarizerService(BaseConsumer):
             "analyst_context": "",
             "insider_context": "",
             "technical_context": "",
+            "quote_context": "",
         }
 
         try:
@@ -265,6 +266,36 @@ class AISummarizerService(BaseConsumer):
                 f"sells ${insider.get('total_sell_value',0):,.0f} "
                 f"net: {insider.get('net_sentiment','neutral')}\n"
             )
+
+        # Quote / technical setup context
+        quote = raw_record.get("fmp_quote")
+        if quote:
+            gap_pct     = quote.get("gap_pct", 0)
+            vol_ratio   = quote.get("vol_ratio", 0)
+            w52_pos     = quote.get("week52_position", 0.5)
+            price       = quote.get("price", 0)
+            prev_close  = quote.get("prev_close", 0)
+            week52_high = quote.get("week52_high", 0)
+            week52_low  = quote.get("week52_low", 0)
+            avg_vol     = quote.get("avg_volume", 0)
+
+            gap_label = "significant (>4%)" if abs(gap_pct) > 4 else (
+                        "moderate (2-4%)" if abs(gap_pct) > 2 else "small (<2%)")
+            vol_label = "very strong (>3x avg)" if vol_ratio > 3 else (
+                        "strong (>2x avg)" if vol_ratio > 2 else (
+                        "moderate (1-2x avg)" if vol_ratio > 1 else "weak (<avg)"))
+            near_52w_high = w52_pos > 0.90
+            near_52w_low  = w52_pos < 0.10
+            w52_flag = " NEAR 52W HIGH" if near_52w_high else (" NEAR 52W LOW" if near_52w_low else "")
+
+            line1 = "Price: ${} | Prev close: ${} | Gap: {:+.1f}% ({})".format(
+                price, prev_close, gap_pct, gap_label)
+            line2 = "52w range: ${}-${} | Position: {:.0%} of range{}".format(
+                week52_low, week52_high, w52_pos, w52_flag)
+            line3 = "Volume: {:.1f}x avg ({}) | Avg daily vol: {:,}".format(
+                vol_ratio, vol_label, avg_vol)
+
+            ctx["quote_context"] = "\n".join([line1, line2, line3]) + "\n"
 
         return ctx
 
@@ -344,6 +375,7 @@ class AISummarizerService(BaseConsumer):
             beta=fmp_ctx["beta"],
             sector=fmp_ctx["sector"],
             sector_return=fmp_ctx["sector_return"],
+            quote_context=fmp_ctx["quote_context"],
             analyst_context=fmp_ctx["analyst_context"],
             insider_context=fmp_ctx["insider_context"],
             technical_context=fmp_ctx["technical_context"],
@@ -455,6 +487,14 @@ class AISummarizerService(BaseConsumer):
             except ValueError:
                 pass
 
+        # ── Parse sympathy plays — validate they look like real tickers ─────
+        raw_sympathy = t2_result.get("sympathy_plays", []) or []
+        sympathy_plays = [
+            t.upper().strip() for t in raw_sympathy
+            if isinstance(t, str) and 1 <= len(t.strip()) <= 5
+               and t.strip().isalpha()
+        ][:3]  # Cap at 3
+
         # ── Assemble final record ─────────────────────────────────────────────
         summarized = SummarizedRecord(
             **enriched.model_dump(),
@@ -465,6 +505,9 @@ class AISummarizerService(BaseConsumer):
             impact_swing=impact_swing,
             regime_flag=regime_flag,
             source_credibility=t2_result.get("source_credibility"),
+            priced_in=t2_result.get("priced_in"),
+            priced_in_reason=t2_result.get("priced_in_reason"),
+            sympathy_plays=sympathy_plays,
             prompt_version=PROMPT_VERSION,
             llm_tokens_used=total_tokens,
             llm_cost_usd=round(total_cost, 6),

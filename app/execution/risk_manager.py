@@ -38,7 +38,8 @@ class RiskConfig:
     max_daily_loss_pct: float = 0.05      # 5% — halt if exceeded
     max_open_positions: int = 10
     max_sector_concentration_pct: float = 0.25  # 25% of portfolio in one sector
-    min_conviction: float = 0.40
+    min_conviction: float = 0.65
+    min_price: float = 5.00          # Block penny stocks under $5
     allow_premarket: bool = True
     allow_afterhours: bool = False
     max_position_loss_pct: float = 0.05   # Per-position stop: 5%
@@ -53,7 +54,8 @@ class RiskConfig:
             max_position_usd=float(os.environ.get("RISK_MAX_POSITION_USD", "5000")),
             max_daily_loss_pct=float(os.environ.get("RISK_MAX_DAILY_LOSS_PCT", "0.05")),
             max_open_positions=int(os.environ.get("RISK_MAX_OPEN_POSITIONS", "10")),
-            min_conviction=float(os.environ.get("RISK_MIN_CONVICTION", "0.40")),
+            min_conviction=float(os.environ.get("RISK_MIN_CONVICTION", "0.65")),
+            min_price=float(os.environ.get("RISK_MIN_PRICE", "5.00")),
             allow_premarket=os.environ.get("RISK_ALLOW_PREMARKET", "true").lower() == "true",
             allow_afterhours=os.environ.get("RISK_ALLOW_AFTERHOURS", "false").lower() == "true",
             default_take_profit_pct=float(os.environ.get("RISK_TAKE_PROFIT_PCT", "0.10")),
@@ -99,6 +101,13 @@ class RiskManager:
             return RiskDecision(
                 approved=False,
                 reason=f"conviction {conviction:.2f} < min {self.config.min_conviction}"
+            )
+
+        # Block penny stocks
+        if current_price < self.config.min_price:
+            return RiskDecision(
+                approved=False,
+                reason=f"price ${current_price:.2f} below min ${self.config.min_price:.2f}"
             )
 
         # ── 2. Session filter ─────────────────────────────────────────────────

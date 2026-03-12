@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
 
+from app.config import settings
 from app.execution.base_broker import BaseBroker, OrderStatus, Position
 
 
@@ -36,8 +36,8 @@ class PositionMonitor:
         self._broker = broker
         self._running = False
         self._http: httpx.AsyncClient | None = None
-        self._telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        self._telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+        self._telegram_token = settings.telegram_bot_token
+        self._telegram_chat = settings.telegram_chat_id
 
         # In-memory tracking: ticker → metadata from execution engine
         self._position_meta: dict[str, dict] = {}

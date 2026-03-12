@@ -192,36 +192,45 @@ class DeduplicatorService(BaseConsumer):
 
     async def _store_title(self, norm: NormalizedRecord, cluster_id: UUID) -> None:
         """
-        Upsert into news_item so it's available for future fuzzy matches.
-        Only stores the fields needed for dedup — full record written by enricher.
+        Upsert into news_cluster + news_item so items are available for future
+        fuzzy matches.
+
+        IMPORTANT: news_cluster must be inserted BEFORE news_item because
+        news_item.cluster_id has a FK constraint referencing news_cluster.id.
+        Both writes are in a single transaction for atomicity.
         """
         if not self._Session:
             return
         try:
             from sqlalchemy import text
             async with self._Session() as session:
+                # Step 1: Ensure the cluster row exists first
                 await session.execute(text("""
-                    INSERT INTO news_item (
-                        id, source, vendor_id, published_at, received_at,
-                        url, canonical_url, title, snippet, content_hash, cluster_id
-                    ) VALUES (
-                        :id, :source, :vendor_id, :published_at, :received_at,
-                        :url, :canonical_url, :title, :snippet, :content_hash, :cluster_id
-                    )
-                    ON CONFLICT (source, vendor_id) DO NOTHING
-                """), {
-                    "id": str(norm.id),
-                    "source": norm.source.value,
-                    "vendor_id": norm.vendor_id,
-                    "published_at": norm.published_at,
-                    "received_at": norm.received_at,
-                    "url": norm.url,
-                    "canonical_url": norm.canonical_url,
-                    "title": norm.title,
-                    "snippet": norm.snippet,
-                    "content_hash": norm.content_hash,
-                    "cluster_id": str(cluster_id),
-                })
+                                           INSERT INTO news_cluster (id)
+                                           VALUES (:cluster_id) ON CONFLICT (id) DO NOTHING
+                                           """), {"cluster_id": str(cluster_id)})
+
+                # Step 2: Insert the news_item referencing the cluster
+                await session.execute(text("""
+                                           INSERT INTO news_item (id, source, vendor_id, published_at, received_at,
+                                                                  url, canonical_url, title, snippet, content_hash,
+                                                                  cluster_id)
+                                           VALUES (:id, :source, :vendor_id, :published_at, :received_at,
+                                                   :url, :canonical_url, :title, :snippet, :content_hash,
+                                                   :cluster_id) ON CONFLICT (source, vendor_id) DO NOTHING
+                                           """), {
+                                          "id": str(norm.id),
+                                          "source": norm.source.value,
+                                          "vendor_id": norm.vendor_id,
+                                          "published_at": norm.published_at,
+                                          "received_at": norm.received_at,
+                                          "url": norm.url,
+                                          "canonical_url": norm.canonical_url,
+                                          "title": norm.title,
+                                          "snippet": norm.snippet,
+                                          "content_hash": norm.content_hash,
+                                          "cluster_id": str(cluster_id),
+                                      })
                 await session.commit()
         except Exception as e:
             _log("warning", "deduplicator.store_title_error", error=str(e))

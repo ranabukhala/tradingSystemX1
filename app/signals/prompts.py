@@ -3,7 +3,7 @@ Prompt templates for the AI summarizer.
 All prompts versioned — bump PROMPT_VERSION when changing.
 """
 
-PROMPT_VERSION = "v1.2"
+PROMPT_VERSION = "v1.3"
 
 # ── T1 Prompt: Fast facts extraction ─────────────────────────────────────────
 T1_SYSTEM = """You are a financial news analyst. Extract structured facts from news headlines.
@@ -74,7 +74,7 @@ Impact score: {impact_day} (day), {impact_swing} (swing)
 Float: {float_shares} shares ({float_sensitivity} sensitivity)
 Market cap tier: {market_cap_tier} | Beta: {beta}
 Sector: {sector} | Sector today: {sector_return}%
-{analyst_context}{insider_context}{technical_context}{earnings_history}{analyst_consensus}{sentiment_score}
+{quote_context}{analyst_context}{insider_context}{technical_context}{earnings_history}{analyst_consensus}{sentiment_score}
 --- End Context ---
 
 Respond with this exact JSON structure:
@@ -84,7 +84,10 @@ Respond with this exact JSON structure:
   "source_credibility": 0.0,
   "signal_bias": "long|short|neutral",
   "key_levels": [],
-  "watch_for": ""
+  "watch_for": "",
+  "priced_in": "yes|partially|no",
+  "priced_in_reason": "one sentence explaining why",
+  "sympathy_plays": []
 }}
 
 Rules:
@@ -99,7 +102,10 @@ Rules:
 - source_credibility: 0.0-1.0 (1.0=SEC filing/earnings, 0.7=major outlet, 0.4=blog/rumor)
 - signal_bias: directional lean for primary ticker
 - key_levels: list of important price levels mentioned or implied (numbers only)
-- watch_for: what to monitor in next 30 minutes"""
+- watch_for: one sentence — specific price level or event that invalidates this thesis in next 30 min
+- priced_in: yes=market already moved on this, partially=some anticipation priced, no=genuine surprise
+- priced_in_reason: cite pre-market move, whisper numbers, or prior analyst coverage as evidence
+- sympathy_plays: list up to 3 tickers in same sector/theme likely to move in sympathy (NOT the primary ticker). Empty list if no clear sympathy plays. Only well-known liquid tickers."""
 
 
 # ── Regime Prompt: Market context ────────────────────────────────────────────

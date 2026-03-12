@@ -88,11 +88,15 @@ class FMPEnrichmentService(BaseConsumer):
         primary = tickers[0]
 
         # Run enrichment tasks in parallel
-        float_data, profile, analyst, insider = await asyncio.gather(
+        async def _noop():
+            return None
+
+        float_data, profile, analyst, insider, quote = await asyncio.gather(
             self._get_float(primary),
             self._get_profile(primary),
-            self._get_analyst(primary) if catalyst in ("analyst", "earnings") else asyncio.coroutine(lambda: None)(),
-            self._get_insider(primary) if catalyst in ("earnings", "ma", "regulatory") else asyncio.coroutine(lambda: None)(),
+            self._get_analyst(primary) if catalyst in ("analyst", "earnings") else _noop(),
+            self._get_insider(primary) if catalyst in ("earnings", "ma", "regulatory") else _noop(),
+            self._get_quote(primary),
             return_exceptions=True,
         )
 
@@ -131,6 +135,15 @@ class FMPEnrichmentService(BaseConsumer):
         # ── Insider activity ───────────────────────────────────────────────────
         if insider and not isinstance(insider, Exception):
             record["fmp_insider"] = insider
+
+        # ── Quote data: price context for technical setup analysis ──────────────
+        if quote and not isinstance(quote, Exception):
+            record["fmp_quote"] = quote
+            _log("debug", "fmp.quote_resolved",
+                 ticker=primary,
+                 prev_close=quote.get("prev_close"),
+                 week52_high=quote.get("week52_high"),
+                 avg_volume=quote.get("avg_volume"))
 
         record["fmp_enriched"] = True
         record["fmp_requests_remaining"] = self._fmp.daily_requests_remaining
@@ -235,6 +248,51 @@ class FMPEnrichmentService(BaseConsumer):
             "net_sentiment":     "bullish" if total_buy_value > total_sell_value else "bearish",
             "notable":           total_buy_value > 500_000 or total_sell_value > 1_000_000,
         }
+
+
+    async def _get_quote(self, ticker: str) -> dict | None:
+        """
+        Fetch intraday quote for technical setup context.
+        Returns: prev_close, price, 52w high/low, avg_volume, change_pct, volume
+        Single FMP call to /stable/quote
+        """
+        data = await self._fmp.get("/stable/quote", symbol=ticker)
+        if not data or not isinstance(data, list) or not data:
+            return None
+        q = data[0]
+        try:
+            prev_close   = float(q.get("previousClose") or 0)
+            price        = float(q.get("price") or 0)
+            week52_high  = float(q.get("yearHigh") or 0)
+            week52_low   = float(q.get("yearLow") or 0)
+            avg_volume   = int(q.get("avgVolume") or 0)
+            volume       = int(q.get("volume") or 0)
+            change_pct   = float(q.get("changesPercentage") or 0)
+
+            # Gap % = (current price - prev close) / prev close * 100
+            gap_pct = round(((price - prev_close) / prev_close * 100), 2) if prev_close else 0.0
+
+            # Volume ratio vs average
+            vol_ratio = round(volume / avg_volume, 2) if avg_volume else 0.0
+
+            # 52w position: where is price in the 52w range (0=at low, 1=at high)
+            week52_range = week52_high - week52_low
+            week52_position = round((price - week52_low) / week52_range, 2) if week52_range else 0.5
+
+            return {
+                "price":           round(price, 2),
+                "prev_close":      round(prev_close, 2),
+                "gap_pct":         gap_pct,
+                "week52_high":     round(week52_high, 2),
+                "week52_low":      round(week52_low, 2),
+                "week52_position": week52_position,   # 0.0–1.0
+                "avg_volume":      avg_volume,
+                "volume":          volume,
+                "vol_ratio":       vol_ratio,         # current vol / avg vol
+                "change_pct":      round(change_pct, 2),
+            }
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
 
 
 def _classify_market_cap(mkt_cap: float) -> str:

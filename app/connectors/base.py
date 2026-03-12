@@ -5,9 +5,8 @@ Handles: metrics, logging, retry logic, graceful shutdown.
 from __future__ import annotations
 
 import asyncio
-import os
-import sys
 import json
+import sys
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
@@ -19,6 +18,8 @@ from tenacity import (
     wait_exponential,
     retry_if_exception_type,
 )
+
+from app.config import settings
 
 
 def _log(level: str, event: str, **kw) -> None:
@@ -32,7 +33,7 @@ class BaseConnector(ABC):
     def __init__(self) -> None:
         self._running = False
         self._setup_metrics()
-        metrics_port = int(os.environ.get("METRICS_PORT", 8000))
+        metrics_port = settings.metrics_port
         try:
             start_http_server(metrics_port)
             _log("info", "connector.metrics_server.started", port=metrics_port)

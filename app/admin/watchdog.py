@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
@@ -22,6 +21,8 @@ from typing import Any
 
 import httpx
 import redis.asyncio as aioredis
+
+from app.config import settings
 
 POLL_INTERVAL = 30          # seconds between health checks
 SILENCE_THRESHOLD = 300     # seconds — connector silence = alert
@@ -100,8 +101,8 @@ class WatchdogService:
         self._restart_history: dict[str, list[float]] = {}
         self._snapshot = SystemSnapshot()
 
-        self._bot_token = os.environ.get("ADMIN_BOT_TOKEN", "")
-        self._admin_chat_id = os.environ.get("ADMIN_CHAT_ID", "")
+        self._bot_token = settings.admin_bot_token
+        self._admin_chat_id = settings.admin_chat_id or ""
         self._docker_socket = "/var/run/docker.sock"
 
         # Initialize health state
@@ -113,7 +114,7 @@ class WatchdogService:
         self._running = True
         self._http = httpx.AsyncClient(timeout=10.0)
         self._redis = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
         _log("info", "watchdog.started", services=len(MONITORED_SERVICES))
@@ -229,7 +230,7 @@ class WatchdogService:
             spent = await self._redis.get(spend_key)
             if spent:
                 self._snapshot.llm_budget_used = float(spent)
-                limit = float(os.environ.get("LLM_DAILY_BUDGET_USD", "5.0"))
+                limit = float(settings.llm_daily_budget_usd)
                 self._snapshot.llm_budget_limit = limit
                 pct = self._snapshot.llm_budget_used / limit
                 if pct >= BUDGET_WARN_PCT:

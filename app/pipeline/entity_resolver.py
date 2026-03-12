@@ -99,6 +99,7 @@ DECAY_MINUTES: dict[CatalystType, int] = {
     CatalystType.REGULATORY:  480,   # 8h — FDA etc lasts longer
     CatalystType.FILING:       60,   # 1h — SEC filings mostly noise
     CatalystType.MACRO:       180,   # 3h — macro context shifts
+    CatalystType.LEGAL:        30,   # 30min — lawsuits are lagging, move already priced
     CatalystType.OTHER:        60,
 }
 
@@ -110,6 +111,7 @@ CATALYST_PATTERNS: list[tuple[re.Pattern, CatalystType]] = [
     (re.compile(r'\b(fda|approval|trial|phase [123]|nda|bla|anda|pdufa)\b', re.I), CatalystType.REGULATORY),
     (re.compile(r'\b(sec|8-k|10-k|10-q|proxy|insider|filing)\b', re.I), CatalystType.FILING),
     (re.compile(r'\b(fed|fomc|cpi|inflation|gdp|jobs|payroll|interest rate|powell|yellen)\b', re.I), CatalystType.MACRO),
+    (re.compile(r'\b(lawsuit|class action|securities fraud|litigation|rosen law|korsinsky|bronstein|shareholder rights|alleged fraud|investor loss|contact.*attorney|suffered loss)\b', re.I), CatalystType.LEGAL),
 ]
 
 # Category string → CatalystType
@@ -160,29 +162,58 @@ def resolve_tickers(raw_tickers: list[str], title: str) -> tuple[list[str], dict
     """
     Validate and score tickers.
     Returns (resolved_tickers, confidence_map).
+
+    Scoring logic:
+      0.95 — $TICKER explicitly in title (highest signal)
+      0.85 — vendor tag AND ticker appears in title as bare word
+      0.75 — ticker appears as bare word in title (known universe only)
+      0.60 — vendor-provided tag only, NOT in title (possible mismatch)
+
+    Threshold: only accept tickers with confidence >= 0.70
+    This blocks vendor tags that don't appear in the title at all.
     """
     confidence: dict[str, float] = {}
 
-    # Vendor-provided tickers get high confidence
+    # Pre-compute title presence for cross-validation
+    title_upper = title.upper()
+    title_dollar_tickers = set(re.findall(r'\$([A-Z]{1,5})', title))
+    title_bare_words = set(re.findall(r'\b([A-Z]{1,5})\b', title_upper))
+
+    # Scan title for $TICKER — highest confidence, unambiguous
+    for t in title_dollar_tickers:
+        if t not in TICKER_BLACKLIST:
+            confidence[t] = 0.95
+
+    # Vendor-provided tickers — cross-validate against title
     for t in raw_tickers:
         t = t.upper().strip()
-        if t and t not in TICKER_BLACKLIST and (t in KNOWN_TICKERS or len(t) <= 5):
-            confidence[t] = 0.90
+        if not t or t in TICKER_BLACKLIST:
+            continue
+        if len(t) > 5:
+            continue
+        if t in title_dollar_tickers:
+            # Already scored 0.95 above
+            continue
+        elif t in title_bare_words and t in KNOWN_TICKERS:
+            # Vendor tag confirmed by title mention — high confidence
+            confidence[t] = max(confidence.get(t, 0), 0.85)
+        elif t in title_bare_words:
+            # In title but not known universe — moderate confidence
+            confidence[t] = max(confidence.get(t, 0), 0.72)
+        else:
+            # Vendor tag NOT in title — likely a related/mentioned ticker, not primary
+            # Only accept if it's a well-known ticker (reduces false positives)
+            if t in KNOWN_TICKERS:
+                confidence[t] = max(confidence.get(t, 0), 0.60)
+            # Unknown tickers not in title are discarded entirely
 
-    # Scan title for $TICKER or ALL-CAPS 1-5 char words that look like tickers
-    title_tickers = re.findall(r'\$([A-Z]{1,5})', title)
-    for t in title_tickers:
-        if t not in TICKER_BLACKLIST:
-            confidence[t] = max(confidence.get(t, 0), 0.95)  # $ prefix = high confidence
-
-    # Scan for bare uppercase words that match known universe
-    words = re.findall(r'\b([A-Z]{1,5})\b', title)
-    for t in words:
+    # Scan for bare uppercase words matching known universe (title-derived)
+    for t in title_bare_words:
         if t in KNOWN_TICKERS and t not in TICKER_BLACKLIST:
             confidence[t] = max(confidence.get(t, 0), 0.75)
 
-    # Filter to confidence >= 0.7
-    resolved = [t for t, c in confidence.items() if c >= 0.70]
+    # Filter to confidence >= 0.70 — this excludes vendor-only tags not in title
+    resolved = [t for t, c in sorted(confidence.items(), key=lambda x: -x[1]) if c >= 0.70]
     return resolved, confidence
 
 

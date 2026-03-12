@@ -42,7 +42,8 @@ RUN pip install --no-cache-dir --upgrade pip \
         click \
         rich \
         asyncpg \
-        websocket-client
+        websocket-client \
+        pytest
 
 # Copy application code
 COPY app/ ./app/
@@ -50,6 +51,7 @@ COPY alembic/ ./alembic/
 COPY alembic.ini .
 COPY config/ ./config/
 COPY scripts/ ./scripts/
+COPY tests/ ./tests/
 
 # Health check default (overridden per service)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \

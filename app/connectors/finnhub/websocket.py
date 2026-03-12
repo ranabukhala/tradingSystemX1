@@ -58,7 +58,8 @@ class FinnhubWebSocketConnector:
     """
 
     def __init__(self) -> None:
-        self._api_key = os.environ.get("FINNHUB_API_KEY", "")
+        from app.config import settings
+        self._api_key = settings.finnhub_api_key
         self._running = False
         self._seen_ids: set[str] = set()
         self._reconnect_delay = 5   # seconds, doubles on each failure

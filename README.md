@@ -139,6 +139,114 @@ Docker Network: trading_net
 
 ---
 
+## Required Environment Variables
+
+Copy `.env.example` to `.env` and configure:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BENZINGA_API_KEY` | Yes (for news) | Benzinga API key |
+| `POLYGON_API_KEY` | Yes (for news/prices) | Polygon.io API key |
+| `BROKER` | Yes | `alpaca_paper`, `alpaca_live`, `ibkr_paper`, `ibkr_live` |
+| `CONFIRM_LIVE_TRADING` | For live | Must be `true` for live brokers (safety guard) |
+| `DATA_DIR` | No | SQLite state DB directory (default: `/data`) |
+| `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` | For Alpaca | Broker credentials |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | For alerts | Telegram notifications |
+
+---
+
+## Compose Profiles
+
+Start subsets of the stack:
+
+```bash
+make up-infra          # Postgres, Redis, Redpanda, MinIO, Grafana, Prometheus
+make up-connectors     # News/price connectors (requires infra)
+make up-pipeline       # Normalizer, deduplicator, entity resolver
+make up-signals        # AI summarizer, signal aggregator, telegram alerts
+make up-execution      # Execution engine, position monitor
+```
+
+Full stack: `make up` (starts infra + all profiles).
+
+---
+
+## SQLite State DB (Idempotency)
+
+Pipeline stages and the execution engine use SQLite for at-least-once safety:
+
+- **Location:** `{DATA_DIR}/state.db` (default `/data/state.db`)
+- **Volume:** `service_data:/data` is mounted for all connector/pipeline/execution services
+- **Tables:** `processed_events` (per-stage dedup), `order_idempotency` (execution), `daily_loss_tracker` (risk)
+
+**Inspect from host:**
+```bash
+docker compose run --no-deps --rm --entrypoint sqlite3 connector_benzinga /data/state.db "SELECT * FROM processed_events LIMIT 10"
+```
+
+---
+
+## DLQ Inspect & Replay
+
+Failed messages go to `{topic}.dlq` (e.g. `news.raw.dlq`).
+
+**List DLQ messages:**
+```bash
+make dlq-inspect t=news.raw.dlq
+# or: docker compose run --rm --entrypoint python connector_benzinga -m app.dlq inspect news.raw.dlq --limit 20
+```
+
+**Replay by event_id:**
+```bash
+make dlq-replay id=<event_id> t=news.raw.dlq
+```
+
+**Replay all (dry-run first):**
+```bash
+docker compose run --rm --entrypoint python connector_benzinga -m app.dlq replay news.raw.dlq --all --dry-run
+```
+
+**DLQ metrics:** `pipeline_dlq_total` (Prometheus) — alert on rate spikes in Grafana.
+
+---
+
+## Risk Controls & Safety Guardrails
+
+- **CONFIRM_LIVE_TRADING:** Must be `true` for live brokers; execution exits otherwise
+- **Daily loss cap:** `RISK_DAILY_LOSS_CAP_USD` (default 2000)
+- **Consecutive loss halt:** `RISK_CONSECUTIVE_LOSS_HALT` (default 5)
+- **Max orders per day:** `RISK_MAX_ORDERS_PER_DAY` (default 120)
+- **Cooldown after loss:** `RISK_COOLDOWN_AFTER_LOSS_MINUTES` (default 30)
+- **Position limits:** `RISK_MAX_POSITION_PCT`, `RISK_MAX_OPEN_POSITIONS`
+
+All risk settings are in `app/config.py` and `.env.example`.
+
+---
+
+## Paper Trading Quickstart
+
+```bash
+cp .env.example .env
+# Set BROKER=alpaca_paper and add ALPACA_API_KEY, ALPACA_SECRET_KEY
+make up
+# Execution engine runs in paper mode; no real orders
+```
+
+For live: set `BROKER=alpaca_live` and `CONFIRM_LIVE_TRADING=true`.
+
+---
+
+## Testing
+
+```bash
+make test-unit    # Unit tests (idempotency, schemas, execution safety) — no infra needed
+make test        # Full test suite (requires infra up)
+```
+
+Local: `pytest tests/ -v` (requires Python 3.11+).
+
+---
+
 ## Troubleshooting
 
 **Containers not starting:**

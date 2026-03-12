@@ -60,7 +60,7 @@ class OrderRequest:
     order_type: OrderType = OrderType.MARKET
     limit_price: float | None = None
     stop_price: float | None = None
-    time_in_force: TimeInForce = TimeInForce.DAY
+    time_in_force: TimeInForce = TimeInForce.GTC
 
     # Attached orders (bracket)
     take_profit_price: float | None = None
@@ -175,6 +175,13 @@ class BaseBroker(ABC):
     async def close_position(self, ticker: str) -> OrderResult:
         """Market close entire position."""
         ...
+
+    async def get_order_flow_context(self, ticker: str, current_price: float) -> dict:
+        """
+        Optional: fetch bid/ask spread and VWAP for informational display.
+        Default returns empty dict — brokers override if supported.
+        """
+        return {}
 
     @abstractmethod
     async def get_quote(self, ticker: str) -> float:

@@ -18,11 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 
+from app.config import settings
 from app.connectors.fmp.client import FMPClient
 from app.connectors.base import BaseConnector, _log
 
@@ -46,15 +46,14 @@ class FMPTechnicalConnector(BaseConnector):
         pass
 
     async def fetch(self) -> int:
-        api_key = os.environ.get("FMP_API_KEY", "")
-        if not api_key:
+        if not settings.fmp_api_key:
             return 0
 
         redis_conn = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
-        fmp = FMPClient(api_key=api_key, redis=redis_conn, plan=os.environ.get("FMP_PLAN", "free"))
+        fmp = FMPClient(api_key=settings.fmp_api_key, redis=redis_conn, plan=settings.fmp_plan)
 
         # Get active signal tickers from Redis (written by signal aggregator)
         active_tickers_raw = await redis_conn.smembers("active_signal_tickers")
@@ -84,21 +83,21 @@ class FMPTechnicalConnector(BaseConnector):
         return updated
 
     async def _fetch_technicals(self, fmp: FMPClient, ticker: str) -> dict | None:
-        # RSI (14-period daily)
+        # RSI (14-period daily) — requires FMP paid plan (402 on free/starter)
+        # If 402 is returned, FMPClient logs fmp.http_error and returns None gracefully.
+        # In that case we skip RSI — Polygon RSI in technicals.py covers the pre-trade filter.
         rsi_data = await fmp.get(
-            "/stable/technical-indicator/daily",
+            "/stable/technical-indicators/rsi",
             symbol=ticker,
-            type="rsi",
-            period=14,
-            limit=1,
+            periodLength=14,
+            timeframe="1day",
         )
 
-        # MACD
+        # MACD — same plan requirement as RSI
         macd_data = await fmp.get(
-            "/stable/technical-indicator/daily",
+            "/stable/technical-indicators/macd",
             symbol=ticker,
-            type="macd",
-            limit=1,
+            timeframe="1day",
         )
 
         if not rsi_data and not macd_data:
@@ -107,14 +106,16 @@ class FMPTechnicalConnector(BaseConnector):
         result: dict = {"ticker": ticker, "updated_at": datetime.now(timezone.utc).isoformat()}
 
         if rsi_data and isinstance(rsi_data, list) and rsi_data:
-            result["rsi"] = round(rsi_data[0].get("rsi", 0), 1)
+            # New endpoint returns: {"date": ..., "value": ...}
+            result["rsi"] = round(float(rsi_data[0].get("value", 0)), 1)
             result["rsi_signal"] = _rsi_signal(result["rsi"])
 
         if macd_data and isinstance(macd_data, list) and macd_data:
             macd = macd_data[0]
-            result["macd"]        = round(macd.get("macd", 0), 4)
-            result["macd_signal"] = round(macd.get("macdSignal", 0), 4)
-            result["macd_hist"]   = round(macd.get("macdHistogram", 0), 4)
+            # New endpoint returns: {"date": ..., "value": ..., "signal": ..., "histogram": ...}
+            result["macd"]        = round(float(macd.get("value", 0)), 4)
+            result["macd_signal"] = round(float(macd.get("signal", 0)), 4)
+            result["macd_hist"]   = round(float(macd.get("histogram", 0)), 4)
             result["macd_bias"]   = "bullish" if result["macd"] > result["macd_signal"] else "bearish"
 
         return result
@@ -139,27 +140,38 @@ class FMPSectorConnector(BaseConnector):
         pass
 
     async def fetch(self) -> int:
-        api_key = os.environ.get("FMP_API_KEY", "")
-        if not api_key:
+        if not settings.fmp_api_key:
             return 0
 
         redis_conn = await aioredis.from_url(
-            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            settings.redis_url,
             decode_responses=True,
         )
-        fmp = FMPClient(api_key=api_key, redis=redis_conn)
+        fmp = FMPClient(api_key=settings.fmp_api_key, redis=redis_conn)
 
-        data = await fmp.get("/stable/sector-performance")
+        # Stable endpoint requires a date parameter — use today
+        from datetime import date as _date
+        today_str = _date.today().isoformat()
+        data = await fmp.get("/stable/sector-performance-snapshot", date=today_str)
 
         if not data or not isinstance(data, list):
             await fmp.close()
             return 0
 
         # Build sector map
+        # New stable response: [{sector, averageChange, exchange, date}, ...]
+        # Legacy response used changesPercentage (string with % sign) — now a float
         sectors = {}
         for item in data:
             sector = item.get("sector", "")
-            change_pct = float(item.get("changesPercentage", "0").replace("%", ""))
+            if not sector:
+                continue
+            # averageChange is a float in new endpoint; handle both formats defensively
+            raw = item.get("averageChange", item.get("changesPercentage", 0))
+            try:
+                change_pct = float(str(raw).replace("%", ""))
+            except (ValueError, TypeError):
+                change_pct = 0.0
             sectors[sector] = change_pct
 
         # Determine overall market regime from sectors

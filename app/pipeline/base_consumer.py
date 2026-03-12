@@ -1,24 +1,28 @@
 """
 Base class for all pipeline consumer services.
-Handles: Kafka consume loop, metrics, graceful shutdown, DLQ routing.
+Handles: Kafka consume loop, metrics, graceful shutdown, DLQ routing,
+         idempotency (SQLite), and correlation ID propagation.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
-import signal
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from typing import Any
+from uuid import uuid4
 
 from confluent_kafka import Consumer, KafkaError, KafkaException
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
+from app.config import settings
+from app.logging import get_logger, bind_event_context, clear_event_context
+
+log = get_logger("base_consumer")
+
 
 def _log(level: str, event: str, **kw) -> None:
-    entry = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "event": event, **kw}
-    print(json.dumps(entry), flush=True)
+    """Legacy log helper — delegates to structlog."""
+    getattr(log, level, log.info)(event, **kw)
 
 
 class BaseConsumer(ABC):
@@ -26,19 +30,17 @@ class BaseConsumer(ABC):
     Base for all pipeline stage consumers.
 
     Subclasses implement:
-      - input_topic: str
-      - output_topic: str
-      - service_name: str
+      - input_topic, output_topic, service_name
       - process(record: dict) -> dict | None
-          Return processed record to emit, or None to skip/drop.
     """
 
     def __init__(self) -> None:
         self._running = False
         self._consumer: Consumer | None = None
+        self._idempotency = None
         self._setup_metrics()
 
-        metrics_port = int(os.environ.get("METRICS_PORT", 8000))
+        metrics_port = settings.metrics_port
         try:
             start_http_server(metrics_port)
             _log("info", "service.metrics_server.started", port=metrics_port)
@@ -61,40 +63,36 @@ class BaseConsumer(ABC):
 
     @abstractmethod
     async def process(self, record: dict) -> dict | None:
-        """
-        Process one record.
-        Return enriched/transformed dict to emit downstream, or None to drop.
-        Raise exception to route to DLQ.
-        """
+        """Process one record. Return dict to emit or None to drop. Raise to DLQ."""
         ...
 
     async def on_start(self) -> None:
-        """Optional hook called once before consume loop starts."""
         pass
 
     async def on_stop(self) -> None:
-        """Optional hook called after consume loop ends."""
         pass
 
     def _setup_metrics(self) -> None:
-        svc = self.service_name
         self.metric_consumed = Counter(
-            f"pipeline_consumed_total", "Messages consumed", ["service"])
+            "pipeline_consumed_total", "Messages consumed", ["service"])
         self.metric_emitted = Counter(
-            f"pipeline_emitted_total", "Messages emitted", ["service"])
+            "pipeline_emitted_total", "Messages emitted", ["service"])
         self.metric_dropped = Counter(
-            f"pipeline_dropped_total", "Messages dropped (dedup/filter)", ["service"])
+            "pipeline_dropped_total", "Messages dropped (dedup/filter)", ["service"])
         self.metric_errors = Counter(
-            f"pipeline_errors_total", "Processing errors", ["service", "error_type"])
+            "pipeline_errors_total", "Processing errors", ["service", "error_type"])
+        self.metric_dlq = Counter(
+            "pipeline_dlq_total", "Messages sent to DLQ", ["service"])
+        self.metric_dedup_skipped = Counter(
+            "pipeline_dedup_skipped_total", "Messages skipped by idempotency", ["service"])
         self.metric_process_latency = Histogram(
-            f"pipeline_process_latency_seconds", "Per-message processing time", ["service"])
+            "pipeline_process_latency_seconds", "Per-message processing time", ["service"])
         self.metric_lag = Gauge(
-            f"pipeline_consumer_lag", "Estimated consumer lag", ["service"])
+            "pipeline_consumer_lag", "Estimated consumer lag", ["service"])
         self.metric_up = Gauge(
-            f"pipeline_up", "1 if service healthy", ["service"])
+            "pipeline_up", "1 if service healthy", ["service"])
 
     def _make_consumer(self) -> Consumer:
-        from app.config import settings
         return Consumer({
             "bootstrap.servers": settings.kafka_bootstrap_servers,
             "group.id": f"{settings.kafka_group_id}-{self.service_name}",
@@ -107,6 +105,12 @@ class BaseConsumer(ABC):
     def _make_producer(self):
         from app.kafka import get_producer
         return get_producer()
+
+    def _get_idempotency_store(self):
+        if self._idempotency is None:
+            from app.idempotency import IdempotencyStore
+            self._idempotency = IdempotencyStore()
+        return self._idempotency
 
     async def run(self) -> None:
         self._running = True
@@ -123,10 +127,10 @@ class BaseConsumer(ABC):
         self.metric_up.labels(service=svc).set(1)
 
         loop = asyncio.get_running_loop()
+        idem = self._get_idempotency_store()
 
         try:
             while self._running:
-                # Poll in thread to not block event loop
                 msg = await loop.run_in_executor(
                     None, lambda: self._consumer.poll(timeout=1.0)
                 )
@@ -152,6 +156,20 @@ class BaseConsumer(ABC):
                     self._consumer.commit(msg)
                     continue
 
+                # ── Extract/generate event_id for correlation ──────────
+                event_id = raw.get("event_id") or str(uuid4())
+                bind_event_context(event_id, service=svc, topic=self.input_topic)
+
+                # ── Idempotency check ──────────────────────────────────
+                already = idem.check_and_mark(svc, event_id)
+                if already:
+                    _log("debug", "service.dedup_skipped",
+                         service=svc, event_id=event_id)
+                    self.metric_dedup_skipped.labels(service=svc).inc()
+                    self._consumer.commit(msg)
+                    clear_event_context()
+                    continue
+
                 try:
                     with self.metric_process_latency.labels(service=svc).time():
                         result = await self.process(raw)
@@ -159,6 +177,12 @@ class BaseConsumer(ABC):
                     if result is None:
                         self.metric_dropped.labels(service=svc).inc()
                     else:
+                        # Propagate correlation IDs
+                        if "event_id" not in result:
+                            result["event_id"] = str(uuid4())
+                        if "parent_id" not in result:
+                            result["parent_id"] = event_id
+
                         key = result.get("vendor_id") or result.get("id")
                         producer.produce(
                             topic=self.output_topic,
@@ -169,19 +193,28 @@ class BaseConsumer(ABC):
 
                 except Exception as e:
                     _log("error", "service.process_error",
-                         service=svc, error=str(e), msg_key=str(msg.key()))
+                         service=svc, error=str(e), event_id=event_id)
                     self.metric_errors.labels(service=svc, error_type=type(e).__name__).inc()
-                    # Route to DLQ
+                    self.metric_dlq.labels(service=svc).inc()
                     try:
-                        producer.produce_to_dlq(
+                        from app.models.news import DLQMessage
+                        dlq_msg = DLQMessage(
                             original_topic=self.input_topic,
-                            value=raw,
                             error=str(e),
+                            error_type=type(e).__name__,
+                            event_id=event_id,
+                            payload=raw,
+                        )
+                        producer.produce(
+                            topic=f"{self.input_topic}.dlq",
+                            value=dlq_msg.to_kafka_dict(),
+                            key=event_id,
                         )
                     except Exception:
                         pass
 
                 self._consumer.commit(msg)
+                clear_event_context()
 
         except Exception as e:
             _log("error", "service.fatal_error", service=svc, error=str(e))
@@ -190,6 +223,8 @@ class BaseConsumer(ABC):
         finally:
             if self._consumer:
                 self._consumer.close()
+            if self._idempotency:
+                self._idempotency.close()
             await self.on_stop()
             _log("info", "service.stopped", service=svc)
 

@@ -129,6 +129,12 @@ services:
       KAFKA_SCHEMAREGISTRY_URLS: http://redpanda:8081
     ports:
       - "8088:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/brokers > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
     networks:
       - trading_net
 
@@ -203,6 +209,12 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/brokers > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
     environment:
       ADMINER_DEFAULT_SERVER: postgres
     depends_on:
@@ -295,6 +307,13 @@ services:
     ports:
       - "8001:8001"             # Prometheus metrics scrape port
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   connector_polygon_news:
     <<: *connector
     container_name: trading_connector_polygon_news
@@ -310,6 +329,13 @@ services:
     ports:
       - "8002:8002"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   connector_polygon_prices:
     <<: *connector
     container_name: trading_connector_polygon_prices
@@ -323,6 +349,13 @@ services:
       POSTGRES_HOST: postgres
     ports:
       - "8003:8003"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   connector_earnings:
     <<: *connector
@@ -338,6 +371,13 @@ services:
     ports:
       - "8004:8004"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   connector_fred:
     <<: *connector
     container_name: trading_connector_fred
@@ -351,6 +391,13 @@ services:
       POSTGRES_HOST: postgres
     ports:
       - "8005:8005"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   # ══════════════════════════════════════════════════════════
   #  LAYER 4 — PIPELINE SERVICES (Phase 2)
@@ -371,6 +418,13 @@ services:
     ports:
       - "8011:8011"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   pipeline_deduplicator:
     <<: *connector
     container_name: trading_pipeline_deduplicator
@@ -386,6 +440,13 @@ services:
     ports:
       - "8012:8012"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   pipeline_entity_resolver:
     <<: *connector
     container_name: trading_pipeline_entity_resolver
@@ -395,10 +456,17 @@ services:
       SERVICE_NAME: entity_resolver
       METRICS_PORT: "8013"
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       POSTGRES_HOST: postgres
     ports:
       - "8013:8013"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 
   # ══════════════════════════════════════════════════════════
@@ -421,6 +489,13 @@ services:
     ports:
       - "8021:8021"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   signals_signal_aggregator:
     <<: *connector
     container_name: trading_signals_aggregator
@@ -430,8 +505,16 @@ services:
       SERVICE_NAME: signal_aggregator
       METRICS_PORT: "8022"
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
     ports:
       - "8022:8022"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   signals_telegram_alerts:
     <<: *connector
@@ -446,6 +529,12 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ports:
       - "8023:8023"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 
   # ══════════════════════════════════════════════════════════
@@ -471,6 +560,13 @@ services:
     ports:
       - "8031:8031"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   admin_bot:
     <<: *connector
     container_name: trading_admin_bot
@@ -478,6 +574,7 @@ services:
     command: ["admin_bot"]
     environment:
       SERVICE_NAME: admin_bot
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       METRICS_PORT: "8032"
       REDIS_URL: redis://redis:6379/0
       ADMIN_BOT_TOKEN: ${ADMIN_BOT_TOKEN:-}
@@ -487,6 +584,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     ports:
       - "8032:8032"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 
   # ══════════════════════════════════════════════════════════
@@ -503,6 +606,8 @@ services:
       METRICS_PORT: "8041"
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      # Pre-trade filter integration
+      USE_PRETRADE_FILTER: ${USE_PRETRADE_FILTER:-true}
       # Broker selection: alpaca_paper | alpaca_live | ibkr_paper | ibkr_live
       BROKER: ${BROKER:-alpaca_paper}
       ALPACA_API_KEY: ${ALPACA_API_KEY:-}
@@ -517,13 +622,21 @@ services:
       RISK_MAX_POSITION_USD: ${RISK_MAX_POSITION_USD:-5000}
       RISK_MAX_DAILY_LOSS_PCT: ${RISK_MAX_DAILY_LOSS_PCT:-0.05}
       RISK_MAX_OPEN_POSITIONS: ${RISK_MAX_OPEN_POSITIONS:-10}
-      RISK_MIN_CONVICTION: ${RISK_MIN_CONVICTION:-0.40}
+      RISK_MIN_CONVICTION: ${RISK_MIN_CONVICTION:-0.65}
+      RISK_MIN_PRICE: ${RISK_MIN_PRICE:-5.00}
       RISK_ALLOW_PREMARKET: ${RISK_ALLOW_PREMARKET:-true}
       RISK_TAKE_PROFIT_PCT: ${RISK_TAKE_PROFIT_PCT:-0.10}
       RISK_STOP_LOSS_PCT: ${RISK_STOP_LOSS_PCT:-0.04}
       RISK_USE_BRACKET_ORDERS: ${RISK_USE_BRACKET_ORDERS:-true}
     ports:
       - "8041:8041"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   position_monitor:
     <<: *connector
@@ -543,6 +656,12 @@ services:
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     ports:
       - "8042:8042"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 
   # ══════════════════════════════════════════════════════════
@@ -564,6 +683,13 @@ services:
     ports:
       - "8051:8051"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   fmp_earnings:
     <<: *connector
     container_name: trading_fmp_earnings
@@ -580,6 +706,13 @@ services:
     ports:
       - "8052:8052"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   fmp_technical:
     <<: *connector
     container_name: trading_fmp_technical
@@ -594,6 +727,13 @@ services:
     ports:
       - "8053:8053"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   fmp_sectors:
     <<: *connector
     container_name: trading_fmp_sectors
@@ -607,8 +747,12 @@ services:
       FMP_PLAN: ${FMP_PLAN:-free}
     ports:
       - "8054:8054"
-
-
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
   # ══════════════════════════════════════════════════════════
   #  LAYER 9 — FINNHUB CONNECTORS (Phase 4C)
   # ══════════════════════════════════════════════════════════
@@ -627,6 +771,13 @@ services:
     ports:
       - "8061:8061"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   finnhub_websocket:
     <<: *connector
     container_name: trading_finnhub_websocket
@@ -639,6 +790,13 @@ services:
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     ports:
       - "8062:8062"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   finnhub_sentiment:
     <<: *connector
@@ -655,6 +813,13 @@ services:
     ports:
       - "8063:8063"
 
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   finnhub_fundamentals:
     <<: *connector
     container_name: trading_finnhub_fundamentals
@@ -667,7 +832,61 @@ services:
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     ports:
       - "8064:8064"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+  # ══════════════════════════════════════════════════════════
+  #  LAYER 10 — PRE-TRADE FILTERS (Phase 5)
+  # ══════════════════════════════════════════════════════════
 
+  regime_poller:
+    <<: *connector
+    container_name: trading_regime_poller
+    entrypoint: ["python", "-m", "app.filters"]
+    command: ["regime"]
+    environment:
+      SERVICE_NAME: regime_poller
+      METRICS_PORT: "8073"
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      REDIS_URL: redis://redis:6379/0
+      REGIME_POLL_INTERVAL: "300"
+    ports:
+      - "8073:8073"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  pretrade_filter:
+    <<: *connector
+    container_name: trading_pretrade_filter
+    entrypoint: ["python", "-m", "app.filters"]
+    command: ["pretrade"]
+    environment:
+      SERVICE_NAME: pretrade_filter
+      METRICS_PORT: "8074"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
+      UNUSUAL_WHALES_API_KEY: ${UNUSUAL_WHALES_API_KEY:-}
+      TRADIER_API_KEY: ${TRADIER_API_KEY:-}
+      IEX_API_KEY: ${IEX_API_KEY:-}
+      FINVIZ_API_KEY: ${FINVIZ_API_KEY:-}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      USE_PRETRADE_FILTER: "true"
+    ports:
+      - "8074:8074"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
 # ══════════════════════════════════════════════════════════
 #  VOLUMES & NETWORKS

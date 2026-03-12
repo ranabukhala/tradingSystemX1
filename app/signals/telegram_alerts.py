@@ -53,6 +53,7 @@ CATALYST_LABELS = {
     "regulatory": "💊 Regulatory",
     "filing":     "📋 SEC Filing",
     "macro":      "🌍 Macro",
+    "legal":      "⚖️ Legal/Lawsuit ⚠️",
     "other":      "📰 News",
 }
 
@@ -94,7 +95,25 @@ def format_signal_message(signal: TradingSignal) -> str:
 
     if signal.t2_summary:
         lines.append(f"")
-        lines.append(f"💡 {signal.t2_summary}")
+        # Sympathy signals get a different header
+        if getattr(signal, "is_sympathy", False):
+            lines.append(f"↗️ {signal.t2_summary}")
+        else:
+            lines.append(f"💡 {signal.t2_summary}")
+
+    # Priced-in status
+    if getattr(signal, "priced_in", None) and not getattr(signal, "is_sympathy", False):
+        priced_emoji = {"yes": "🔴", "partially": "🟡", "no": "🟢"}.get(signal.priced_in, "⚪")
+        lines.append(f"")
+        lines.append(f"{priced_emoji} Priced in: {signal.priced_in.title()}")
+        if getattr(signal, "priced_in_reason", None):
+            lines.append(f"   _{signal.priced_in_reason}_")
+
+    # Sympathy plays
+    if getattr(signal, "sympathy_plays", None) and not getattr(signal, "is_sympathy", False):
+        plays = " · ".join(signal.sympathy_plays)
+        lines.append(f"")
+        lines.append(f"🔗 Sympathy: {plays}")
 
     lines.append(f"")
     lines.append(f"{session} · {catalyst}")
@@ -108,6 +127,21 @@ def format_signal_message(signal: TradingSignal) -> str:
         tier_emoji = {"mega": "🏔️", "large": "🏢", "mid": "🏬",
                       "small": "🏪", "micro": "🏠"}.get(signal.market_cap_tier, "")
         lines.append(f"Cap tier: {tier_emoji} {signal.market_cap_tier.title()}")
+
+    # Timing window (observe only)
+    tw_label   = getattr(signal, "time_window_label", None)
+    tw_emoji   = getattr(signal, "time_window_emoji", "")
+    tw_mult    = getattr(signal, "time_window_mult", None)
+    tw_quality = getattr(signal, "time_window_quality", None)
+    if tw_label:
+        tw_warn = " ⚠️" if tw_quality == "poor" else ""
+        mult_str = ""
+        if tw_mult is not None:
+            delta = (tw_mult - 1) * 100
+            sign = "+" if delta >= 0 else ""
+            mult_str = f" ({sign}{delta:.0f}% if enabled)"
+        lines.append(f"")
+        lines.append(f"🕐 _Timing:_ {tw_emoji} {tw_label}{tw_warn}{mult_str}")
 
     lines.append(f"")
     lines.append(f"🆔 `{str(signal.id)[:8]}`")
