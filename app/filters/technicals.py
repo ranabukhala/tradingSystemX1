@@ -23,6 +23,11 @@ Examples:
   LONG signal, stock above all MAs, RSI 55, MACD bullish, high vol → score +0.85 → +20% conviction
   LONG signal, stock below 200MA, RSI 72 (overbought), low vol    → score -0.4 → -30% conviction
   LONG signal, stock below all MAs, RSI 75, MACD bearish          → score -0.75 → BLOCKED
+
+RSI source priority:
+  1. fmp:technical:{ticker}    Redis key (written by fmp_technical connector)
+  2. finnhub:technical:{ticker} Redis key (written by finnhub connector)
+  3. Polygon /v1/indicators/rsi/{ticker} — primary live source; cached 1hr in poly:rsi:{ticker}
 """
 from __future__ import annotations
 
@@ -84,15 +89,21 @@ async def score_technicals(
     # ── Pull data ──────────────────────────────────────────────────────────────
     await _populate_price_data(result, ticker, redis_conn, http, api_key)
 
-    if result.price <= 0:
-        # No price data — pass through with neutral score but log for diagnostics
-        _log("warning", "technical_filter.no_price_data",
+    # No price AND no RSI — truly nothing to score, pass through neutral
+    if result.price <= 0 and result.rsi is None:
+        _log("warning", "technical_filter.no_data",
              ticker=ticker,
              api_key_present=bool(api_key),
-             rsi_from_redis=result.rsi,
-             note="Polygon snapshot returned no price — check POLYGON_API_KEY env var")
+             note="Polygon snapshot returned no price and RSI unavailable — passing neutral")
         result.conviction_multiplier = 1.0
         return result
+
+    # Price unavailable but RSI exists — log and continue with RSI-only scoring
+    if result.price <= 0:
+        _log("warning", "technical_filter.no_price_data",
+             ticker=ticker,
+             rsi=result.rsi,
+             note="Polygon snapshot returned no price (pre-market?) — scoring RSI only")
 
     # ── Score each check ───────────────────────────────────────────────────────
     raw_score = 0.0
@@ -194,27 +205,69 @@ async def _populate_price_data(
 ) -> None:
     """Fill TechnicalScore with price + indicator data from Redis/Polygon."""
 
-    # 1. RSI + MACD from FMP Redis cache (written by fmp_technical service)
+    # 1a. RSI + MACD from FMP Redis cache (written by fmp_technical connector)
     try:
         tech_raw = await redis_conn.get(f"fmp:technical:{ticker}")
         if tech_raw:
             tech = json.loads(tech_raw)
             result.rsi = tech.get("rsi")
             result.macd_bias = tech.get("macd_bias")
-    except Exception:
-        pass
+    except Exception as e:
+        _log("warning", "technical_filter.fmp_cache_error", ticker=ticker, error=str(e))
 
-    # Also try Finnhub sentiment RSI
+    # 1b. Finnhub RSI cache (written by finnhub connector)
     if result.rsi is None:
         try:
             fh_raw = await redis_conn.get(f"finnhub:technical:{ticker}")
             if fh_raw:
                 fh = json.loads(fh_raw)
                 result.rsi = fh.get("rsi")
-        except Exception:
-            pass
+        except Exception as e:
+            _log("warning", "technical_filter.finnhub_cache_error", ticker=ticker, error=str(e))
 
-    # 2. Current price + MAs from Polygon snapshot
+    # 1c. Polygon RSI — authoritative source when FMP/Finnhub caches are empty.
+    #     FMP returns 402 (plan restriction); Finnhub technical cache is not populated.
+    #     Endpoint: GET /v1/indicators/rsi/{ticker}?timespan=day&window=14&series_type=close&limit=1
+    #     Cached in Redis as poly:rsi:{ticker} for 1 hour to avoid per-signal API calls.
+    if result.rsi is None and api_key:
+        try:
+            cache_key = f"poly:rsi:{ticker}"
+            cached = await redis_conn.get(cache_key)
+            if cached:
+                result.rsi = float(cached)
+            else:
+                resp = await http.get(
+                    f"{POLYGON_BASE}/v1/indicators/rsi/{ticker}",
+                    params={
+                        "timespan":   "day",
+                        "window":     14,
+                        "series_type": "close",
+                        "limit":      1,
+                        "apiKey":     api_key,
+                    },
+                    timeout=8.0,
+                )
+                if resp.status_code == 200:
+                    values = resp.json().get("results", {}).get("values", [])
+                    if values:
+                        result.rsi = round(float(values[0]["value"]), 2)
+                        await redis_conn.setex(cache_key, 3600, str(result.rsi))
+                        _log("debug", "technical_filter.rsi_fetched",
+                             ticker=ticker, rsi=result.rsi, source="polygon")
+                    else:
+                        _log("warning", "technical_filter.rsi_empty",
+                             ticker=ticker,
+                             note="Polygon RSI endpoint returned no values for ticker")
+                else:
+                    _log("warning", "technical_filter.rsi_error",
+                         ticker=ticker, status=resp.status_code,
+                         api_key_present=bool(api_key))
+        except Exception as e:
+            _log("warning", "technical_filter.rsi_exception",
+                 ticker=ticker, error=str(e))
+
+    # 2. Current price from Polygon snapshot.
+    #    Fallback chain: day.c (intraday close) → lastTrade.p → prevDay.c (pre-market safe fallback)
     try:
         resp = await http.get(
             f"{POLYGON_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
@@ -222,11 +275,18 @@ async def _populate_price_data(
             timeout=8.0,
         )
         if resp.status_code == 200:
-            snap = resp.json().get("ticker", {})
-            day = snap.get("day", {})
-            result.price = float(day.get("c") or snap.get("lastTrade", {}).get("p") or 0)
-            result.volume = float(day.get("v") or 0)
-            result.avg_volume = float(snap.get("prevDay", {}).get("v") or 0)
+            snap     = resp.json().get("ticker", {})
+            day      = snap.get("day", {})
+            prev_day = snap.get("prevDay", {})
+            last     = snap.get("lastTrade", {})
+            result.price = float(
+                day.get("c") or
+                last.get("p") or
+                prev_day.get("c") or      # pre-market: today's close not yet available
+                0
+            )
+            result.volume     = float(day.get("v") or 0)
+            result.avg_volume = float(prev_day.get("v") or 0)
         else:
             _log("warning", "technical_filter.snapshot_error",
                  ticker=ticker, status=resp.status_code,
@@ -235,7 +295,7 @@ async def _populate_price_data(
         _log("warning", "technical_filter.snapshot_exception",
              ticker=ticker, error=str(e))
 
-    # 3. MAs from Polygon SMA endpoint
+    # 3. MAs from Polygon SMA endpoint — only meaningful when we have a current price.
     if result.price > 0 and api_key:
         for period, attr in [(20, "ma20"), (50, "ma50"), (200, "ma200")]:
             try:
@@ -257,6 +317,9 @@ async def _populate_price_data(
                         ma = float(values[0]["value"])
                         setattr(result, attr, ma)
                         await redis_conn.setex(cache_key, 3600, str(ma))  # Cache 1hr
+                    else:
+                        _log("warning", "technical_filter.sma_empty",
+                             ticker=ticker, period=period)
                 else:
                     _log("warning", "technical_filter.sma_error",
                          ticker=ticker, period=period, status=resp.status_code)

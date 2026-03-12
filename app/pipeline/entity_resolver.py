@@ -167,7 +167,7 @@ def resolve_tickers(raw_tickers: list[str], title: str) -> tuple[list[str], dict
       0.95 — $TICKER explicitly in title (highest signal)
       0.85 — vendor tag AND ticker appears in title as bare word
       0.75 — ticker appears as bare word in title (known universe only)
-      0.60 — vendor-provided tag only, NOT in title (possible mismatch)
+      0.75 — vendor-provided tag only, NOT in title (trusted for source-specific feeds)
 
     Threshold: only accept tickers with confidence >= 0.70
     This blocks vendor tags that don't appear in the title at all.
@@ -204,7 +204,7 @@ def resolve_tickers(raw_tickers: list[str], title: str) -> tuple[list[str], dict
             # Vendor tag NOT in title — likely a related/mentioned ticker, not primary
             # Only accept if it's a well-known ticker (reduces false positives)
             if t in KNOWN_TICKERS:
-                confidence[t] = max(confidence.get(t, 0), 0.60)
+                confidence[t] = max(confidence.get(t, 0), 0.75)
             # Unknown tickers not in title are discarded entirely
 
     # Scan for bare uppercase words matching known universe (title-derived)
