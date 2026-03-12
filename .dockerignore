@@ -1,0 +1,57 @@
+# Secrets — NEVER ship
+.env
+*.env
+.env.*
+!.env.example
+
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.venv
+venv
+env
+dist
+build
+*.egg-info
+.eggs
+.pytest_cache
+.coverage
+htmlcov
+.mypy_cache
+.ruff_cache
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+.DS_Store
+
+# Docker
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+
+# Docs / dev files (keep tests for make test)
+README.md
+*.md
+Makefile
+*.log
+logs
+
+# Data
+*.csv
+*.parquet
+data
+*.db
+*.sqlite
+
+# CI
+.github
+.gitlab-ci.yml

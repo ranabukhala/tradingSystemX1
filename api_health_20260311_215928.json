@@ -1,0 +1,125 @@
+{
+  "generated_at": "2026-03-11T21:59:28.340833+00:00",
+  "summary": {
+    "total": 13,
+    "ok": 6,
+    "fail": 4,
+    "warn": 1,
+    "skip": 2
+  },
+  "checks": [
+    {
+      "api": "Polygon",
+      "check": "Stock Snapshot (SPY)",
+      "status": "OK",
+      "latency_ms": 593.9999999245629,
+      "detail": "SPY last=$676.33",
+      "data": {
+        "price": 676.33
+      }
+    },
+    {
+      "api": "Polygon",
+      "check": "SMA Indicator (NVDA/20d)",
+      "status": "OK",
+      "latency_ms": 172.0000000204891,
+      "detail": "SMA20=185.63",
+      "data": {
+        "timestamp": 1773201600000,
+        "value": 185.63450000000006
+      }
+    },
+    {
+      "api": "Polygon",
+      "check": "Options Chain (NVDA)",
+      "status": "FAIL",
+      "latency_ms": 155.9999999590218,
+      "detail": "HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"edcb1bc7dc5c627e8daa221dcba30a4e\",\"message\":\"You are not entitled to this data.",
+      "data": {}
+    },
+    {
+      "api": "Unusual Whales",
+      "check": "Flow Alerts (NVDA)",
+      "status": "SKIP",
+      "latency_ms": null,
+      "detail": "UNUSUAL_WHALES_API_KEY not set",
+      "data": {}
+    },
+    {
+      "api": "Tradier",
+      "check": "Options Chain (NVDA)",
+      "status": "SKIP",
+      "latency_ms": null,
+      "detail": "TRADIER_API_KEY not set",
+      "data": {}
+    },
+    {
+      "api": "IEX Cloud",
+      "check": "Short Interest (NVDA)",
+      "status": "FAIL",
+      "latency_ms": null,
+      "detail": "All connection attempts failed",
+      "data": {}
+    },
+    {
+      "api": "Finviz",
+      "check": "Short Float Scrape (NVDA)",
+      "status": "WARN",
+      "latency_ms": 734.000000054948,
+      "detail": "Page loaded but short float not found \u2014 Finviz HTML may have changed",
+      "data": {}
+    },
+    {
+      "api": "FMP",
+      "check": "Quote (NVDA)",
+      "status": "FAIL",
+      "latency_ms": 1109.000000054948,
+      "detail": "HTTP 403: {\n  \"Error Message\": \"Legacy Endpoint : Due to Legacy endpoints being no longer supported - This endpoint is only availa",
+      "data": {}
+    },
+    {
+      "api": "FMP",
+      "check": "Technical Indicators / RSI (NVDA)",
+      "status": "FAIL",
+      "latency_ms": 155.9999999590218,
+      "detail": "HTTP 403: {\n  \"Error Message\": \"Legacy Endpoint : Due to Legacy endpoints being no longer supported - This endpoint is only availa",
+      "data": {}
+    },
+    {
+      "api": "Finnhub",
+      "check": "Company News (NVDA)",
+      "status": "OK",
+      "latency_ms": 1109.000000054948,
+      "detail": "250 articles in last 7 days",
+      "data": {}
+    },
+    {
+      "api": "Finnhub",
+      "check": "Earnings Calendar",
+      "status": "OK",
+      "latency_ms": 1015.999999945052,
+      "detail": "788 earnings events in next 14 days",
+      "data": {}
+    },
+    {
+      "api": "Alpaca",
+      "check": "Paper Account",
+      "status": "OK",
+      "latency_ms": 1234.000000054948,
+      "detail": "status=ACTIVE equity=$100,186.79 buying_power=$371,115.40",
+      "data": {
+        "equity": "100186.79",
+        "buying_power": "371115.4",
+        "status": "ACTIVE"
+      }
+    },
+    {
+      "api": "Alpaca",
+      "check": "Paper Orders Endpoint",
+      "status": "OK",
+      "latency_ms": 140.99999994505197,
+      "detail": "5 recent orders accessible",
+      "data": {}
+    }
+  ]
+}

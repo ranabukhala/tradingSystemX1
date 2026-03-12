@@ -1,0 +1,220 @@
+{
+  "generated_at": "2026-03-12T11:28:13.577840+00:00",
+  "summary": {
+    "total": 14,
+    "ok": 9,
+    "fail": 2,
+    "warn": 1,
+    "skip": 2
+  },
+  "checks": [
+    {
+      "api": "Polygon",
+      "check": "Stock Snapshot (SPY)",
+      "status": "OK",
+      "latency_ms": 515.0000000139698,
+      "detail": "SPY last=$676.33",
+      "data": {
+        "price": 676.33
+      }
+    },
+    {
+      "api": "Polygon",
+      "check": "SMA Indicator (NVDA/20d)",
+      "status": "OK",
+      "latency_ms": 172.0000000204891,
+      "detail": "SMA20=185.63",
+      "data": {
+        "timestamp": 1773201600000,
+        "value": 185.63450000000006
+      }
+    },
+    {
+      "api": "Polygon",
+      "check": "Options Chain (NVDA)",
+      "status": "FAIL",
+      "latency_ms": 155.9999999590218,
+      "detail": "HTTP 403: {\"status\":\"NOT_AUTHORIZED\",\"request_id\":\"597c64aacc6f0d01dea034b8723eb250\",\"message\":\"You are not entitled to this data.",
+      "data": {}
+    },
+    {
+      "api": "Unusual Whales",
+      "check": "Flow Alerts (NVDA)",
+      "status": "SKIP",
+      "latency_ms": null,
+      "detail": "UNUSUAL_WHALES_API_KEY not set",
+      "data": {}
+    },
+    {
+      "api": "Tradier",
+      "check": "Options Chain (NVDA)",
+      "status": "SKIP",
+      "latency_ms": null,
+      "detail": "TRADIER_API_KEY not set",
+      "data": {}
+    },
+    {
+      "api": "IEX Cloud",
+      "check": "Short Interest (NVDA)",
+      "status": "FAIL",
+      "latency_ms": null,
+      "detail": "",
+      "data": {}
+    },
+    {
+      "api": "Finviz Elite",
+      "check": "Screener API Connectivity",
+      "status": "OK",
+      "latency_ms": 827.9999999795109,
+      "detail": "Screener OK \u2014 277 high-short-float stocks returned",
+      "data": {
+        "row_count": 277
+      }
+    },
+    {
+      "api": "FMP",
+      "check": "Quote (NVDA)",
+      "status": "OK",
+      "latency_ms": 937.9999999655411,
+      "detail": "NVDA price=$186.03",
+      "data": {
+        "symbol": "NVDA",
+        "name": "NVIDIA Corporation",
+        "price": 186.03,
+        "changePercentage": 0.68193,
+        "change": 1.26,
+        "volume": 138663908,
+        "dayLow": 184.4501,
+        "dayHigh": 187.62,
+        "yearHigh": 212.19,
+        "yearLow": 86.62,
+        "marketCap": 4521458871513,
+        "priceAvg50": 185.708,
+        "priceAvg200": 176.9079,
+        "exchange": "NASDAQ",
+        "open": 185.92,
+        "previousClose": 184.77,
+        "timestamp": 1773259200
+      }
+    },
+    {
+      "api": "FMP",
+      "check": "RSI Indicator (NVDA)",
+      "status": "WARN",
+      "latency_ms": 140.00000001396984,
+      "detail": "Plan restriction \u2014 RSI requires FMP paid plan (Polygon RSI used instead)",
+      "data": {}
+    },
+    {
+      "api": "FMP",
+      "check": "Sector Performance",
+      "status": "OK",
+      "latency_ms": 172.0000000204891,
+      "detail": "11 sectors returned",
+      "data": [
+        {
+          "date": "2026-03-12",
+          "sector": "Basic Materials",
+          "exchange": "NASDAQ",
+          "averageChange": 0.8333764977279223
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Communication Services",
+          "exchange": "NASDAQ",
+          "averageChange": 0.146274719673678
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Consumer Cyclical",
+          "exchange": "NASDAQ",
+          "averageChange": -0.3648248666556553
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Consumer Defensive",
+          "exchange": "NASDAQ",
+          "averageChange": -0.5763161141949746
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Energy",
+          "exchange": "NASDAQ",
+          "averageChange": 1.8663171400018275
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Financial Services",
+          "exchange": "NASDAQ",
+          "averageChange": -1.039341706727659
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Healthcare",
+          "exchange": "NASDAQ",
+          "averageChange": 0.07377665826049373
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Industrials",
+          "exchange": "NASDAQ",
+          "averageChange": 0.18284864157898095
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Real Estate",
+          "exchange": "NASDAQ",
+          "averageChange": 1.3151499390021248
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Technology",
+          "exchange": "NASDAQ",
+          "averageChange": -0.0004025575549349014
+        },
+        {
+          "date": "2026-03-12",
+          "sector": "Utilities",
+          "exchange": "NASDAQ",
+          "averageChange": -3.3128167981624546
+        }
+      ]
+    },
+    {
+      "api": "Finnhub",
+      "check": "Company News (NVDA)",
+      "status": "OK",
+      "latency_ms": 780.9999999590218,
+      "detail": "250 articles in last 7 days",
+      "data": {}
+    },
+    {
+      "api": "Finnhub",
+      "check": "Earnings Calendar",
+      "status": "OK",
+      "latency_ms": 1172.000000020489,
+      "detail": "820 earnings events in next 14 days",
+      "data": {}
+    },
+    {
+      "api": "Alpaca",
+      "check": "Paper Account",
+      "status": "OK",
+      "latency_ms": 765.999999945052,
+      "detail": "status=ACTIVE equity=$100,334.97 buying_power=$371,327.52",
+      "data": {
+        "equity": "100334.97",
+        "buying_power": "371327.52",
+        "status": "ACTIVE"
+      }
+    },
+    {
+      "api": "Alpaca",
+      "check": "Paper Orders Endpoint",
+      "status": "OK",
+      "latency_ms": 156.00000007543713,
+      "detail": "5 recent orders accessible",
+      "data": {}
+    }
+  ]
+}

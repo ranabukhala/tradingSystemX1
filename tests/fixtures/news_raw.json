@@ -1,0 +1,16 @@
+{
+  "event_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "schema_version": "1",
+  "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "source": "benzinga",
+  "vendor_id": "bz_12345",
+  "published_at": "2024-01-15T08:30:00+00:00",
+  "received_at": "2024-01-15T08:30:05+00:00",
+  "url": "https://www.benzinga.com/news/12345",
+  "title": "Apple Reports Record Q4 Earnings, Beats EPS by $0.12",
+  "snippet": "Apple Inc beat Wall Street estimates with strong iPhone sales driving record quarterly revenue",
+  "author": "John Doe",
+  "raw_tickers": ["AAPL", "MSFT"],
+  "raw_categories": ["earnings"],
+  "raw_payload": {"original_id": 12345}
+}
