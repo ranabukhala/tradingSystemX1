@@ -3,40 +3,44 @@ FMP API Client — shared HTTP client for all FMP connectors.
 
 Handles:
   - Authentication (apikey query param)
-  - Rate limiting (750 req/min on free, 3000 on paid)
-  - Redis caching (avoid redundant calls)
-  - Retry with backoff
-  - Free plan: 250 req/day budget tracking
+  - Redis-backed cross-container daily call budget (via fmp_rate_limiter)
+  - Cache-aside (get_or_fetch): cache hit does NOT touch the daily counter
+  - Intra-process HTTP rate throttle (80 ms between real calls)
+  - HTTP error handling (401 / 402 / 429)
+
+Budget enforcement:
+  The old per-process _daily_count allowed each container to independently
+  spend 250 calls (4 containers × 250 = 1,000 possible).  Now a single Redis
+  key  fmp:api:calls:YYYY-MM-DD  is atomically INCRd for every real HTTP call
+  so all containers share one counter against settings.fmp_daily_call_limit.
 
 Usage:
     client = FMPClient(api_key="...", redis=redis_conn)
     data = await client.get("/stable/shares-float", symbol="AAPL")
+    data = await client.get("/stable/earnings-calendar", from_="2026-01-01", to="2026-03-01")
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import redis.asyncio as aioredis
 
+from app.config import settings
+from app.connectors.fmp_rate_limiter import (
+    build_cache_key,
+    get_or_fetch,
+    get_remaining,
+    get_ttl_for_endpoint,
+)
+
 BASE_URL = "https://financialmodelingprep.com"
-RATE_LIMIT_DELAY = 0.2       # 200ms between requests = 300/min safe for free plan
-CACHE_TTL = {
-    "shares-float":      3600 * 4,    # 4h — float rarely changes
-    "profile":           3600 * 24,   # 24h — company profile is stable
-    "analyst-estimates": 3600 * 2,    # 2h — analyst ratings update occasionally
-    "analyst-price-target-summary": 3600 * 2,
-    "insider-trading":   3600 * 1,    # 1h — insider trades are time-sensitive
-    "earning-calendar":  3600 * 1,    # 1h — earnings dates
-    "senate-trading":    3600 * 6,    # 6h — congressional trades
-    "technical-indicator": 60 * 5,    # 5min — RSI/MACD change frequently
-    "quote":             30,           # 30s — real-time price
-    "sector-performance": 60 * 15,    # 15min
-}
+# 80 ms between real HTTP calls → at most ~750 req/min ceiling
+# (well above the free-plan 300/min; keeps us from spiking)
+RATE_LIMIT_DELAY = 0.08
 
 
 def _log(level: str, event: str, **kw) -> None:
@@ -51,19 +55,22 @@ class FMPClient:
         self,
         api_key: str,
         redis: aioredis.Redis | None = None,
-        plan: str = "free",   # free | starter | premium
+        plan: str = "free",
     ) -> None:
         self._api_key = api_key
         self._redis = redis
         self._plan = plan
+        self._daily_limit: int = settings.fmp_daily_call_limit
         self._http = httpx.AsyncClient(
             base_url=BASE_URL,
             timeout=15.0,
             headers={"User-Agent": "trading-system/1.0"},
         )
-        self._last_request = 0.0
-        self._daily_count = 0
-        self._daily_limit = 250 if plan == "free" else 99999
+        self._last_request: float = 0.0
+        # Session-level counter: counts real HTTP calls (cache misses) in THIS
+        # process only.  Kept for informational Kafka metadata; cross-container
+        # budget enforcement is handled by Redis (fmp_rate_limiter).
+        self._session_calls: int = 0
 
     async def get(
         self,
@@ -72,56 +79,62 @@ class FMPClient:
         **params,
     ) -> Any:
         """
-        GET request with caching and rate limiting.
+        GET request with Redis cache-aside and shared daily budget.
+
         endpoint: e.g. "/stable/shares-float"
-        params: query parameters (symbol=AAPL, etc.)
+        params:   query parameters (symbol=AAPL, from_="2026-01-01", etc.)
+                  Trailing underscores are stripped (from_ → from).
+
+        Returns deserialized JSON or None on error / budget exhausted.
         """
-        # Strip trailing underscores from param names (e.g. from_ → from)
+        # Normalise param names: Python keyword conflict workaround (from_ → from)
         params = {k.rstrip("_"): v for k, v in params.items()}
 
-        # Build cache key
-        params_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        cache_key = f"fmp:{endpoint}:{params_str}"
-
-        # Check cache first
         if cache and self._redis:
-            cached = await self._redis.get(cache_key)
-            if cached:
-                return json.loads(cached)
+            cache_key = build_cache_key(endpoint, params)
+            ttl = get_ttl_for_endpoint(endpoint)
+            result = await get_or_fetch(
+                self._redis,
+                cache_key,
+                lambda: self._raw_get(endpoint, params),
+                ttl,
+                self._daily_limit,
+            )
+            return result
+        else:
+            # No Redis — direct call; no shared budget tracking
+            return await self._raw_get(endpoint, params)
 
-        # Daily limit check (free plan)
-        if self._daily_count >= self._daily_limit:
-            _log("warning", "fmp.daily_limit_reached",
-                 count=self._daily_count, limit=self._daily_limit)
-            return None
-
-        # Rate limiting
+    async def _raw_get(self, endpoint: str, params: dict) -> Any:
+        """
+        Raw HTTP GET — no caching, no budget check.
+        Called by get_or_fetch() after a cache miss + budget approval.
+        Increments _session_calls so the informational property stays accurate.
+        """
+        # Intra-process rate throttle
         now = asyncio.get_event_loop().time()
         elapsed = now - self._last_request
         if elapsed < RATE_LIMIT_DELAY:
             await asyncio.sleep(RATE_LIMIT_DELAY - elapsed)
         self._last_request = asyncio.get_event_loop().time()
 
-        # Make request
+        self._session_calls += 1  # count the HTTP attempt
+
         try:
             resp = await self._http.get(
                 endpoint,
                 params={"apikey": self._api_key, **params},
             )
-            self._daily_count += 1
 
             if resp.status_code == 200:
-                data = resp.json()
-
-                # Cache result
-                if cache and self._redis and data:
-                    ttl = self._get_ttl(endpoint)
-                    await self._redis.setex(cache_key, ttl, json.dumps(data))
-
-                return data
-
+                return resp.json()
             elif resp.status_code == 401:
                 _log("error", "fmp.unauthorized", endpoint=endpoint)
+                return None
+            elif resp.status_code == 402:
+                _log("debug", "fmp.plan_required",
+                     endpoint=endpoint, plan=self._plan,
+                     msg="Endpoint requires a higher FMP plan")
                 return None
             elif resp.status_code == 429:
                 _log("warning", "fmp.rate_limited", endpoint=endpoint)
@@ -136,20 +149,27 @@ class FMPClient:
             _log("error", "fmp.request_error", endpoint=endpoint, error=str(e))
             return None
 
-    def _get_ttl(self, endpoint: str) -> int:
-        """Get cache TTL based on endpoint type."""
-        for key, ttl in CACHE_TTL.items():
-            if key in endpoint:
-                return ttl
-        return 300  # Default 5min
-
-    async def close(self) -> None:
-        await self._http.aclose()
+    # ── Informational properties ──────────────────────────────────────────────
 
     @property
     def daily_requests_used(self) -> int:
-        return self._daily_count
+        """Real HTTP calls made in this process/session (excludes cache hits)."""
+        return self._session_calls
 
     @property
     def daily_requests_remaining(self) -> int:
-        return max(0, self._daily_limit - self._daily_count)
+        """
+        Estimated remaining calls based on session usage only.
+        Useful for Kafka metadata; does NOT reflect other containers' usage.
+        For exact cross-container count use: await client.get_exact_remaining()
+        """
+        return max(0, self._daily_limit - self._session_calls)
+
+    async def get_exact_remaining(self) -> int:
+        """Redis-backed exact remaining calls across all containers today."""
+        if not self._redis:
+            return self._daily_limit
+        return await get_remaining(self._redis, self._daily_limit)
+
+    async def close(self) -> None:
+        await self._http.aclose()

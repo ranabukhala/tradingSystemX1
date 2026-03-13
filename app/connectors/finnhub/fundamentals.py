@@ -29,6 +29,7 @@ import redis.asyncio as aioredis
 
 from app.config import settings
 from app.connectors.base import BaseConnector, _log
+from app.connectors.finnhub_rate_limiter import try_acquire, CACHE_TTL
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
@@ -78,26 +79,56 @@ class FinnhubFundamentalsConnector(BaseConnector):
         updated = 0
         for ticker in TRACKED_TICKERS:
             try:
-                # Earnings surprises
-                earnings = await self._get_earnings_surprises(http, ticker)
-                if earnings:
-                    await redis_conn.setex(
-                        f"finnhub:earnings:{ticker}",
-                        3600 * 6,
-                        json.dumps(earnings),
+                # ── Earnings surprises ────────────────────────────────────────
+                earnings_key = f"finnhub:earnings:{ticker}"
+                cached_earnings = await redis_conn.get(earnings_key)
+                if cached_earnings is not None:
+                    _log("debug", "finnhub.cache.hit", ticker=ticker, data_type="earnings")
+                else:
+                    _log("debug", "finnhub.cache.miss", ticker=ticker, data_type="earnings")
+
+                    # Per-minute rate limit check before API call
+                    allowed, count = await try_acquire(
+                        redis_conn, settings.finnhub_per_minute_call_limit
                     )
-                    updated += 1
+                    if not allowed:
+                        _log("warning", "finnhub.rate_limit.per_minute_cap_reached",
+                             ticker=ticker, count=count,
+                             limit=settings.finnhub_per_minute_call_limit)
+                        break  # Skip remaining tickers for this cycle
+
+                    earnings = await self._get_earnings_surprises(http, ticker)
+                    if earnings:
+                        await redis_conn.setex(
+                            earnings_key, CACHE_TTL["earnings"], json.dumps(earnings)
+                        )
+                        updated += 1
 
                 await asyncio.sleep(0.3)  # Rate limit
 
-                # Analyst recommendations
-                analyst = await self._get_analyst_consensus(http, ticker)
-                if analyst:
-                    await redis_conn.setex(
-                        f"finnhub:analyst:{ticker}",
-                        3600 * 2,
-                        json.dumps(analyst),
+                # ── Analyst recommendations ───────────────────────────────────
+                analyst_key = f"finnhub:analyst:{ticker}"
+                cached_analyst = await redis_conn.get(analyst_key)
+                if cached_analyst is not None:
+                    _log("debug", "finnhub.cache.hit", ticker=ticker, data_type="analyst")
+                else:
+                    _log("debug", "finnhub.cache.miss", ticker=ticker, data_type="analyst")
+
+                    # Per-minute rate limit check before API call
+                    allowed, count = await try_acquire(
+                        redis_conn, settings.finnhub_per_minute_call_limit
                     )
+                    if not allowed:
+                        _log("warning", "finnhub.rate_limit.per_minute_cap_reached",
+                             ticker=ticker, count=count,
+                             limit=settings.finnhub_per_minute_call_limit)
+                        break  # Skip remaining tickers for this cycle
+
+                    analyst = await self._get_analyst_consensus(http, ticker)
+                    if analyst:
+                        await redis_conn.setex(
+                            analyst_key, CACHE_TTL["analyst"], json.dumps(analyst)
+                        )
 
                 await asyncio.sleep(0.3)
 

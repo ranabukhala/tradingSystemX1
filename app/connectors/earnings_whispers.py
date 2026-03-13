@@ -1,15 +1,15 @@
 """
-Earnings Whispers Calendar Connector
+Earnings Calendar Connector (FMP)
 ─────────────────────────────────────────────
 Fetches upcoming earnings events daily at 6 AM ET.
 Stores in events table and emits to events.calendar Kafka topic.
 
-API: https://www.earningswhispers.com/api
+API: https://financialmodelingprep.com/stable/earnings-calendar
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone, date, timedelta
+from datetime import date, timedelta
 
 import aiohttp
 
@@ -21,12 +21,12 @@ from app.models.events import EarningsEvent, EarningsTime
 
 log = get_logger(__name__)
 
-EARNINGS_WHISPERS_URL = "https://api.earningswhispers.com/v1"
+FMP_BASE_URL = "https://financialmodelingprep.com/stable"
 
 
 class EarningsWhispersConnector(BaseConnector):
     """
-    Daily sync of earnings calendar.
+    Daily sync of earnings calendar via FMP.
     Runs once at startup then every 24h.
     Uses upsert logic — safe to re-run.
     """
@@ -41,17 +41,15 @@ class EarningsWhispersConnector(BaseConnector):
 
     @property
     def poll_interval_seconds(self) -> int:
-        # Run daily (24 hours)
         return 86400
 
     def validate_config(self) -> None:
-        if not settings.earnings_whispers_api_key:
-            raise ValueError("EARNINGS_WHISPERS_API_KEY is not set in .env")
+        if not settings.fmp_api_key:
+            raise ValueError("FMP_API_KEY is not set in .env")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                headers={"Authorization": f"Bearer {settings.earnings_whispers_api_key}"},
                 timeout=aiohttp.ClientTimeout(total=30),
             )
         return self._session
@@ -94,15 +92,19 @@ class EarningsWhispersConnector(BaseConnector):
         from_date: date,
         to_date: date,
     ) -> list[EarningsEvent]:
-        """Fetch earnings for a date range."""
+        """Fetch earnings for a date range from FMP."""
         params = {
             "from": from_date.strftime("%Y-%m-%d"),
             "to": to_date.strftime("%Y-%m-%d"),
+            "apikey": settings.fmp_api_key,
         }
 
-        async with session.get(f"{EARNINGS_WHISPERS_URL}/earnings", params=params) as resp:
+        async with session.get(f"{FMP_BASE_URL}/earnings-calendar", params=params) as resp:
             if resp.status == 401:
-                raise ValueError("Earnings Whispers: invalid API key")
+                raise ValueError("FMP: invalid API key")
+            if resp.status == 402:
+                log.error("earnings.bad_response", status=resp.status, reason="FMP plan does not include earnings-calendar")
+                return []
             if resp.status == 429:
                 await asyncio.sleep(60)
                 return []
@@ -111,8 +113,13 @@ class EarningsWhispersConnector(BaseConnector):
                 return []
             data = await resp.json()
 
+        # FMP returns a flat list
+        if not isinstance(data, list):
+            log.error("earnings.unexpected_format", data=str(data)[:200])
+            return []
+
         events = []
-        for item in data.get("earnings", data if isinstance(data, list) else []):
+        for item in data:
             try:
                 events.append(self._parse_event(item))
             except Exception as e:
@@ -121,33 +128,32 @@ class EarningsWhispersConnector(BaseConnector):
         return events
 
     def _parse_event(self, item: dict) -> EarningsEvent:
-        """Parse Earnings Whispers API item into EarningsEvent."""
-        # Parse event date
-        date_str = item.get("date") or item.get("report_date", "")
+        """Parse FMP earnings-calendar item into EarningsEvent."""
+        date_str = item.get("date", "")
         try:
             event_date = date.fromisoformat(date_str)
         except ValueError:
             event_date = date.today()
 
-        # Parse timing
-        time_str = (item.get("time") or item.get("report_time", "")).upper()
-        if "BMO" in time_str or "BEFORE" in time_str or "PRE" in time_str:
+        # FMP uses "bmo" / "amc" / "" for time
+        time_str = (item.get("time") or "").lower()
+        if time_str == "bmo" or "before" in time_str:
             event_time = EarningsTime.BMO
-        elif "AMC" in time_str or "AFTER" in time_str or "POST" in time_str:
+        elif time_str == "amc" or "after" in time_str:
             event_time = EarningsTime.AMC
         else:
             event_time = EarningsTime.UNKNOWN
 
         return EarningsEvent(
-            ticker=item.get("ticker", item.get("symbol", "")).upper().strip(),
-            company_name=item.get("name", item.get("company", "")),
+            ticker=(item.get("symbol") or "").upper().strip(),
+            company_name=item.get("name", ""),
             event_date=event_date,
             event_time=event_time,
-            fiscal_quarter=item.get("fiscal_quarter") or item.get("quarter"),
-            fiscal_year=item.get("fiscal_year") or item.get("year"),
-            whisper_eps=self._parse_float(item.get("whisper_eps") or item.get("whisper")),
-            consensus_eps=self._parse_float(item.get("consensus_eps") or item.get("estimate")),
-            consensus_revenue=self._parse_float(item.get("revenue_estimate")),
+            fiscal_quarter=item.get("fiscalQuarter") or item.get("quarter"),
+            fiscal_year=item.get("fiscalYear") or item.get("year"),
+            whisper_eps=None,  # FMP does not provide whisper EPS
+            consensus_eps=self._parse_float(item.get("epsEstimated")),
+            consensus_revenue=self._parse_float(item.get("revenueEstimated")),
         )
 
     @staticmethod

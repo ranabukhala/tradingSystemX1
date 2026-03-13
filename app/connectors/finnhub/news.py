@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timezone, timedelta
 
 import httpx
+import redis.asyncio as aioredis
 
 from app.config import settings
 from app.connectors.base import BaseConnector, _log
+from app.connectors.finnhub_rate_limiter import try_acquire, CACHE_TTL
 from app.kafka import get_producer
 from app.models.news import NewsSource, RawNewsRecord
 
@@ -93,26 +96,66 @@ class FinnhubNewsConnector(BaseConnector):
         producer = get_producer()
         emitted = 0
 
+        redis_conn = await aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+        )
+
         # General news disabled - geopolitical noise
 
-        # ── 2. Company-specific news for watchlist ────────────────────────────
+        # ── 2. Company-specific news for watchlist (sequential) ───────────────
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        for ticker in WATCHLIST_TICKERS:  # Cap to avoid hitting rate limit
-            try:
-                resp = await http.get("/company-news", params={
-                    "symbol": ticker,
-                    "from": yesterday,
-                    "to": today,
-                })
-                if resp.status_code == 200:
-                    articles = resp.json() or []
-                    emitted += await self._process_articles(articles, producer, ticker=ticker)
-                await asyncio.sleep(0.2)
-            except Exception as e:
-                _log("error", "finnhub.company_news_error",
-                     ticker=ticker, error=str(e))
+        try:
+            for ticker in WATCHLIST_TICKERS:
+                try:
+                    cache_key = f"finnhub:news:{ticker}:{today}"
+
+                    # 1. Cache check — skip API call entirely on hit
+                    cached = await redis_conn.get(cache_key)
+                    if cached is not None:
+                        _log("info", "finnhub.cache.hit", ticker=ticker)
+                        articles = json.loads(cached)
+                        emitted += await self._process_articles(articles, producer, ticker=ticker)
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    _log("debug", "finnhub.cache.miss", ticker=ticker)
+
+                    # 2. Per-minute rate limit check before API call
+                    allowed, count = await try_acquire(
+                        redis_conn, settings.finnhub_per_minute_call_limit
+                    )
+                    if not allowed:
+                        _log("warning", "finnhub.rate_limit.per_minute_cap_reached",
+                             ticker=ticker, count=count,
+                             limit=settings.finnhub_per_minute_call_limit)
+                        break  # Skip remaining tickers for this cycle
+
+                    # 3. API call
+                    resp = await http.get("/company-news", params={
+                        "symbol": ticker,
+                        "from": yesterday,
+                        "to": today,
+                    })
+                    if resp.status_code == 200:
+                        articles = resp.json() or []
+                        await redis_conn.setex(
+                            cache_key, CACHE_TTL["news"], json.dumps(articles)
+                        )
+                        emitted += await self._process_articles(articles, producer, ticker=ticker)
+                    else:
+                        _log("warning", "finnhub.company_news_http_error",
+                             ticker=ticker, status=resp.status_code)
+                    await asyncio.sleep(0.2)
+
+                except Exception as e:
+                    _log("error", "finnhub.company_news_error",
+                         ticker=ticker, error=str(e) or repr(e),
+                         error_type=type(e).__name__)
+        finally:
+            await redis_conn.aclose()
 
         return emitted
 

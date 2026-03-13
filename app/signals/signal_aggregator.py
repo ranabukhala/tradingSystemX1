@@ -324,6 +324,9 @@ class SignalAggregatorService(BaseConsumer):
     def output_topic(self) -> str:
         return "signals.actionable"
 
+    async def on_start(self) -> None:
+        self._producer = self._make_producer()
+
     async def _log_signal(self, summarized, conviction: float, passed: bool,
                           direction: str = "neutral", signal_type: str = "other") -> None:
         """Persist every evaluated signal to signal_log table."""
@@ -451,7 +454,7 @@ class SignalAggregatorService(BaseConsumer):
                          sympathy=sym_ticker,
                          conviction=sym_signal.conviction)
                     # Publish sympathy signal to same topic
-                    await self._producer.send(
+                    self._producer.produce(
                         self.output_topic,
                         value=sym_signal.to_kafka_dict()
                     )

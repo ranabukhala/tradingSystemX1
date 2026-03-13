@@ -43,8 +43,7 @@ RUN pip install --no-cache-dir --upgrade pip \
         rich \
         asyncpg \
         websocket-client \
-        pytest \
-        ib_insync
+        pytest
 
 # Copy application code
 COPY app/ ./app/

@@ -40,7 +40,9 @@ class FMPTechnicalConnector(BaseConnector):
 
     @property
     def poll_interval_seconds(self) -> int:
-        return 300  # Every 5 minutes
+        return 43_200  # Every 12 hours
+        # Math: 20 tickers × 2 endpoints = 40 calls/cycle.
+        # 43,200 s → 2 cycles/day → 80 calls/day within the shared 200-call budget.
 
     def validate_config(self) -> None:
         pass
@@ -69,7 +71,7 @@ class FMPTechnicalConnector(BaseConnector):
             if tech:
                 await redis_conn.setex(
                     f"fmp:technical:{ticker}",
-                    300,  # 5min TTL
+                    86_400,  # 24 h TTL — outlasts the 12 h poll interval
                     json.dumps(tech),
                 )
                 updated += 1
@@ -134,7 +136,8 @@ class FMPSectorConnector(BaseConnector):
 
     @property
     def poll_interval_seconds(self) -> int:
-        return 900  # Every 15 minutes
+        return 1_800  # Every 30 minutes
+        # Math: 1 call/cycle × 48 cycles/day = 48 calls/day within the shared 200-call budget.
 
     def validate_config(self) -> None:
         pass
@@ -197,7 +200,7 @@ class FMPSectorConnector(BaseConnector):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        await redis_conn.setex("fmp:sectors", 900, json.dumps(payload))
+        await redis_conn.setex("fmp:sectors", 3_600, json.dumps(payload))  # 1 h TTL (poll: 30 min)
 
         _log("info", "fmp_sectors.updated",
              regime=regime,

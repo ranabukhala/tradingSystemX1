@@ -138,11 +138,45 @@ class ExecutionEngine(BaseConsumer):
             _log("error", "execution.account_error", error=str(e))
             return None
 
+        # ── Spread gate — pre-check BEFORE risk evaluation and order submission ──
+        # Wide spreads mean we'd pay more in slippage than the edge is worth.
+        #   > 2.0% → hard block (spread_too_wide)
+        #   > 1.0% → -30% conviction
+        #   > 0.5% → -15% conviction
+        flow = {}
+        try:
+            flow = await self._broker.get_order_flow_context(ticker, price)
+        except Exception as e:
+            _log("warning", "execution.spread_fetch_error", ticker=ticker, error=str(e))
+
+        conviction = signal.conviction
+        spread_pct = flow.get("spread_pct")
+        if spread_pct is not None:
+            if spread_pct > 2.0:
+                _log("info", "execution.risk_blocked",
+                     ticker=ticker, direction=direction,
+                     conviction=conviction,
+                     reason=f"spread_too_wide ({spread_pct:.3f}%)",
+                     spread_label=flow.get("spread_label", ""))
+                return None
+            elif spread_pct > 1.0:
+                conviction = round(conviction * 0.70, 3)
+                _log("info", "execution.spread_conviction_cut",
+                     ticker=ticker, spread_pct=spread_pct,
+                     conviction_in=signal.conviction, conviction_out=conviction,
+                     cut_pct=30, spread_label=flow.get("spread_label", ""))
+            elif spread_pct > 0.5:
+                conviction = round(conviction * 0.85, 3)
+                _log("info", "execution.spread_conviction_cut",
+                     ticker=ticker, spread_pct=spread_pct,
+                     conviction_in=signal.conviction, conviction_out=conviction,
+                     cut_pct=15, spread_label=flow.get("spread_label", ""))
+
         # ── Risk evaluation ───────────────────────────────────────────────────
         decision = await self._risk.evaluate(
             ticker=ticker,
             direction=direction,
-            conviction=signal.conviction,
+            conviction=conviction,      # spread-adjusted conviction
             current_price=price,
             account=account,
             open_positions=positions,
@@ -180,7 +214,7 @@ class ExecutionEngine(BaseConsumer):
              broker=self._broker.name)
 
         # ── Telegram alert ────────────────────────────────────────────────────
-        await self._send_trade_alert(signal, result, decision, price)
+        await self._send_trade_alert(signal, result, decision, price, flow=flow)
 
         # ── Persist to Postgres ───────────────────────────────────────────────
         await self._save_trade(signal, order, result, decision, price)
@@ -213,12 +247,17 @@ class ExecutionEngine(BaseConsumer):
         result: OrderResult,
         decision,
         price: float,
+        flow: dict | None = None,
     ) -> None:
         if not self._telegram_token or not self._telegram_chat:
             return
 
-        # Fetch order flow context — informational only, no effect on execution
-        flow = await self._broker.get_order_flow_context(signal.ticker, price)
+        # Reuse flow fetched in process() for spread gating; fetch only if not provided
+        if flow is None:
+            try:
+                flow = await self._broker.get_order_flow_context(signal.ticker, price)
+            except Exception:
+                flow = {}
 
         if result.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
             emoji = "❌"
@@ -249,12 +288,19 @@ class ExecutionEngine(BaseConsumer):
             f"📰 _{signal.t1_summary or signal.news_title[:80]}_",
         ]
 
-        # ── Order flow info block (observe only) ─────────────────────────────
+        # ── Order flow info block ─────────────────────────────────────────────
         flow_lines = []
         if flow.get("spread_pct") is not None:
-            spread_warn = " ⚠️" if flow["spread_pct"] > 0.5 else ""
+            spread_pct = flow["spread_pct"]
+            spread_warn = " ⚠️" if spread_pct > 0.5 else ""
+            spread_label = flow.get("spread_label", "")
+            # Annotate conviction impact applied upstream in process()
+            if spread_pct > 1.0:
+                spread_warn += " (−30% conviction)"
+            elif spread_pct > 0.5:
+                spread_warn += " (−15% conviction)"
             flow_lines.append(
-                f"Spread: {flow['spread_pct']:.3f}% ({flow['spread_label']}){spread_warn}"
+                f"Spread: {spread_pct:.3f}% ({spread_label}){spread_warn}"
             )
         if flow.get("vwap") is not None:
             vwap_warn = " ⚠️" if "below" in (flow.get("vwap_bias") or "") and signal.direction == "long" else ""
@@ -264,7 +310,7 @@ class ExecutionEngine(BaseConsumer):
             )
         if flow_lines:
             msg_lines.append("")
-            msg_lines.append("📊 _Order Flow (observe only)_")
+            msg_lines.append("📊 _Order Flow_")
             msg_lines.extend(flow_lines)
         # ── End order flow block ──────────────────────────────────────────────
 

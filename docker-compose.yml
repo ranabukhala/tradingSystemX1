@@ -370,6 +370,9 @@ services:
       POSTGRES_HOST: postgres
     ports:
       - "8004:8004"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
 
     healthcheck:
       test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]

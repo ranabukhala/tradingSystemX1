@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     fmp_api_key: str = ""
     fmp_plan: str = "free"
+    fmp_daily_call_limit: int = 240  # Shared across all FMP containers (10-call buffer vs 250 cap)
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
 
@@ -102,7 +103,8 @@ class Settings(BaseSettings):
     benzinga_poll_interval_seconds: int = 30
     polygon_news_poll_interval_seconds: int = 60
     alphavantage_poll_interval_seconds: int = 300
-    finnhub_poll_interval: int = 30
+    finnhub_poll_interval: int = 300              # 5 min — news doesn't change per-minute
+    finnhub_per_minute_call_limit: int = 55      # 60 req/min hard cap − 5 buffer
     earnings_sync_hour_et: int = 6
     earnings_lookahead_days: int = 30
 

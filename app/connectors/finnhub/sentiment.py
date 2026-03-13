@@ -31,6 +31,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from app.config import settings
+from app.connectors.finnhub_rate_limiter import try_acquire, CACHE_TTL
 from app.pipeline.base_consumer import BaseConsumer, _log
 
 FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -167,12 +168,23 @@ class FinnhubSentimentService(BaseConsumer):
 
     async def _get_news_sentiment(self, ticker: str) -> dict | None:
         """Get Finnhub company news sentiment score."""
-        # Check Redis cache first (TTL 15min)
         cache_key = f"finnhub:sentiment:{ticker}"
         if self._redis:
             cached = await self._redis.get(cache_key)
             if cached:
+                _log("debug", "finnhub.cache.hit", ticker=ticker, data_type="sentiment")
                 return json.loads(cached)
+            _log("debug", "finnhub.cache.miss", ticker=ticker, data_type="sentiment")
+
+            # Per-minute rate limit check before API call
+            allowed, count = await try_acquire(
+                self._redis, settings.finnhub_per_minute_call_limit
+            )
+            if not allowed:
+                _log("warning", "finnhub.rate_limit.per_minute_cap_reached",
+                     ticker=ticker, count=count,
+                     limit=settings.finnhub_per_minute_call_limit)
+                return None
 
         try:
             resp = await self._http.get(
@@ -182,7 +194,7 @@ class FinnhubSentimentService(BaseConsumer):
             if resp.status_code == 200:
                 data = resp.json()
                 if self._redis:
-                    await self._redis.setex(cache_key, 900, json.dumps(data))
+                    await self._redis.setex(cache_key, CACHE_TTL["sentiment"], json.dumps(data))
                 return data
         except Exception as e:
             _log("warning", "finnhub_sentiment.news_error",
@@ -195,7 +207,19 @@ class FinnhubSentimentService(BaseConsumer):
         if self._redis:
             cached = await self._redis.get(cache_key)
             if cached:
+                _log("debug", "finnhub.cache.hit", ticker=ticker, data_type="insider_mspr")
                 return json.loads(cached)
+            _log("debug", "finnhub.cache.miss", ticker=ticker, data_type="insider_mspr")
+
+            # Per-minute rate limit check before API call
+            allowed, count = await try_acquire(
+                self._redis, settings.finnhub_per_minute_call_limit
+            )
+            if not allowed:
+                _log("warning", "finnhub.rate_limit.per_minute_cap_reached",
+                     ticker=ticker, count=count,
+                     limit=settings.finnhub_per_minute_call_limit)
+                return None
 
         try:
             # Last 3 months
@@ -228,7 +252,7 @@ class FinnhubSentimentService(BaseConsumer):
                 }
 
                 if self._redis:
-                    await self._redis.setex(cache_key, 3600, json.dumps(result))
+                    await self._redis.setex(cache_key, CACHE_TTL["insider_mspr"], json.dumps(result))
                 return result
 
         except Exception as e:

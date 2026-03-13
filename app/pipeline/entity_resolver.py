@@ -16,6 +16,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -65,6 +66,58 @@ TICKER_BLACKLIST = {
     "A","I","IT","AT","BE","BY","DO","GO","IF","IN","IS","ME","MY",
     "NO","OF","OK","ON","OR","SO","TO","UP","US","WE","AI","AR",
     "HE","HI","AN","AS","AT","BY","HE","HI",
+}
+
+# Company name → ticker mapping for title-based detection.
+# Keys are lowercase substrings matched with word-boundary regex against title.lower().
+# Catches prose mentions like "Okta reports earnings" → OKTA (score 0.90).
+COMPANY_NAME_MAP: dict[str, str] = {
+    # Mega cap
+    "apple":           "AAPL",
+    "microsoft":       "MSFT",
+    "nvidia":          "NVDA",
+    "alphabet":        "GOOGL",
+    "meta":            "META",
+    "amazon":          "AMZN",
+    "tesla":           "TSLA",
+    # Large cap tech
+    "intel":           "INTC",
+    "qualcomm":        "QCOM",
+    "broadcom":        "AVGO",
+    "oracle":          "ORCL",
+    "salesforce":      "CRM",
+    "servicenow":      "NOW",
+    "snowflake":       "SNOW",
+    "datadog":         "DDOG",
+    "cloudflare":      "NET",
+    "crowdstrike":     "CRWD",
+    "zscaler":         "ZS",
+    "okta":            "OKTA",
+    "palo alto":       "PANW",
+    "fortinet":        "FTNT",
+    # Financials
+    "jpmorgan":        "JPM",
+    "goldman sachs":   "GS",
+    "morgan stanley":  "MS",
+    "bank of america": "BAC",
+    "wells fargo":     "WFC",
+    "citigroup":       "C",
+    "blackrock":       "BLK",
+    "robinhood":       "HOOD",
+    "coinbase":        "COIN",
+    # Healthcare
+    "pfizer":          "PFE",
+    "moderna":         "MRNA",
+    "abbvie":          "ABBV",
+    "gilead":          "GILD",
+    # Consumer / Other
+    "costco":          "COST",
+    "starbucks":       "SBUX",
+    "mcdonald":        "MCD",
+    "rivian":          "RIVN",
+    "lucid":           "LCID",
+    "palantir":        "PLTR",
+    "microstrategy":   "MSTR",
 }
 
 # Market cap tiers (approximate, for known large names)
@@ -165,26 +218,40 @@ def resolve_tickers(raw_tickers: list[str], title: str) -> tuple[list[str], dict
 
     Scoring logic:
       0.95 — $TICKER explicitly in title (highest signal)
+      0.90 — company name matched in title via COMPANY_NAME_MAP (e.g. "Okta" → OKTA)
       0.85 — vendor tag AND ticker appears in title as bare word
-      0.75 — ticker appears as bare word in title (known universe only)
-      0.75 — vendor-provided tag only, NOT in title (trusted for source-specific feeds)
+      0.75 — ticker appears as bare word in title only (known universe)
+      0.72 — ticker appears as bare word in title only (unknown universe)
+      0.60 — vendor tag NOT in title (sympathy / related ticker) → below threshold
 
-    Threshold: only accept tickers with confidence >= 0.70
-    This blocks vendor tags that don't appear in the title at all.
+    Title-primacy rule: if any title-confirmed ticker (score ≥ 0.72) exists,
+      all non-title tickers are explicitly capped at 0.60 so they fall below
+      the acceptance threshold and are excluded from the resolved list.
+      This prevents sympathy-play tickers (e.g. NVDA on an Oracle article)
+      from being promoted to primary.
+
+    Threshold: only accept tickers with confidence >= 0.70.
     """
     confidence: dict[str, float] = {}
 
     # Pre-compute title presence for cross-validation
     title_upper = title.upper()
+    title_lower = title.lower()
     title_dollar_tickers = set(re.findall(r'\$([A-Z]{1,5})', title))
     title_bare_words = set(re.findall(r'\b([A-Z]{1,5})\b', title_upper))
 
-    # Scan title for $TICKER — highest confidence, unambiguous
+    # 1. Scan title for $TICKER — highest confidence, unambiguous
     for t in title_dollar_tickers:
         if t not in TICKER_BLACKLIST:
             confidence[t] = 0.95
 
-    # Vendor-provided tickers — cross-validate against title
+    # 2. Company name matching — catches "Okta", "Microsoft", etc. in prose titles
+    for name, ticker in COMPANY_NAME_MAP.items():
+        if re.search(r'\b' + re.escape(name) + r'\b', title_lower):
+            if ticker not in TICKER_BLACKLIST:
+                confidence[ticker] = max(confidence.get(ticker, 0), 0.90)
+
+    # 3. Vendor-provided tickers — cross-validate against title
     for t in raw_tickers:
         t = t.upper().strip()
         if not t or t in TICKER_BLACKLIST:
@@ -201,16 +268,25 @@ def resolve_tickers(raw_tickers: list[str], title: str) -> tuple[list[str], dict
             # In title but not known universe — moderate confidence
             confidence[t] = max(confidence.get(t, 0), 0.72)
         else:
-            # Vendor tag NOT in title — likely a related/mentioned ticker, not primary
-            # Only accept if it's a well-known ticker (reduces false positives)
+            # Vendor tag NOT in title — likely sympathy/related ticker, not the primary subject.
+            # Cap at 0.60 (below 0.70 threshold) so it is excluded from resolved list.
             if t in KNOWN_TICKERS:
-                confidence[t] = max(confidence.get(t, 0), 0.75)
+                confidence[t] = max(confidence.get(t, 0), 0.60)
             # Unknown tickers not in title are discarded entirely
 
-    # Scan for bare uppercase words matching known universe (title-derived)
+    # 4. Scan for bare uppercase words matching known universe (title-derived)
     for t in title_bare_words:
         if t in KNOWN_TICKERS and t not in TICKER_BLACKLIST:
             confidence[t] = max(confidence.get(t, 0), 0.75)
+
+    # 5. Title-primacy: if any ticker is confirmed in the title (score ≥ 0.72),
+    #    explicitly cap all non-title tickers at 0.60 to prevent sympathy play promotion.
+    #    Handles edge cases where a vendor-only ticker otherwise gained a higher score.
+    title_confirmed = {t for t, c in confidence.items() if c >= 0.72}
+    if title_confirmed:
+        for t in list(confidence.keys()):
+            if t not in title_confirmed:
+                confidence[t] = min(confidence[t], 0.60)
 
     # Filter to confidence >= 0.70 — this excludes vendor-only tags not in title
     resolved = [t for t, c in sorted(confidence.items(), key=lambda x: -x[1]) if c >= 0.70]
@@ -373,5 +449,41 @@ class EntityResolverService(BaseConsumer):
             earnings_proximity_h=earnings_proximity_h,
             decay_minutes=decay,
         )
+
+        # Update news_item row with resolved enrichment fields
+        if self._Session:
+            try:
+                from sqlalchemy import text
+                async with self._Session() as session:
+                    await session.execute(text("""
+                        UPDATE news_item SET
+                            tickers             = :tickers,
+                            ticker_confidence   = :ticker_confidence,
+                            catalyst_type       = :catalyst_type,
+                            mode                = :mode,
+                            session_context     = :session_context,
+                            market_cap_tier     = :market_cap_tier,
+                            float_sensitivity   = :float_sensitivity,
+                            short_interest_flag = :short_interest_flag,
+                            earnings_proximity_h= :earnings_proximity_h,
+                            decay_minutes       = :decay_minutes
+                        WHERE source = :source AND vendor_id = :vendor_id
+                    """), {
+                        "tickers":             tickers,
+                        "ticker_confidence":   json.dumps({k: float(v) for k, v in ticker_confidence.items()}),
+                        "catalyst_type":       catalyst.value,
+                        "mode":                mode.value,
+                        "session_context":     session_ctx.value,
+                        "market_cap_tier":     market_cap_tier.value if market_cap_tier else None,
+                        "float_sensitivity":   float_sensitivity.value,
+                        "short_interest_flag": any(t in HIGH_FLOAT_SENSITIVITY for t in tickers),
+                        "earnings_proximity_h":earnings_proximity_h,
+                        "decay_minutes":       decay,
+                        "source":              deduped.source.value,
+                        "vendor_id":           deduped.vendor_id,
+                    })
+                    await session.commit()
+            except Exception as e:
+                _log("warning", "entity_resolver.db_update_error", error=str(e))
 
         return enriched.to_kafka_dict()
