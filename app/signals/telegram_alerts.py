@@ -214,12 +214,17 @@ class TelegramAlertsService(BaseConsumer):
             _log("error", "telegram_alerts.parse_error", error=str(e))
             raise
 
+        # Skip neutral signals unless extremely high conviction + impact.
+        # Neutral signals are noise 99% of the time — only alert on the rare
+        # case where the model is very confident AND the event is high-impact.
+        # Must come before the base conviction filter so low-conviction neutrals
+        # don't accidentally pass if ALERT_CONVICTION_THRESHOLD is lowered.
+        if signal.direction.lower() == "neutral":
+            if signal.conviction < 0.85 or signal.impact_day < 0.70:
+                return None  # drop silently, no alert
+
         # Filter by conviction threshold
         if signal.conviction < ALERT_CONVICTION_THRESHOLD:
-            return None
-
-        # Skip neutral signals unless very high conviction
-        if signal.direction == "neutral" and signal.conviction < 0.75:
             return None
 
         # Send alert

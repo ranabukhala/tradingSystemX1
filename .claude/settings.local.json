@@ -57,7 +57,10 @@
       "Bash(xargs grep -l \"company_news_error\")",
       "Bash(MSYS_NO_PATHCONV=1 docker exec trading_pipeline_deduplicator python -c \"from app.config import settings; print\\(''env:'', settings.environment\\)\")",
       "Bash(MSYS_NO_PATHCONV=1 docker exec trading_finnhub_news python -c \":*)",
-      "Bash(docker restart trading_finnhub_news)"
+      "Bash(docker restart trading_finnhub_news)",
+      "Bash(docker cp trading_signals_telegram://app/app/signals/telegram_alerts.py C:/tmp/telegram_alerts_backup.py)",
+      "Bash(docker cp \"C:/work/docker/project1/trading-system/app/signals/telegram_alerts.py\" trading_signals_telegram://app/app/signals/telegram_alerts.py)",
+      "Bash(docker restart trading_signals_telegram)"
     ]
   }
 }
