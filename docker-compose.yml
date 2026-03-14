@@ -892,6 +892,42 @@ services:
       retries: 3
       start_period: 20s
 
+  # ══════════════════════════════════════════════════════════
+  #  MARKET HOURS SCHEDULER
+  #  Starts/stops trading services on NYSE open/close via Docker SDK.
+  #  Always running — independent of market hours.
+  # ══════════════════════════════════════════════════════════
+
+  scheduler:
+    <<: *connector
+    container_name: trading_scheduler
+    restart: always                        # Must always be up, overrides unless-stopped
+    entrypoint: ["python", "-m", "app.scheduler"]
+    environment:
+      SERVICE_NAME: scheduler
+      # Market open/close times (US/Eastern). Defaults: 08:00 – 16:30.
+      MARKET_OPEN_HOUR:  ${MARKET_OPEN_HOUR:-8}
+      MARKET_OPEN_MIN:   ${MARKET_OPEN_MIN:-0}
+      MARKET_CLOSE_HOUR: ${MARKET_CLOSE_HOUR:-16}
+      MARKET_CLOSE_MIN:  ${MARKET_CLOSE_MIN:-30}
+    volumes:
+      - ./app:/app/app                           # live code mount (from *connector)
+      - ./config:/app/config                     # watchlist etc.  (from *connector)
+      - /var/run/docker.sock:/var/run/docker.sock # Docker socket — required for SDK
+    depends_on:                                  # Override *connector (no migrate/topic_setup needed)
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import docker; docker.from_env().ping()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
 # ══════════════════════════════════════════════════════════
 #  VOLUMES & NETWORKS
 # ══════════════════════════════════════════════════════════

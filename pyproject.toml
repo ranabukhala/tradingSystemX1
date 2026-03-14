@@ -57,6 +57,9 @@ dependencies = [
     "tenacity>=8.2.0",       # Retry logic
     "click>=8.1.0",          # CLI scripts
     "rich>=13.7.0",          # Pretty terminal output
+
+    # Docker SDK — used by market scheduler to start/stop sibling containers
+    "docker>=7.0.0",
 ]
 
 [project.optional-dependencies]
