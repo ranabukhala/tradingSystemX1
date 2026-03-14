@@ -284,11 +284,11 @@ class TelegramAlertsService(BaseConsumer):
 
     @property
     def input_topic(self) -> str:
-        return "signals.actionable"
+        return "signals.filtered"
 
     @property
     def output_topic(self) -> str:
-        return "signals.actionable"  # Pass-through, no downstream topic
+        return "signals.filtered"  # Pass-through, no downstream topic
 
     async def on_start(self) -> None:
         import os

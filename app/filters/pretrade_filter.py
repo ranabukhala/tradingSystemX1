@@ -188,10 +188,13 @@ class PreTradeFilterService(BaseConsumer):
             "scale":       regime.get("conviction_scale"),
         }
         record["filter_technicals"] = {
-            "score":       getattr(tech, "score", None),
-            "multiplier":  getattr(tech, "conviction_multiplier", 1.0),
-            "checks":      getattr(tech, "checks", {}),
-            "rsi":         getattr(tech, "rsi", None),
+            "score": getattr(tech, "score", None),
+            "multiplier": getattr(tech, "conviction_multiplier", 1.0),
+            "checks": getattr(tech, "checks", {}),
+            "rsi": getattr(tech, "rsi", None),
+            # ↓ promote these so formatter can access them directly
+            "technical_score": getattr(tech, "technical_score", 0),
+            "technical_score_breakdown": getattr(tech, "technical_score_breakdown", {}),
         }
         record["filter_options"] = {
             "flow_bias":   getattr(options, "flow_bias", "neutral"),
