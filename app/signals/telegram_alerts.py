@@ -58,7 +58,7 @@ CATALYST_LABELS = {
 }
 
 
-def format_signal_message(signal: TradingSignal) -> str:
+def format_signal_message(signal: TradingSignal, tech_checks: dict | None = None) -> str:
     """Format a trading signal into a Telegram message."""
     direction_emoji = DIRECTION_EMOJI.get(signal.direction, "⚪")
     direction_label = signal.direction.upper()
@@ -85,6 +85,12 @@ def format_signal_message(signal: TradingSignal) -> str:
 
     if decay_str:
         lines.append(f"Edge decay: ~{decay_str}")
+
+    # ── Technical scoring block ────────────────────────────────────────────────
+    tech_block = _format_technicals_block(tech_checks or {})
+    if tech_block:
+        lines.append(f"")
+        lines.extend(tech_block.splitlines())
 
     lines.append(f"")
     lines.append(f"📰 _{signal.news_title}_")
@@ -145,6 +151,114 @@ def format_signal_message(signal: TradingSignal) -> str:
 
     lines.append(f"")
     lines.append(f"🆔 `{str(signal.id)[:8]}`")
+
+    return "\n".join(lines)
+
+
+def _format_technicals_block(checks: dict) -> str:
+    """
+    Format the 0-10 technical score breakdown as a compact Telegram block.
+
+    Input: record["filter_technicals"]["checks"]
+    Returns: multi-line string ready for inline inclusion, or "" if no data.
+    """
+    score = checks.get("_technical_score")
+    bd    = checks.get("_technical_score_breakdown")
+
+    if score is None or not bd:
+        return ""
+
+    threshold    = bd.get("threshold", 7)
+    passed       = bd.get("passed", score >= threshold)
+    status_emoji = "✅" if passed else "❌"
+
+    def bar(pts: int, max_pts: int) -> str:
+        """Compact filled/empty bar: ██░ for 2/3."""
+        return "█" * pts + "░" * (max_pts - pts)
+
+    lines = [f"📊 *Technicals: {score}/10* {status_emoji}"]
+
+    # 1. Volume (2pts)
+    v    = bd.get("volume", {})
+    vpts = v.get("pts", 0)
+    detail = ""
+    if v.get("vol_ratio") is not None:
+        detail += f" · {v['vol_ratio']:.1f}× avg"
+    obv = v.get("obv_trending_with_direction")
+    if obv is not None:
+        detail += f" · OBV {'✓' if obv else '✗'}"
+    lines.append(f"`Vol  ` {bar(vpts, 2)} {vpts}/2{detail}")
+
+    # 2. Multi-Timeframe (2pts)
+    m    = bd.get("multi_timeframe", {})
+    mpts = m.get("pts", 0)
+    detail = ""
+    d50 = m.get("daily_50ma_aligned")
+    h20 = m.get("hourly_20ma_aligned")
+    if d50 is not None:
+        detail += f" · 50MA {'✓' if d50 else '✗'}"
+    if h20 is not None:
+        detail += f" · 1h-20 {'✓' if h20 else '✗'}"
+    lines.append(f"`MTF  ` {bar(mpts, 2)} {mpts}/2{detail}")
+
+    # 3. Key Levels (2pts)
+    k    = bd.get("key_levels", {})
+    kpts = k.get("pts", 0)
+    detail = ""
+    if k.get("pct_from_swing_high") is not None:
+        detail += f" · {k['pct_from_swing_high']:.1f}% to high"
+    elif k.get("pct_from_swing_low") is not None:
+        detail += f" · {k['pct_from_swing_low']:.1f}% to low"
+    if k.get("near_round_number"):
+        detail += " · round#"
+    lines.append(f"`Lvl  ` {bar(kpts, 2)} {kpts}/2{detail}")
+
+    # 4. VWAP (1pt)
+    vw    = bd.get("vwap", {})
+    vwpts = vw.get("pts", 0)
+    detail = ""
+    pvw  = vw.get("price_vs_vwap")
+    vval = vw.get("vwap")
+    if pvw:
+        detail += f" · {pvw}"
+        if vval:
+            detail += f" ${vval:.2f}"
+    lines.append(f"`VWAP ` {bar(vwpts, 1)} {vwpts}/1{detail}")
+
+    # 5. ATR (1pt)
+    a    = bd.get("atr", {})
+    apts = a.get("pts", 0)
+    detail = ""
+    ratio = a.get("move_atr_ratio")
+    if ratio is not None:
+        detail += f" · {ratio:.1f}× ATR"
+        if not a.get("in_sweet_spot", True):
+            detail += " ⚠️"
+    lines.append(f"`ATR  ` {bar(apts, 1)} {apts}/1{detail}")
+
+    # 6. RSI Divergence (1pt)
+    r    = bd.get("rsi_divergence", {})
+    rpts = r.get("pts", 0)
+    detail = ""
+    rsi_val = r.get("current_rsi")
+    div     = r.get("opposing_divergence")
+    if rsi_val is not None:
+        detail += f" · RSI {rsi_val:.0f}"
+    if div is not None:
+        detail += f" · {'div ⚠️' if div else 'clean'}"
+    lines.append(f"`RSI  ` {bar(rpts, 1)} {rpts}/1{detail}")
+
+    # 7. Relative Strength (1pt)
+    rs    = bd.get("relative_strength", {})
+    rspts = rs.get("pts", 0)
+    detail = ""
+    s5   = rs.get("stock_5d_pct")
+    spy5 = rs.get("spy_5d_pct")
+    if s5 is not None and spy5 is not None:
+        s_sign   = "+" if s5   >= 0 else ""
+        spy_sign = "+" if spy5 >= 0 else ""
+        detail += f" · {s_sign}{s5:.1f}% vs SPY {spy_sign}{spy5:.1f}%"
+    lines.append(f"`RS   ` {bar(rspts, 1)} {rspts}/1{detail}")
 
     return "\n".join(lines)
 
@@ -229,14 +343,17 @@ class TelegramAlertsService(BaseConsumer):
 
         # Send alert
         if self._http and self._bot_token and self._chat_id:
-            await self._send_alert(signal)
+            # Pull the technical checks from the raw record before the Pydantic
+            # model drops the filter_technicals field (it's not declared on TradingSignal)
+            tech_checks = record.get("filter_technicals", {}).get("checks", {})
+            await self._send_alert(signal, tech_checks)
 
         # Pass-through — don't re-emit to Kafka
         return None
 
-    async def _send_alert(self, signal: TradingSignal) -> None:
+    async def _send_alert(self, signal: TradingSignal, tech_checks: dict | None = None) -> None:
         """Send formatted alert to Telegram."""
-        message = format_signal_message(signal)
+        message = format_signal_message(signal, tech_checks=tech_checks)
 
         try:
             resp = await self._http.post("/sendMessage", json={

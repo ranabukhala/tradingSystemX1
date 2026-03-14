@@ -60,7 +60,10 @@
       "Bash(docker restart trading_finnhub_news)",
       "Bash(docker cp trading_signals_telegram://app/app/signals/telegram_alerts.py C:/tmp/telegram_alerts_backup.py)",
       "Bash(docker cp \"C:/work/docker/project1/trading-system/app/signals/telegram_alerts.py\" trading_signals_telegram://app/app/signals/telegram_alerts.py)",
-      "Bash(docker restart trading_signals_telegram)"
+      "Bash(docker restart trading_signals_telegram)",
+      "Bash(docker cp app/signals/telegram_alerts.py trading_signals_telegram:/app/app/signals/telegram_alerts.py)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec trading_signals_telegram sh -c \"grep -n ''_technical_score\\\\|_format_technicals_block\\\\|tech_checks'' //app/app/signals/telegram_alerts.py\")",
+      "Bash(docker restart trading_execution_engine trading_position_monitor)"
     ]
   }
 }
