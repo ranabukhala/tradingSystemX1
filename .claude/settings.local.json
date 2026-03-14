@@ -65,7 +65,15 @@
       "Bash(MSYS_NO_PATHCONV=1 docker exec trading_signals_telegram sh -c \"grep -n ''_technical_score\\\\|_format_technicals_block\\\\|tech_checks'' //app/app/signals/telegram_alerts.py\")",
       "Bash(docker restart trading_execution_engine trading_position_monitor)",
       "Bash(docker compose build scheduler)",
-      "Bash(docker compose up -d scheduler)"
+      "Bash(docker compose up -d scheduler)",
+      "Bash(docker cp app/models/news.py trading_signals_ai_summarizer:/app/app/models/news.py)",
+      "Bash(docker cp app/signals/ai_summarizer.py trading_signals_ai_summarizer:/app/app/signals/ai_summarizer.py)",
+      "Bash(docker cp app/signals/signal_aggregator.py trading_signals_signal_aggregator:/app/app/signals/signal_aggregator.py)",
+      "Bash(docker cp app/filters/pretrade_filter.py trading_pretrade_filter:/app/app/filters/pretrade_filter.py)",
+      "Bash(docker ps -a --format \"{{.Names}}\\\\t{{.Status}}\")",
+      "Bash(dir stock_context_service)",
+      "Bash(dir migrations009_stock_context.sql)",
+      "Bash(python -c \":*)"
     ]
   }
 }

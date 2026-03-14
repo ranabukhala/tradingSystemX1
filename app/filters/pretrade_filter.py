@@ -48,7 +48,11 @@ from app.filters.options_flow import score_options_flow
 from app.filters.short_interest import score_squeeze
 from app.pipeline.base_consumer import BaseConsumer, _log
 
-
+# Stock context service — provides per-ticker adjusted_threshold
+# Import lazily inside process() to avoid hard dependency at module load time.
+_CONTEXT_SERVICE_URL = os.environ.get(
+    "CONTEXT_SERVICE_URL", "http://stock_context_service:8082"
+)
 POLYGON_BASE = "https://api.polygon.io"
 
 
@@ -108,6 +112,40 @@ class PreTradeFilterService(BaseConsumer):
         if self._redis:
             await self._redis.aclose()
 
+    async def _get_stock_context(self, ticker: str) -> Optional[dict]:
+        """
+        Return the cached StockContext dict for *ticker* from Redis.
+
+        Falls back to a forced HTTP refresh via the context service if
+        the cache is cold.  Returns None on failure (graceful degradation).
+        """
+        # 1. Try Redis cache first (same key written by stock_context_service)
+        try:
+            raw = await self._redis.get(f"stock_context:{ticker}")
+            if raw:
+                return json.loads(raw)
+        except Exception as exc:
+            _log("warning", "pretrade_filter.context_redis_error",
+                 ticker=ticker, error=str(exc))
+
+        # 2. Cache miss — ask the context service to reclassify immediately
+        try:
+            url = f"{_CONTEXT_SERVICE_URL}/context/{ticker}/refresh"
+            resp = await self._http.get(url, timeout=4.0)
+            if resp.status_code == 200:
+                ctx = resp.json()
+                _log("debug", "pretrade_filter.context_refreshed",
+                     ticker=ticker,
+                     threshold=ctx.get("adjusted_threshold"))
+                return ctx
+            _log("warning", "pretrade_filter.context_refresh_failed",
+                 ticker=ticker, status=resp.status_code)
+        except Exception as exc:
+            _log("warning", "pretrade_filter.context_service_unreachable",
+                 ticker=ticker, error=str(exc))
+
+        return None
+
     async def process(self, record: dict) -> dict | None:
         ticker    = record.get("ticker", "")
         direction = record.get("direction", "neutral")
@@ -115,6 +153,20 @@ class PreTradeFilterService(BaseConsumer):
 
         if direction == "neutral":
             return None
+
+        # ── Fetch stock context (regime / cleanliness / adjusted threshold) ───
+        stock_ctx = await self._get_stock_context(ticker)
+        if stock_ctx is None:
+            _log("warning", "pretrade_filter.no_context",
+                 ticker=ticker,
+                 fallback="using static TECHNICAL_SCORE_THRESHOLD")
+        else:
+            _log("debug", "pretrade_filter.context_loaded",
+                 ticker=ticker,
+                 trend=stock_ctx.get("trend_regime"),
+                 vol=stock_ctx.get("volatility_regime"),
+                 clean=stock_ctx.get("cleanliness"),
+                 threshold=stock_ctx.get("adjusted_threshold"))
 
         # ── Run all 4 filters in parallel ─────────────────────────────────────
         regime_task = asyncio.create_task(
@@ -168,11 +220,73 @@ class PreTradeFilterService(BaseConsumer):
             await self._emit_blocked(blocked_record)
             return None
 
+        # ── Context-adjusted technical score threshold ────────────────────────
+        # The static TECHNICAL_SCORE_THRESHOLD env var is the system default.
+        # When stock_context_service is available it supplies a ticker-specific
+        # threshold (7, 8, or 9) based on trend regime and price cleanliness.
+        # We re-evaluate the block decision here — without touching technicals.py.
+        tech_score_val = getattr(tech, "technical_score", None)
+        if stock_ctx is not None and tech_score_val is not None:
+            ctx_threshold = int(stock_ctx.get("adjusted_threshold", 8))
+            if tech_score_val < ctx_threshold and not getattr(tech, "blocked", False):
+                # Context requires a higher bar than the static env var
+                ctx_block_reason = (
+                    f"Context threshold {ctx_threshold}/10 not met "
+                    f"(score={tech_score_val}, "
+                    f"trend={stock_ctx.get('trend_regime')}, "
+                    f"cleanliness={stock_ctx.get('cleanliness')})"
+                )
+                _log("info", "pretrade_filter.context_threshold_block",
+                     ticker=ticker, direction=direction,
+                     tech_score=tech_score_val,
+                     ctx_threshold=ctx_threshold,
+                     trend=stock_ctx.get("trend_regime"),
+                     cleanliness=stock_ctx.get("cleanliness"))
+                await self._update_signal_log(record, conviction_in, 0.0,
+                                              blocked=True, reason=ctx_block_reason,
+                                              regime=regime, tech=tech,
+                                              options=options, squeeze=squeeze)
+                blocked_record = {
+                    **record,
+                    "blocked": True,
+                    "block_reason": ctx_block_reason,
+                }
+                await self._emit_blocked(blocked_record)
+                return None
+            elif tech_score_val >= ctx_threshold and getattr(tech, "blocked", False):
+                # Context permits a lower bar than the static env var — unblock
+                _log("info", "pretrade_filter.context_threshold_unblock",
+                     ticker=ticker, direction=direction,
+                     tech_score=tech_score_val,
+                     ctx_threshold=ctx_threshold,
+                     trend=stock_ctx.get("trend_regime"))
+                tech.blocked      = False
+                tech.block_reason = ""
+
         # ── Compute final conviction ───────────────────────────────────────────
+        regime_name  = regime.get("regime", "risk_on")
+        is_systemic  = regime_name in ("risk_off", "high_vol")
+
         conviction = conviction_in
         conviction *= regime.get("conviction_scale", 1.0)
-        conviction *= getattr(tech, "conviction_multiplier", 1.0)
-        conviction *= (1.0 + getattr(options, "conviction_delta", 0.0))
+
+        # Technical multiplier: in a systemic sell-off stocks are below their MAs
+        # market-wide — that's the same information already in regime.conviction_scale.
+        # For LONG signals floor the tech multiplier at 1.0 so we don't double-count.
+        # For SHORT signals the sub-MA reading confirms direction, so leave it as-is.
+        tech_mult = getattr(tech, "conviction_multiplier", 1.0)
+        if is_systemic and direction == "long" and tech_mult < 1.0:
+            tech_mult = 1.0
+        conviction *= tech_mult
+
+        # Options delta: broad bearish flow in risk_off / high_vol is systemic noise,
+        # not a stock-specific signal.  Neutralise the negative delta for LONG signals
+        # only; SHORT signals get to keep the confirming bearish flow.
+        options_delta = getattr(options, "conviction_delta", 0.0)
+        if is_systemic and direction == "long" and options_delta < 0:
+            options_delta = 0.0
+        conviction *= (1.0 + options_delta)
+
         conviction *= getattr(squeeze, "conviction_multiplier", 1.0)
         conviction = round(min(max(conviction, 0.0), 1.0), 3)
 
@@ -212,6 +326,19 @@ class PreTradeFilterService(BaseConsumer):
         # Promote signal type if squeeze candidate
         if getattr(squeeze, "signal_type_override", None):
             record["signal_type"] = squeeze.signal_type_override
+
+        # ── Attach stock context fields to the outbound record ────────────────
+        # These flow through to signals.filtered → execution_engine → signal_log.
+        if stock_ctx is not None:
+            record["trend_regime"]       = stock_ctx.get("trend_regime")
+            record["volatility_regime"]  = stock_ctx.get("volatility_regime")
+            record["cleanliness"]        = stock_ctx.get("cleanliness")
+            record["adjusted_threshold"] = stock_ctx.get("adjusted_threshold")
+        else:
+            record["trend_regime"]       = None
+            record["volatility_regime"]  = None
+            record["cleanliness"]        = None
+            record["adjusted_threshold"] = None
 
         _log("info", "pretrade_filter.passed",
              ticker=ticker, direction=direction,

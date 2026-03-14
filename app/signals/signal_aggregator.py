@@ -19,6 +19,7 @@ import pytz
 from typing import Any
 from uuid import UUID, uuid4
 
+import redis.asyncio as aioredis
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -56,7 +57,7 @@ SESSION_WEIGHT: dict[SessionContext, float] = {
 ET = pytz.timezone("America/New_York")
 
 # Time-of-day windows with conviction multiplier and label
-# Observe mode: multiplier logged but NOT applied to conviction yet
+# Dampening multipliers (< 1.0) are applied; boost multipliers (> 1.0) logged only.
 TIME_WINDOWS: list[tuple[tuple[int,int], tuple[int,int], float, str, str]] = [
     # (start_hhmm, end_hhmm, multiplier, label, emoji)
     ((9, 30),  (9, 45),  0.50, "Open shakeout — high noise, fades quickly",    "🔴"),
@@ -113,10 +114,10 @@ class TradingSignal(BaseModel):
     sympathy_plays: list[str] = Field(default_factory=list)
     is_sympathy: bool = False               # True = secondary signal from sympathy
 
-    # Timing intelligence (observe only — not applied to conviction yet)
+    # Timing intelligence (dampening < 1.0 active; boosts > 1.0 logged only)
     time_window_label: str | None = None
     time_window_emoji: str | None = None
-    time_window_mult: float | None = None   # What multiplier WOULD apply if enabled
+    time_window_mult: float | None = None   # Applied if < 1.0; logged-only if ≥ 1.0
     time_window_quality: str | None = None  # good / caution / poor
 
     # Metadata
@@ -244,6 +245,12 @@ def classify_direction(record: SummarizedRecord) -> str:
     if record.regime_flag == RegimeFlag.RISK_OFF:
         return "short"
 
+    # T2 signal_bias tiebreaker: when all fact-based checks fall through to
+    # neutral, use Sonnet's holistic directional read.  Previously generated
+    # on every high-impact item but never consumed — now wired in.
+    if getattr(record, "signal_bias", None) in ("long", "short"):
+        return record.signal_bias  # type: ignore[return-value]
+
     return "neutral"
 
 
@@ -278,16 +285,42 @@ def get_time_window(dt_utc: datetime) -> dict:
     }
 
 
-def build_sympathy_signal(primary: TradingSignal, sympathy_ticker: str) -> TradingSignal:
+def build_sympathy_signal(
+    primary: TradingSignal,
+    sympathy_ticker: str,
+    intraday_return: float | None = None,
+) -> TradingSignal:
     """
     Build a reduced-conviction signal for a sympathy play ticker.
-    Inherits direction and catalyst from primary, discounted conviction.
+
+    Discount is dynamic based on how much the sympathy ticker has already moved:
+      flat / <1%    → × 0.72  (fresh — most upside still available)
+      partial 1–3%  → × 0.55  (partially priced in)
+      already ran>3%→ × 0.38  (chasing — heavy discount)
+    Extra ×0.6 penalty if the ticker is already moving against the expected direction.
+
+    Flat 30% was the old behaviour regardless of price action.
     """
+    abs_move = abs(intraday_return) if intraday_return is not None else 0.0
+
+    if abs_move >= 3.0:
+        discount = 0.38   # already ran — chasing risk
+    elif abs_move >= 1.0:
+        discount = 0.55   # partially moved
+    else:
+        discount = 0.72   # fresh — most upside available
+
+    # Penalty when the sympathy ticker is moving the wrong way
+    if intraday_return is not None:
+        is_long = primary.direction == "long"
+        if (is_long and intraday_return < -1.0) or (not is_long and intraday_return > 1.0):
+            discount *= 0.6   # sector not following — questionable sympathy
+
     return TradingSignal(
         ticker=sympathy_ticker,
         signal_type="sympathy",
         direction=primary.direction,
-        conviction=round(primary.conviction * 0.70, 3),  # 30% discount vs primary
+        conviction=round(primary.conviction * discount, 3),
         catalyst_type=primary.catalyst_type,
         session_context=primary.session_context,
         regime_flag=primary.regime_flag,
@@ -324,8 +357,40 @@ class SignalAggregatorService(BaseConsumer):
     def output_topic(self) -> str:
         return "signals.actionable"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._redis: aioredis.Redis | None = None
+
     async def on_start(self) -> None:
         self._producer = self._make_producer()
+        self._redis = await aioredis.from_url(
+            os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+            decode_responses=True,
+        )
+
+    async def on_stop(self) -> None:
+        if self._redis:
+            await self._redis.aclose()
+
+    async def _get_intraday_return(self, ticker: str) -> float | None:
+        """
+        Return the intraday % change for ticker from the Redis price cache
+        written by the polygon_prices connector (key: price:{ticker}:last).
+        Returns None if data is unavailable.
+        """
+        if not self._redis:
+            return None
+        try:
+            raw = await self._redis.get(f"price:{ticker}:last")
+            if raw:
+                d = json.loads(raw)
+                last = float(d.get("c") or d.get("close") or 0)
+                open_ = float(d.get("o") or d.get("open") or last)
+                if open_ > 0:
+                    return (last - open_) / open_ * 100
+        except Exception:
+            pass
+        return None
 
     async def _log_signal(self, summarized, conviction: float, passed: bool,
                           direction: str = "neutral", signal_type: str = "other") -> None:
@@ -409,14 +474,36 @@ class SignalAggregatorService(BaseConsumer):
              catalyst=summarized.catalyst_type.value,
              title=summarized.title[:80])
 
-        # Time window assessment (observe only — not modifying conviction)
+        # Time window: apply dampening multipliers (< 1.0) now active.
+        # Boost multipliers (> 1.0) not yet validated — kept inactive.
         tw = get_time_window(summarized.published_at or datetime.now(timezone.utc))
-        _log("info", "signal_aggregator.time_window",
-             ticker=primary_ticker,
-             time_et=tw["time_et"],
-             window=tw["window_label"],
-             multiplier=tw["multiplier"],
-             quality=tw["quality"])
+        tw_mult = tw["multiplier"]
+        if tw_mult < 1.0:
+            conviction_pre_tw = conviction
+            conviction = round(conviction * tw_mult, 3)
+            _log("info", "signal_aggregator.time_window_dampen",
+                 ticker=primary_ticker,
+                 window=tw["window_label"],
+                 time_et=tw["time_et"],
+                 multiplier=tw_mult,
+                 conviction_before=conviction_pre_tw,
+                 conviction_after=conviction)
+            # Re-check threshold after dampening
+            if conviction < CONVICTION_THRESHOLD:
+                _log("info", "signal_aggregator.time_window_threshold_drop",
+                     ticker=primary_ticker,
+                     window=tw["window_label"],
+                     conviction=conviction,
+                     threshold=CONVICTION_THRESHOLD)
+                await self._log_signal(summarized, conviction, passed=False)
+                return None
+        else:
+            _log("info", "signal_aggregator.time_window",
+                 ticker=primary_ticker,
+                 time_et=tw["time_et"],
+                 window=tw["window_label"],
+                 multiplier=tw_mult,
+                 quality=tw["quality"])
 
         signal = TradingSignal(
             ticker=primary_ticker,
@@ -437,6 +524,10 @@ class SignalAggregatorService(BaseConsumer):
             impact_swing=summarized.impact_swing or 0.0,
             source=summarized.source.value,
             prompt_version=summarized.prompt_version,
+            time_window_label=tw["window_label"],
+            time_window_emoji=tw["window_emoji"],
+            time_window_mult=tw_mult,
+            time_window_quality=tw["quality"],
         )
 
         await self._log_signal(summarized, conviction, passed=True,
@@ -447,11 +538,14 @@ class SignalAggregatorService(BaseConsumer):
             for sym_ticker in summarized.sympathy_plays:
                 if sym_ticker == primary_ticker:
                     continue
-                sym_signal = build_sympathy_signal(signal, sym_ticker)
+                sym_return = await self._get_intraday_return(sym_ticker)
+                sym_signal = build_sympathy_signal(signal, sym_ticker,
+                                                   intraday_return=sym_return)
                 if sym_signal.conviction >= CONVICTION_THRESHOLD:
                     _log("info", "signal_aggregator.sympathy_signal",
                          primary=primary_ticker,
                          sympathy=sym_ticker,
+                         intraday_return=round(sym_return, 2) if sym_return is not None else None,
                          conviction=sym_signal.conviction)
                     # Publish sympathy signal to same topic
                     self._producer.produce(

@@ -259,6 +259,7 @@ class SummarizedRecord(EnrichedRecord):
     impact_swing: float | None = None      # 0–1, multi-day impact
     regime_flag: RegimeFlag | None = None
     source_credibility: float | None = None  # 0–1, source tier weight
+    signal_bias: str | None = None           # long | short | neutral — T2 directional lean
 
     # New catalyst intelligence fields (v1.3)
     priced_in: str | None = None            # yes | partially | no

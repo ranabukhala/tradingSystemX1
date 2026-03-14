@@ -882,7 +882,8 @@ services:
       FINVIZ_API_KEY: ${FINVIZ_API_KEY:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       USE_PRETRADE_FILTER: "true"
-      TECHNICAL_SCORE_THRESHOLD: "7"    # 0-10 composite score; min to pass filter
+      TECHNICAL_SCORE_THRESHOLD: "7"    # 0-10 composite score; min to pass filter (static fallback)
+      CONTEXT_SERVICE_URL: "http://stock_context_service:8082"  # dynamic threshold source
     ports:
       - "8074:8074"
     healthcheck:
@@ -927,6 +928,50 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+
+# ══════════════════════════════════════════════════════════
+#  STOCK CONTEXT CLASSIFIER
+#  Pre-computes trend/volatility/cleanliness regime per ticker.
+#  Exposes /health and /context/{ticker} on port 8082.
+#  Uses its own Dockerfile (not the shared image).
+# ══════════════════════════════════════════════════════════
+
+  stock_context_service:
+    build:
+      context: .
+      dockerfile: stock_context_service/Dockerfile
+    container_name: trading_stock_context
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POLYGON_API_KEY:            ${POLYGON_API_KEY}
+      REDIS_URL:                  redis://redis:6379/0
+      DATABASE_URL:               postgresql://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      WATCHLIST_TICKERS:          ${WATCHLIST_TICKERS:-}
+      TECHNICAL_SCORE_THRESHOLD:  ${TECHNICAL_SCORE_THRESHOLD:-7}
+      LOG_LEVEL:                  ${LOG_LEVEL:-INFO}
+      TZ:                         America/New_York
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - trading_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 # ══════════════════════════════════════════════════════════
 #  VOLUMES & NETWORKS

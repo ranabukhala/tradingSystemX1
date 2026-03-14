@@ -505,6 +505,7 @@ class AISummarizerService(BaseConsumer):
             impact_swing=impact_swing,
             regime_flag=regime_flag,
             source_credibility=t2_result.get("source_credibility"),
+            signal_bias=t2_result.get("signal_bias"),
             priced_in=t2_result.get("priced_in"),
             priced_in_reason=t2_result.get("priced_in_reason"),
             sympathy_plays=sympathy_plays,
