@@ -73,7 +73,8 @@
       "Bash(docker ps -a --format \"{{.Names}}\\\\t{{.Status}}\")",
       "Bash(dir stock_context_service)",
       "Bash(dir migrations009_stock_context.sql)",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(xargs grep -l \"class.*Enum\\\\|block.*reason\\\\|drop.*reason\")"
     ]
   }
 }
