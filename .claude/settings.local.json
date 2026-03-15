@@ -112,7 +112,8 @@
       "Bash(grep -r self._producer app/pipeline/*.py app/signals/*.py app/execution/*.py)",
       "Bash(py -3.12 -m pytest tests/test_redis_idempotency.py -v --tb=short)",
       "Bash(py -3.12 -c \"import redis; print\\(redis.__version__\\)\")",
-      "Bash(py -3.12 -c \"import redis.asyncio; print\\(''redis.asyncio OK''\\)\")"
+      "Bash(py -3.12 -c \"import redis.asyncio; print\\(''redis.asyncio OK''\\)\")",
+      "Bash(py -3.12 -m pytest tests/test_llm_trust.py -v --tb=short)"
     ]
   }
 }

@@ -29,6 +29,14 @@ from app.models.news import (
 )
 from app.pipeline.base_consumer import BaseConsumer, _log
 from app.pipeline.event_cluster import EventClusterStore
+from app.pipeline.llm_validation import (
+    LLMValidationResult,
+    validate_llm_output,
+    direction_from_facts,
+    apply_conviction_cap,
+    apply_regime_adjustment,
+    INTERPRETIVE_MAX_CONVICTION,
+)
 
 # Minimum conviction to emit a signal (override via SIGNAL_CONVICTION_THRESHOLD env var)
 import os
@@ -137,34 +145,58 @@ class TradingSignal(BaseModel):
     pipeline_entry_at: datetime | None = None   # When connector first received it (received_at)
     route_type: str | None = None               # "fast" | "slow" — from ai_summarizer
 
+    # Trust metadata (v1.6)
+    # direction_source tracks WHAT evidence drove the final direction decision.
+    # Downstream consumers (pretrade_filter, execution_engine) may use this to
+    # apply additional scrutiny to interpretive-only signals.
+    direction_source: str = "neutral_default"
+    #   "facts"              — direction from validated factual fields (EPS, rating, etc.)
+    #   "interpretive_prior" — only LLM signal_bias was available; conviction was capped
+    #   "neutral_default"    — no evidence; signal is neutral and will be dropped
+    interpretive_cap_applied: bool = False
+    #   True when conviction was reduced to INTERPRETIVE_MAX_CONVICTION ceiling
+
     def to_kafka_dict(self) -> dict:
         return self.model_dump(mode="json")
 
 
-def compute_conviction(record: SummarizedRecord) -> float:
+def compute_conviction(
+    record: SummarizedRecord,
+    direction_source: str,
+    validation: LLMValidationResult,
+) -> tuple[float, bool]:
     """
-    Compute conviction score 0.0–1.0 from multiple factors.
+    Compute conviction score 0.0–1.0 with trust-aware caps.
+
+    Returns (conviction, interpretive_cap_applied).
 
     Formula:
-      base     = impact_day (from LLM)
+      base     = validated impact_day (from LLM — interpretive)
       × catalyst_weight
       × session_weight
       × float_weight
-      × credibility_boost
-    """
-    base = record.impact_day or 0.0
+      × credibility_boost (from validated source_credibility)
 
-    cat_w = CATALYST_WEIGHT.get(record.catalyst_type, 0.5)
+    Post-formula adjustments (in order):
+      1. Earnings proximity bonus (factual: based on earnings_proximity_h)
+      2. Priced-in penalty       (interpretive: conditional on direction_source)
+      3. Interpretive ceiling    (hard cap when direction_source="interpretive_prior")
+      4. Regime adjustment       (interpretive: regime_flag scales conviction down only)
+    """
+    # Use validated impact_day — never the raw LLM value
+    base = validation.cleaned_impact_day or 0.0
+
+    cat_w  = CATALYST_WEIGHT.get(record.catalyst_type, 0.5)
     sess_w = SESSION_WEIGHT.get(record.session_context, 1.0)
     float_w = FLOAT_WEIGHT.get(record.float_sensitivity, 1.0)
 
-    # Source credibility boost: high credibility = more weight
-    cred = record.source_credibility or 0.6
+    # Use validated source_credibility
+    cred = validation.cleaned_source_credibility or 0.6
     cred_boost = 0.8 + (cred * 0.4)   # Range: 0.8–1.2
 
     conviction = base * cat_w * sess_w * float_w * cred_boost
 
-    # Earnings proximity bonus: news within 2h of earnings = very high conviction
+    # ── 1. Earnings proximity bonus (factual context) ─────────────────────
     if record.earnings_proximity_h is not None:
         proximity_h = abs(record.earnings_proximity_h)
         if proximity_h <= 2:
@@ -172,19 +204,36 @@ def compute_conviction(record: SummarizedRecord) -> float:
         elif proximity_h <= 24:
             conviction *= 1.1
 
-    # Legal filings (class actions, lawsuits) are always lagging — auto mark priced in
+    # ── 2. Priced-in penalty (interpretive — applied conditionally) ───────
+    # Legal filings are structurally lagging — always treat as priced in
     if record.catalyst_type == CatalystType.LEGAL:
-        if not getattr(record, "priced_in", None):
-            record.priced_in = "yes"
+        priced_in = "yes"
+    else:
+        priced_in = validation.cleaned_priced_in  # already validated; None = no penalty
 
-    # Priced-in penalty: if market already moved on this, reduce conviction
-    priced_in = getattr(record, "priced_in", None)
+    if direction_source == "interpretive_prior" and priced_in == "yes":
+        # BLOCK: both evidence sources say "don't trade" — the LLM thinks
+        # direction is X AND the same LLM says the market already knows about it.
+        return 0.0, False
+
     if priced_in == "yes":
         conviction *= 0.60      # Heavy discount — likely to fade or not extend
     elif priced_in == "partially":
         conviction *= 0.85      # Moderate discount
 
-    return min(1.0, round(conviction, 3))
+    conviction = min(1.0, round(conviction, 3))
+
+    # ── 3. Interpretive ceiling ───────────────────────────────────────────
+    # Signals whose direction came from LLM opinion (not facts) are capped.
+    # This prevents a Sonnet "long" bias from generating a high-conviction trade.
+    conviction, cap_applied = apply_conviction_cap(conviction, direction_source)
+
+    # ── 4. Regime adjustment (demoted: scale only, never set direction) ───
+    # A "risk_off" regime flag does NOT flip a fact-backed "long" to "short".
+    # It reduces conviction by 10 % to reflect the adverse macro environment.
+    conviction = apply_regime_adjustment(conviction, validation.cleaned_regime_flag)
+
+    return round(conviction, 3), cap_applied
 
 
 def classify_signal_type(record: SummarizedRecord, conviction: float) -> str:
@@ -216,53 +265,46 @@ def classify_signal_type(record: SummarizedRecord, conviction: float) -> str:
     return "event_driven"
 
 
-def classify_direction(record: SummarizedRecord) -> str:
+def classify_direction(
+    record: SummarizedRecord,
+    validation: LLMValidationResult,
+) -> tuple[str, str]:
     """
-    Determine directional bias from facts and T2 analysis.
+    Determine trade direction and record where the evidence came from.
+
+    Returns (direction, direction_source) where direction_source is one of:
+      "facts"              — determined from validated structural facts
+      "interpretive_prior" — only LLM signal_bias was available (conviction capped)
+      "neutral_default"    — no directional evidence; signal will be dropped
+
+    Phase 1 — Factual fields (highest trust, no conviction cap).
+      Uses direction_from_facts() which reads facts_json and applies a strict
+      precedence order: eps_beat > guidance > analyst > deal_price > fda_outcome.
+
+    Phase 2 — Interpretive prior (LLM signal_bias only).
+      regime_flag is INTENTIONALLY excluded from direction determination.
+      It was previously able to return "long" / "short" on its own (risk_on /
+      risk_off), which let a pure LLM assessment of macro conditions drive a
+      trade direction with no structural backing.  It is now a conviction
+      multiplier only (see apply_regime_adjustment()).
+
+    Phase 3 — Default neutral.
+      Both phases returned neutral → signal carries no directional edge.
     """
-    facts = record.facts_json
+    # ── Phase 1: Factual fields ───────────────────────────────────────────
+    direction = direction_from_facts(record.facts_json)
+    if direction != "neutral":
+        return direction, "facts"
 
-    # Earnings signals
-    if facts:
-        if facts.eps_beat is True or facts.guidance_raised is True:
-            return "long"
-        if facts.eps_beat is False or facts.guidance_lowered is True:
-            return "short"
+    # ── Phase 2: Interpretive prior ───────────────────────────────────────
+    # validation.cleaned_signal_bias is None when signal_bias was absent,
+    # invalid, or literally "neutral" — all treated identically as no prior.
+    bias = validation.cleaned_signal_bias
+    if bias in ("long", "short"):
+        return bias, "interpretive_prior"
 
-        # Analyst signals
-        if facts.rating_new and facts.price_target_new:
-            bullish_ratings = {"buy", "strong buy", "outperform", "overweight", "upgrade"}
-            bearish_ratings = {"sell", "strong sell", "underperform", "underweight", "downgrade"}
-            rating_lower = facts.rating_new.lower()
-            if any(r in rating_lower for r in bullish_ratings):
-                return "long"
-            if any(r in rating_lower for r in bearish_ratings):
-                return "short"
-
-        # M&A target is almost always long
-        if facts.deal_price and facts.deal_premium_pct:
-            return "long"
-
-        # FDA approval = long, rejection = short
-        if facts.fda_outcome:
-            if "approved" in facts.fda_outcome.lower():
-                return "long"
-            if any(w in facts.fda_outcome.lower() for w in ["rejected", "failed", "denied"]):
-                return "short"
-
-    # Regime-based direction for macro
-    if record.regime_flag == RegimeFlag.RISK_ON:
-        return "long"
-    if record.regime_flag == RegimeFlag.RISK_OFF:
-        return "short"
-
-    # T2 signal_bias tiebreaker: when all fact-based checks fall through to
-    # neutral, use Sonnet's holistic directional read.  Previously generated
-    # on every high-impact item but never consumed — now wired in.
-    if getattr(record, "signal_bias", None) in ("long", "short"):
-        return record.signal_bias  # type: ignore[return-value]
-
-    return "neutral"
+    # ── Phase 3: Default neutral ──────────────────────────────────────────
+    return "neutral", "neutral_default"
 
 
 def get_time_window(dt_utc: datetime) -> dict:
@@ -300,18 +342,27 @@ def build_sympathy_signal(
     primary: TradingSignal,
     sympathy_ticker: str,
     intraday_return: float | None = None,
-) -> TradingSignal:
+) -> TradingSignal | None:
     """
     Build a reduced-conviction signal for a sympathy play ticker.
 
-    Discount is dynamic based on how much the sympathy ticker has already moved:
-      flat / <1%    → × 0.72  (fresh — most upside still available)
-      partial 1–3%  → × 0.55  (partially priced in)
-      already ran>3%→ × 0.38  (chasing — heavy discount)
-    Extra ×0.6 penalty if the ticker is already moving against the expected direction.
+    Returns None when the primary signal's direction came from interpretive
+    fields only.  Sympathy chains compound LLM uncertainty: if we're already
+    uncertain about the primary direction (no structural facts backing it),
+    generating derivative signals multiplies that uncertainty uncontrollably.
 
-    Flat 30% was the old behaviour regardless of price action.
+    When primary.direction_source == "facts":
+      Discount is dynamic based on how much the sympathy ticker has already moved:
+        flat / <1%    → × 0.72  (fresh — most upside still available)
+        partial 1–3%  → × 0.55  (partially priced in)
+        already ran>3%→ × 0.38  (chasing — heavy discount)
+      Extra × 0.6 penalty if the ticker is already moving against expected direction.
+      Additional × 0.80 base discount for all sympathy signals (v1.6).
     """
+    # ── Guard: block sympathy chains from interpretive-only primaries ─────
+    if primary.direction_source != "facts":
+        return None
+
     abs_move = abs(intraday_return) if intraday_return is not None else 0.0
 
     if abs_move >= 3.0:
@@ -326,6 +377,9 @@ def build_sympathy_signal(
         is_long = primary.direction == "long"
         if (is_long and intraday_return < -1.0) or (not is_long and intraday_return > 1.0):
             discount *= 0.6   # sector not following — questionable sympathy
+
+    # Extra base discount for all sympathy signals (they inherit LLM tickers)
+    discount *= 0.80
 
     return TradingSignal(
         ticker=sympathy_ticker,
@@ -355,6 +409,10 @@ def build_sympathy_signal(
         news_published_at=primary.news_published_at,
         pipeline_entry_at=primary.pipeline_entry_at,
         route_type=primary.route_type,
+        # Sympathy signals always have interpretive direction_source
+        # (they derive from LLM-suggested tickers, not structured facts)
+        direction_source="interpretive_prior",
+        interpretive_cap_applied=True,
     )
 
 
@@ -467,14 +525,38 @@ class SignalAggregatorService(BaseConsumer):
         if summarized.impact_day is None:
             return None
 
-        # Compute conviction
-        conviction = compute_conviction(summarized)
+        # ── Validate all LLM outputs before any trading logic ────────────
+        # validate_llm_output() checks ranges, vocabularies, and ticker formats.
+        # All downstream logic uses validation.cleaned_* values, never raw fields.
+        validation = validate_llm_output(summarized)
+        if validation.issues:
+            _log("debug", "signal_aggregator.llm_validation_issues",
+                 vendor_id=summarized.vendor_id,
+                 issue_count=len(validation.issues),
+                 issues=[{"field": i.field, "reason": i.reason}
+                         for i in validation.issues[:5]])
+
+        # Classify direction first — conviction formula depends on direction_source
+        direction, direction_source = classify_direction(summarized, validation)
+
+        # Compute conviction with trust-aware caps
+        conviction, cap_applied = compute_conviction(summarized, direction_source, validation)
+
+        # Block if conviction zeroed out (interpretive + priced_in="yes")
+        if conviction == 0.0 and direction != "neutral":
+            _log("info", "signal_aggregator.interpretive_priced_in_block",
+                 vendor_id=summarized.vendor_id,
+                 direction_source=direction_source)
+            await self._log_signal(summarized, conviction, passed=False,
+                                   direction=direction)
+            return None
 
         if conviction < CONVICTION_THRESHOLD:
             _log("debug", "signal_aggregator.low_conviction",
                  vendor_id=summarized.vendor_id,
                  conviction=conviction,
-                 threshold=CONVICTION_THRESHOLD)
+                 threshold=CONVICTION_THRESHOLD,
+                 direction_source=direction_source)
             await self._log_signal(summarized, conviction, passed=False)
             return None
 
@@ -482,12 +564,13 @@ class SignalAggregatorService(BaseConsumer):
         primary_ticker = summarized.tickers[0]
 
         signal_type = classify_signal_type(summarized, conviction)
-        direction = classify_direction(summarized)
 
         _log("info", "signal_aggregator.signal_generated",
              ticker=primary_ticker,
              direction=direction,
+             direction_source=direction_source,
              conviction=conviction,
+             interpretive_cap=cap_applied,
              signal_type=signal_type,
              catalyst=summarized.catalyst_type.value,
              title=summarized.title[:80])
@@ -550,6 +633,9 @@ class SignalAggregatorService(BaseConsumer):
             news_published_at=summarized.published_at,
             pipeline_entry_at=summarized.received_at,
             route_type=getattr(summarized, "route_type", None),
+            # Trust metadata (v1.6)
+            direction_source=direction_source,
+            interpretive_cap_applied=cap_applied,
         )
 
         await self._log_signal(summarized, conviction, passed=True,
@@ -573,21 +659,30 @@ class SignalAggregatorService(BaseConsumer):
                 return None
         # ─────────────────────────────────────────────────────────────────────
 
-        # Emit sympathy signals for secondary tickers (only if not priced in)
-        if summarized.sympathy_plays and summarized.priced_in != "yes":
-            for sym_ticker in summarized.sympathy_plays:
+        # Emit sympathy signals for secondary tickers.
+        # Requires: (a) direction_source="facts" on primary — interpretive-only
+        # primaries may not spawn sympathy chains; (b) not fully priced in;
+        # (c) tickers were validated (cleaned_sympathy_plays).
+        if (direction_source == "facts"
+                and validation.cleaned_sympathy_plays
+                and validation.cleaned_priced_in != "yes"):
+            for sym_ticker in validation.cleaned_sympathy_plays:
                 if sym_ticker == primary_ticker:
                     continue
                 sym_return = await self._get_intraday_return(sym_ticker)
                 sym_signal = build_sympathy_signal(signal, sym_ticker,
                                                    intraday_return=sym_return)
+                if sym_signal is None:
+                    # Blocked by trust guard (should not reach here given the outer
+                    # direction_source check, but defensive)
+                    continue
                 if sym_signal.conviction >= CONVICTION_THRESHOLD:
                     _log("info", "signal_aggregator.sympathy_signal",
                          primary=primary_ticker,
                          sympathy=sym_ticker,
                          intraday_return=round(sym_return, 2) if sym_return is not None else None,
-                         conviction=sym_signal.conviction)
-                    # Publish sympathy signal to same topic
+                         conviction=sym_signal.conviction,
+                         direction_source="interpretive_prior")
                     self._producer.produce(
                         self.output_topic,
                         value=sym_signal.to_kafka_dict()

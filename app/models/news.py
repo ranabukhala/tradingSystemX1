@@ -305,6 +305,14 @@ class SummarizedRecord(EnrichedRecord):
     # Routing metadata (v1.4)
     route_type: str | None = None           # "fast" | "slow" — how this record was produced
 
+    # Trust metadata (v1.6)
+    # facts_validated=False means ≥1 factual field (EPS, deal_price, …) failed
+    # range/type validation in llm_validation.validate_llm_output().
+    # When False, direction_from_facts() will still be tried but any validated
+    # field that failed is treated as absent — it does NOT flip to neutral by
+    # default; only the specific invalid field is dropped.
+    facts_validated: bool = True
+
     # AI metadata
     prompt_version: str | None = None
     llm_tokens_used: int | None = None
