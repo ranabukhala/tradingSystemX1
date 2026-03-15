@@ -30,6 +30,8 @@ from app.models.news import (
     RegimeFlag, SummarizedRecord,
 )
 from app.pipeline.base_consumer import BaseConsumer, _log
+from app.pipeline.route_classifier import classify_route
+from app.pipeline.fast_path_builder import build_fast_path_summary
 from app.signals.prompts import (
     PROMPT_VERSION, T1_SYSTEM, T1_USER, T2_SYSTEM, T2_USER,
 )
@@ -412,6 +414,31 @@ class AISummarizerService(BaseConsumer):
             summarized = SummarizedRecord(**enriched.model_dump())
             return summarized.to_kafka_dict()
 
+        # ── Fast-path routing ─────────────────────────────────────────────────
+        # Check whether structured vendor data is sufficient to bypass T1/T2 LLM.
+        # route_classifier inspects raw_payload and known vendor fields.
+        route = classify_route(enriched, raw_record=record)
+        _log(
+            "info", "ai_summarizer.route_selected",
+            vendor_id=enriched.vendor_id,
+            catalyst=enriched.catalyst_type.value,
+            route_type=route.route_type,
+            reason=route.reason,
+            confidence=round(route.confidence, 2),
+        )
+        if route.is_fast:
+            summarized = build_fast_path_summary(enriched, route)
+            _log(
+                "info", "ai_summarizer.fast_path_complete",
+                vendor_id=enriched.vendor_id,
+                tickers=enriched.tickers,
+                reason=route.reason,
+                direction=summarized.signal_bias,
+                impact_day=summarized.impact_day,
+            )
+            return summarized.to_kafka_dict()
+        # ─────────────────────────────────────────────────────────────────────
+
         # Budget check
         if not self._budget.can_spend(0.01):  # Minimum T1 cost estimate
             _log("warning", "ai_summarizer.budget_exhausted",
@@ -509,6 +536,7 @@ class AISummarizerService(BaseConsumer):
             priced_in=t2_result.get("priced_in"),
             priced_in_reason=t2_result.get("priced_in_reason"),
             sympathy_plays=sympathy_plays,
+            route_type="slow",
             prompt_version=PROMPT_VERSION,
             llm_tokens_used=total_tokens,
             llm_cost_usd=round(total_cost, 6),

@@ -76,7 +76,26 @@
       "Bash(python -c \":*)",
       "Bash(xargs grep -l \"class.*Enum\\\\|block.*reason\\\\|drop.*reason\")",
       "Bash(docker restart:*)",
-      "Bash(docker ps:*)"
+      "Bash(docker ps:*)",
+      "Bash(ls /c/work/docker/project1/trading-system/requirements*.txt)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(python3 -c \"import fakeredis; print\\(dir\\(fakeredis\\)\\)\")",
+      "Bash(python3 -c \"import fakeredis; print\\(fakeredis.__version__\\)\")",
+      "Bash(python3 -c \"from fakeredis import FakeAsyncRedis; print\\(''async ok''\\)\")",
+      "Bash(/c/Users/ran.abu-khala/AppData/Local/Programs/Python/Python39/python.exe -c \"import fakeredis; from fakeredis import FakeAsyncRedis; print\\(''ok'', fakeredis.__version__\\)\")",
+      "Bash(/c/Users/ran.abu-khala/AppData/Local/Programs/Python/Python39/python.exe -m pytest tests/test_event_dedup.py tests/test_fast_path.py -x -q)",
+      "Read(//c/Users/ran.abu-khala/AppData/Local/Programs/Python//**)",
+      "Bash(py -3.11 --version)",
+      "Bash(py -3.12 --version)",
+      "Bash(py -3.12 -m pip install fakeredis pytest-asyncio pytest -q)",
+      "Bash(py -3.12 -c \"from fakeredis import FakeAsyncRedis; print\\(''''ok''''\\)\")",
+      "Bash(py -3.12 -m pip install pydantic pydantic-settings redis -q)",
+      "Bash(py -3.12 -m pytest tests/test_event_dedup.py tests/test_fast_path.py -x -q)",
+      "Bash(py -3.12 -m pip install tzdata -q)",
+      "Bash(py -3.12 -m pip install zoneinfo)",
+      "Bash(py -3.12 -c \":*)",
+      "Bash(py -3.12 -m pytest tests/test_event_dedup.py tests/test_fast_path.py -q)"
     ]
   }
 }

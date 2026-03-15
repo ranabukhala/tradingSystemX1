@@ -8,6 +8,10 @@ Stages:
   DroppedRecord      → emitted to news.dropped (non-representative audit trail)
   EnrichedRecord     → emitted to news.enriched by entity resolver
   SummarizedRecord   → emitted to news.summarized by AI agents
+
+route_type on SummarizedRecord:
+  "fast"  — built from structured vendor facts; zero LLM cost
+  "slow"  — full T1/T2 LLM path (default)
 """
 from __future__ import annotations
 
@@ -297,6 +301,9 @@ class SummarizedRecord(EnrichedRecord):
     priced_in: str | None = None            # yes | partially | no
     priced_in_reason: str | None = None     # one-sentence explanation
     sympathy_plays: list[str] = Field(default_factory=list)  # sector sympathy tickers
+
+    # Routing metadata (v1.4)
+    route_type: str | None = None           # "fast" | "slow" — how this record was produced
 
     # AI metadata
     prompt_version: str | None = None
