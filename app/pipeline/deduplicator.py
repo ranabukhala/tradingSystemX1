@@ -3,28 +3,38 @@ Deduplicator Service — Stage 2 of the processing pipeline.
 
 Consumes: news.normalized
 Emits:    news.deduped
+         news.dropped  (non-representative items for audit)
 
 Dedup strategy (in order):
-  1. Exact URL match     — Redis SET, TTL 24h
-  2. Exact hash match    — Redis SET, TTL 24h
-  3. Fuzzy title match   — Trigram similarity via Postgres pg_trgm (>= 0.75)
+  1. Exact URL match         — Redis SET, TTL 24h
+  2. Exact hash match        — Redis SET, TTL 24h
+  3. Fuzzy title match       — Trigram similarity via Postgres pg_trgm (>= 0.75)
+  4. Semantic SimHash match  — 64-bit locality-sensitive hash, Hamming distance
 
 For duplicates:
-  - Non-representative items still emitted with is_representative=False
-    so downstream can track syndication clusters.
+  - Non-representative items are emitted to news.dropped for audit.
+  - Representative items continue to news.deduped as before.
   - Cluster ID is shared UUID for all items in a group.
+
+Feature flags (env vars):
+  ENABLE_SEMANTIC_DEDUP=true        — activate SimHash tier (default: true)
+  DEDUP_EMIT_DROPPED_TOPIC=true     — emit non-rep items to news.dropped (default: true)
+  DEDUP_SQLITE_FALLBACK_READ=false  — read old SQLite idempotency on startup (default: false)
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 from uuid import UUID, uuid4
 
 import redis.asyncio as aioredis
 
 from app.config import settings
-from app.models.news import DedupedRecord, NormalizedRecord
+from app.models.news import DedupedRecord, DroppedRecord, NormalizedRecord
 from app.pipeline.base_consumer import BaseConsumer, _log
+from app.pipeline.dedup_reason import DedupAction, DedupReason, DedupTier
+from app.pipeline.event_cluster import EventClusterStore
 
 # TTL for dedup keys in Redis
 DEDUP_TTL = settings.redis_dedup_ttl_seconds  # default 86400 = 24h
@@ -32,11 +42,17 @@ DEDUP_TTL = settings.redis_dedup_ttl_seconds  # default 86400 = 24h
 # Fuzzy match threshold — trigrams below this are considered distinct
 SIMILARITY_THRESHOLD = 0.75
 
+# Feature flags
+_SEMANTIC_DEDUP   = os.environ.get("ENABLE_SEMANTIC_DEDUP",     "true").lower() == "true"
+_EMIT_DROPPED     = os.environ.get("DEDUP_EMIT_DROPPED_TOPIC",  "true").lower() == "true"
+_DROPPED_TOPIC    = "news.dropped"
+
 
 class DeduplicatorService(BaseConsumer):
 
     def __init__(self) -> None:
         self._redis: aioredis.Redis | None = None
+        self._cluster_store: EventClusterStore | None = None
         self._db_pool = None
         super().__init__()
 
@@ -58,13 +74,17 @@ class DeduplicatorService(BaseConsumer):
             decode_responses=True,
             max_connections=10,
         )
+        if _SEMANTIC_DEDUP:
+            self._cluster_store = EventClusterStore(self._redis)
         # Import here to avoid circular at module load
         from app.db import get_engine
         from sqlalchemy.ext.asyncio import AsyncSession
         from sqlalchemy.orm import sessionmaker
         engine = get_engine()
         self._Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-        _log("info", "deduplicator.connections_ready")
+        _log("info", "deduplicator.connections_ready",
+             semantic_dedup=_SEMANTIC_DEDUP,
+             emit_dropped=_EMIT_DROPPED)
 
     async def on_stop(self) -> None:
         if self._redis:
@@ -85,7 +105,11 @@ class DeduplicatorService(BaseConsumer):
             cluster_id = UUID(existing_url)
             _log("debug", "deduplicator.exact_url_match",
                  vendor_id=norm.vendor_id, cluster_id=str(cluster_id))
-            return self._make_duplicate(norm, cluster_id, "exact_url", 1.0)
+            return await self._make_duplicate(
+                norm, cluster_id, "exact_url", 1.0,
+                dedup_tier=DedupTier.VENDOR_ID,
+                dedup_reason=DedupReason.VENDOR_ID_SEEN,
+            )
 
         # ── Step 2: Exact hash dedup ─────────────────────────────
         hash_key = f"dedup:hash:{norm.content_hash}"
@@ -97,7 +121,11 @@ class DeduplicatorService(BaseConsumer):
                  vendor_id=norm.vendor_id, cluster_id=str(cluster_id))
             # Register this URL too so future URL lookups hit cache
             await self._redis.setex(url_key, DEDUP_TTL, str(cluster_id))
-            return self._make_duplicate(norm, cluster_id, "exact_hash", 1.0)
+            return await self._make_duplicate(
+                norm, cluster_id, "exact_hash", 1.0,
+                dedup_tier=DedupTier.CONTENT_HASH,
+                dedup_reason=DedupReason.CONTENT_HASH_MATCH,
+            )
 
         # ── Step 3: Fuzzy title match via Postgres pg_trgm ───────
         cluster_id, similarity = await self._fuzzy_match(norm.title, norm.published_at)
@@ -108,7 +136,43 @@ class DeduplicatorService(BaseConsumer):
                  cluster_id=str(cluster_id))
             await self._redis.setex(url_key, DEDUP_TTL, str(cluster_id))
             await self._redis.setex(hash_key, DEDUP_TTL, str(cluster_id))
-            return self._make_duplicate(norm, cluster_id, "similarity", similarity)
+            return await self._make_duplicate(
+                norm, cluster_id, "similarity", similarity,
+                dedup_tier=DedupTier.SEMANTIC,
+                dedup_reason=DedupReason.SIMHASH_CLUSTER,
+            )
+
+        # ── Step 4: Semantic SimHash clustering ──────────────────
+        if _SEMANTIC_DEDUP and self._cluster_store and norm.raw_tickers:
+            # Use the first raw ticker as the primary for bucketing.
+            # catalyst_type is not yet available at this stage (resolved in enricher),
+            # so we default to "other" — broad enough to cluster multi-vendor same stories.
+            primary_ticker = norm.raw_tickers[0].upper()
+            cluster_result = await self._cluster_store.match_or_create(
+                ticker=primary_ticker,
+                catalyst="other",
+                published_at=norm.published_at,
+                title=norm.title,
+                facts=None,   # facts not available at normalization stage
+                incoming_event_id=str(norm.id),
+            )
+            if not cluster_result.is_representative:
+                semantic_cluster_id = UUID(cluster_result.event_id) if _is_valid_uuid(cluster_result.event_id) else uuid4()
+                _log("info", "deduplicator.simhash_match",
+                     vendor_id=norm.vendor_id,
+                     matched_event_id=cluster_result.event_id,
+                     fact_overlap=cluster_result.fact_overlap)
+                await self._redis.setex(url_key, DEDUP_TTL, str(semantic_cluster_id))
+                await self._redis.setex(hash_key, DEDUP_TTL, str(semantic_cluster_id))
+                return await self._make_duplicate(
+                    norm, semantic_cluster_id, "simhash", cluster_result.fact_overlap,
+                    dedup_tier=DedupTier.SEMANTIC,
+                    dedup_reason=(
+                        DedupReason.FACT_CONFIRMED
+                        if cluster_result.fact_overlap == 1.0
+                        else DedupReason.SIMHASH_CLUSTER
+                    ),
+                )
 
         # ── New unique item ───────────────────────────────────────
         new_cluster_id = uuid4()
@@ -124,24 +188,49 @@ class DeduplicatorService(BaseConsumer):
             is_representative=True,
             dedup_method=None,
             similarity_score=None,
+            dedup_tier=DedupTier.NONE,
+            dedup_reason=DedupReason.NEW,
         )
         return deduped.to_kafka_dict()
 
-    def _make_duplicate(
+    async def _make_duplicate(
         self,
         norm: NormalizedRecord,
         cluster_id: UUID,
         method: str,
         score: float,
+        dedup_tier: DedupTier = DedupTier.CONTENT_HASH,
+        dedup_reason: DedupReason = DedupReason.CONTENT_HASH_MATCH,
     ) -> dict:
-        """Build a non-representative deduped record."""
+        """Build a non-representative deduped record and optionally emit to news.dropped."""
         deduped = DedupedRecord(
             **norm.model_dump(),
             cluster_id=cluster_id,
             is_representative=False,
             dedup_method=method,
             similarity_score=score,
+            dedup_tier=dedup_tier,
+            dedup_reason=dedup_reason,
         )
+
+        # Emit to news.dropped for audit trail
+        if _EMIT_DROPPED:
+            try:
+                dropped = DroppedRecord(
+                    id=norm.id,
+                    source=norm.source,
+                    vendor_id=norm.vendor_id,
+                    title=norm.title,
+                    published_at=norm.published_at,
+                    cluster_id=cluster_id,
+                    dedup_tier=dedup_tier,
+                    dedup_reason=dedup_reason,
+                    similarity_score=score,
+                )
+                self._producer.produce(_DROPPED_TOPIC, value=dropped.to_kafka_dict())
+            except Exception as e:
+                _log("warning", "deduplicator.dropped_emit_error", error=str(e))
+
         return deduped.to_kafka_dict()
 
     async def _fuzzy_match(
@@ -234,3 +323,11 @@ class DeduplicatorService(BaseConsumer):
                 await session.commit()
         except Exception as e:
             _log("warning", "deduplicator.store_title_error", error=str(e))
+
+
+def _is_valid_uuid(s: str) -> bool:
+    try:
+        UUID(s)
+        return True
+    except ValueError:
+        return False

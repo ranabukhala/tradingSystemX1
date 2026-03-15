@@ -26,10 +26,15 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import redis.asyncio as aioredis
+
 from app.execution.base_broker import BaseBroker, OrderResult, OrderStatus
 from app.execution.risk_manager import RiskManager, RiskConfig
 from app.pipeline.base_consumer import BaseConsumer, _log
+from app.pipeline.event_cluster import EventClusterStore
 from app.signals.signal_aggregator import TradingSignal
+
+_ENABLE_ORDER_EVENT_GATE = os.environ.get("ENABLE_ORDER_EVENT_GATE", "true").lower() == "true"
 
 
 def _get_broker() -> BaseBroker:
@@ -78,6 +83,8 @@ class ExecutionEngine(BaseConsumer):
         self._telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self._telegram_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
         self._http: httpx.AsyncClient | None = None
+        self._redis: aioredis.Redis | None = None
+        self._cluster_store: EventClusterStore | None = None
         super().__init__()
 
     @property
@@ -100,15 +107,24 @@ class ExecutionEngine(BaseConsumer):
         self._http = httpx.AsyncClient(timeout=15.0)
         self._broker = _get_broker()
         await self._broker.connect()
+        if _ENABLE_ORDER_EVENT_GATE:
+            self._redis = await aioredis.from_url(
+                os.environ.get("REDIS_URL", "redis://redis:6379/0"),
+                decode_responses=True,
+            )
+            self._cluster_store = EventClusterStore(self._redis)
         _log("info", "execution_engine.ready",
              broker=self._broker.name,
-             paper=self._broker.paper)
+             paper=self._broker.paper,
+             order_event_gate=_ENABLE_ORDER_EVENT_GATE)
 
     async def on_stop(self) -> None:
         if self._broker:
             await self._broker.disconnect()
         if self._http:
             await self._http.aclose()
+        if self._redis:
+            await self._redis.aclose()
 
     async def process(self, record: dict) -> dict | None:
         try:
@@ -199,6 +215,24 @@ class ExecutionEngine(BaseConsumer):
             decision=decision,
             signal_id=str(signal.id),
         )
+
+        # ── Order event gate — prevent double-submission for same news event ─
+        # Uses cluster_id when available (set by deduplicator), falls back to signal.id.
+        event_id = getattr(signal, "cluster_id", None) or str(signal.id)
+        if _ENABLE_ORDER_EVENT_GATE and self._cluster_store:
+            # Pre-register with a placeholder — will be updated with real order ID below
+            gate_open = await self._cluster_store.mark_order_submitted(
+                event_id=str(event_id),
+                broker_order_id=f"pending:{signal.id}",
+            )
+            if not gate_open:
+                _log("info", "execution.order_gate_blocked",
+                     ticker=ticker,
+                     direction=direction,
+                     event_id=str(event_id),
+                     signal_id=str(signal.id))
+                return None
+        # ────────────────────────────────────────────────────────────────────
 
         result = await self._broker.submit_order(order)
 

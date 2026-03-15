@@ -5,6 +5,7 @@ Stages:
   RawNewsRecord      → emitted to news.raw by connectors
   NormalizedRecord   → emitted to news.normalized by normalizer
   DedupedRecord      → emitted to news.deduped by deduplicator
+  DroppedRecord      → emitted to news.dropped (non-representative audit trail)
   EnrichedRecord     → emitted to news.enriched by entity resolver
   SummarizedRecord   → emitted to news.summarized by AI agents
 """
@@ -13,10 +14,13 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
+
+if TYPE_CHECKING:
+    from app.pipeline.dedup_reason import DedupReason, DedupTier
 
 
 # ── Enums ─────────────────────────────────────────────────────────────────────
@@ -146,14 +150,42 @@ class DedupedRecord(NormalizedRecord):
     """
     cluster_id: UUID | None = None         # Which syndication cluster this belongs to
     is_representative: bool = True         # True = chosen item for this cluster
-    dedup_method: str | None = None        # "exact_url" | "exact_hash" | "similarity"
-    similarity_score: float | None = None  # For fuzzy matches
+    dedup_method: str | None = None        # "exact_url" | "exact_hash" | "similarity" | "simhash"
+    similarity_score: float | None = None  # For fuzzy / SimHash matches
+    dedup_tier: str | None = None          # DedupTier value: "vendor_id" | "content_hash" | "semantic" | "none"
+    dedup_reason: str | None = None        # DedupReason value: granular reason code
 
     def to_kafka_dict(self) -> dict:
         return self.model_dump(mode="json")
 
     @classmethod
     def from_kafka_dict(cls, data: dict) -> "DedupedRecord":
+        return cls.model_validate(data)
+
+
+# ── Stage 3b: Dropped record (audit trail) ────────────────────────────────────
+
+class DroppedRecord(BaseModel):
+    """
+    Emitted to news.dropped for non-representative / duplicate items.
+    Provides a full audit trail without polluting the main pipeline.
+    """
+    id: UUID
+    source: NewsSource
+    vendor_id: str
+    title: str
+    published_at: datetime
+    cluster_id: UUID | None = None
+    dedup_tier: str | None = None          # DedupTier value
+    dedup_reason: str | None = None        # DedupReason value
+    similarity_score: float | None = None
+    dropped_at: datetime = Field(default_factory=datetime.utcnow)
+
+    def to_kafka_dict(self) -> dict:
+        return self.model_dump(mode="json")
+
+    @classmethod
+    def from_kafka_dict(cls, data: dict) -> "DroppedRecord":
         return cls.model_validate(data)
 
 

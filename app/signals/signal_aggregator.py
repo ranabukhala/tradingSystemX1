@@ -28,10 +28,15 @@ from app.models.news import (
     NewsMode, RegimeFlag, SessionContext, SummarizedRecord,
 )
 from app.pipeline.base_consumer import BaseConsumer, _log
+from app.pipeline.event_cluster import EventClusterStore
 
 # Minimum conviction to emit a signal (override via SIGNAL_CONVICTION_THRESHOLD env var)
 import os
 CONVICTION_THRESHOLD = float(os.environ.get("SIGNAL_CONVICTION_THRESHOLD", "0.55"))
+
+# Signal event gate — prevent duplicate signals for the same news event
+_ENABLE_SIGNAL_EVENT_GATE = os.environ.get("ENABLE_SIGNAL_EVENT_GATE", "true").lower() == "true"
+_MULTI_SIGNAL_POLICY      = os.environ.get("MULTI_SIGNAL_POLICY", "deny")  # deny | allow | allow_opposite
 
 # Catalyst weight multipliers
 CATALYST_WEIGHT: dict[CatalystType, float] = {
@@ -360,6 +365,7 @@ class SignalAggregatorService(BaseConsumer):
     def __init__(self) -> None:
         super().__init__()
         self._redis: aioredis.Redis | None = None
+        self._cluster_store: EventClusterStore | None = None
 
     async def on_start(self) -> None:
         self._producer = self._make_producer()
@@ -367,6 +373,8 @@ class SignalAggregatorService(BaseConsumer):
             os.environ.get("REDIS_URL", "redis://redis:6379/0"),
             decode_responses=True,
         )
+        if _ENABLE_SIGNAL_EVENT_GATE:
+            self._cluster_store = EventClusterStore(self._redis)
 
     async def on_stop(self) -> None:
         if self._redis:
@@ -532,6 +540,24 @@ class SignalAggregatorService(BaseConsumer):
 
         await self._log_signal(summarized, conviction, passed=True,
                                direction=direction, signal_type=signal_type)
+
+        # ── Signal event gate ─────────────────────────────────────────────────
+        # Prevents duplicate signals being emitted for the same underlying news event.
+        # Uses Redis SETNX atomicity — first caller wins.
+        if _ENABLE_SIGNAL_EVENT_GATE and self._cluster_store:
+            allowed = await self._cluster_store.mark_signal_emitted(
+                event_id=str(summarized.cluster_id or summarized.id),
+                direction=direction,
+                multi_signal_policy=_MULTI_SIGNAL_POLICY,
+            )
+            if not allowed:
+                _log("info", "signal_aggregator.signal_gate_blocked",
+                     ticker=primary_ticker,
+                     event_id=str(summarized.cluster_id or summarized.id),
+                     direction=direction,
+                     policy=_MULTI_SIGNAL_POLICY)
+                return None
+        # ─────────────────────────────────────────────────────────────────────
 
         # Emit sympathy signals for secondary tickers (only if not priced in)
         if summarized.sympathy_plays and summarized.priced_in != "yes":

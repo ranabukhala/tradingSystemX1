@@ -440,6 +440,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       POSTGRES_HOST: postgres
+      # Semantic dedup feature flags
+      ENABLE_SEMANTIC_DEDUP: ${ENABLE_SEMANTIC_DEDUP:-true}
+      DEDUP_EMIT_DROPPED_TOPIC: ${DEDUP_EMIT_DROPPED_TOPIC:-true}
+      SIMHASH_HAMMING_THRESHOLD: ${SIMHASH_HAMMING_THRESHOLD:-8}
     ports:
       - "8012:8012"
 
@@ -509,6 +513,11 @@ services:
       METRICS_PORT: "8022"
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      REDIS_URL: redis://redis:6379/0
+      # Signal event gate — prevents duplicate signals for same news event
+      ENABLE_SIGNAL_EVENT_GATE: ${ENABLE_SIGNAL_EVENT_GATE:-true}
+      MULTI_SIGNAL_POLICY: ${MULTI_SIGNAL_POLICY:-deny}
+      SIGNAL_DEDUP_TTL_SEC: ${SIGNAL_DEDUP_TTL_SEC:-14400}
     ports:
       - "8022:8022"
 
@@ -609,6 +618,10 @@ services:
       METRICS_PORT: "8041"
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      REDIS_URL: redis://redis:6379/0
+      # Order event gate — prevents double-submission for same news event
+      ENABLE_ORDER_EVENT_GATE: ${ENABLE_ORDER_EVENT_GATE:-true}
+      ORDER_DEDUP_TTL_SEC: ${ORDER_DEDUP_TTL_SEC:-86400}
       # Pre-trade filter integration
       USE_PRETRADE_FILTER: ${USE_PRETRADE_FILTER:-true}
       # Broker selection: alpaca_paper | alpaca_live | ibkr_paper | ibkr_live
