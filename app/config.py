@@ -123,6 +123,19 @@ class Settings(BaseSettings):
     signal_conviction_threshold: float = 0.55
     signal_alert_threshold: float = 0.60
 
+    # ── Idempotency backend ───────────────────────────────────
+    # "redis"  — async SET NX EX (atomic, cross-instance, default)
+    # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)
+    idempotency_backend: str = "redis"
+    # TTL for pipeline event keys in Redis.  48 h = 2× content-dedup TTL (24 h).
+    # Events older than this that arrive via deep replay will be re-processed;
+    # the downstream deduplicator's 4-tier content dedup prevents content dups.
+    idempotency_ttl_seconds: int = 172800
+    # When true, an in-process SQLite store acts as a hot-spare when Redis
+    # is temporarily unreachable.  Set false to disable the fallback entirely
+    # (fail-open behaviour is preserved — the pipeline never stalls).
+    idempotency_fallback_enabled: bool = True
+
     # ── SQLite state DB ───────────────────────────────────────
     data_dir: str = "/data"
     sqlite_db_path: str = ""  # Computed below if empty

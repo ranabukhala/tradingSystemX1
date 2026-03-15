@@ -108,7 +108,11 @@
       "Bash(py -3.12 -c \"from app.logging import get_logger; print\\(''app.logging ok''\\)\")",
       "Bash(py -3.12 -m pip install structlog httpx sqlalchemy pydantic-settings asyncpg -q)",
       "Bash(py -3.12 -c \"import structlog, httpx, sqlalchemy, asyncpg; from app.logging import get_logger; print\\(''all ok''\\)\")",
-      "Bash(docker cp:*)"
+      "Bash(docker cp:*)",
+      "Bash(grep -r self._producer app/pipeline/*.py app/signals/*.py app/execution/*.py)",
+      "Bash(py -3.12 -m pytest tests/test_redis_idempotency.py -v --tb=short)",
+      "Bash(py -3.12 -c \"import redis; print\\(redis.__version__\\)\")",
+      "Bash(py -3.12 -c \"import redis.asyncio; print\\(''redis.asyncio OK''\\)\")"
     ]
   }
 }

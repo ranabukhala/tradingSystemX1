@@ -1,7 +1,7 @@
 """
 Base class for all pipeline consumer services.
 Handles: Kafka consume loop, metrics, graceful shutdown, DLQ routing,
-         idempotency (SQLite), and correlation ID propagation.
+         idempotency (Redis with SQLite fallback), and correlation ID propagation.
 """
 from __future__ import annotations
 
@@ -46,7 +46,10 @@ class BaseConsumer(ABC):
     def __init__(self) -> None:
         self._running = False
         self._consumer: Consumer | None = None
+        # SQLite store — lazy-created; used as Redis fallback and for order/loss tracking
         self._idempotency = None
+        # Redis idempotency store — created in run() via _init_redis_idempotency()
+        self._redis_idem = None
         # Lag tracking — updated periodically by _update_lag()
         self._current_lag: int = 0
         self._last_lag_check: float = 0.0
@@ -103,6 +106,10 @@ class BaseConsumer(ABC):
             "pipeline_consumer_lag", "Estimated consumer lag", ["service"])
         self.metric_up = Gauge(
             "pipeline_up", "1 if service healthy", ["service"])
+        self.metric_idem_fallback = Counter(
+            "pipeline_idem_redis_fallback_total",
+            "Idempotency checks routed to SQLite fallback (Redis unreachable)",
+            ["service"])
 
     def _make_consumer(self) -> Consumer:
         return Consumer({
@@ -119,10 +126,61 @@ class BaseConsumer(ABC):
         return get_producer()
 
     def _get_idempotency_store(self):
+        """Return (and lazily create) the SQLite IdempotencyStore.
+
+        Still used directly by the execution engine for order/loss tracking.
+        Also acts as the Redis fallback store when enabled.
+        """
         if self._idempotency is None:
             from app.idempotency import IdempotencyStore
             self._idempotency = IdempotencyStore()
         return self._idempotency
+
+    async def _init_redis_idempotency(self):
+        """
+        Build and return the async idempotency store for use in the consume loop.
+
+        Backend selection (IDEMPOTENCY_BACKEND env / config):
+          "redis"  — RedisIdempotencyStore with optional SQLite fallback.
+          "sqlite" — _SQLiteAsyncAdapter around the existing SQLite store.
+
+        A dedicated low-connection Redis client is created (max_connections=5,
+        connect/read timeout 2 s) so a slow/dead Redis never blocks message
+        polling for longer than a single TCP handshake timeout.
+        """
+        if settings.idempotency_backend == "sqlite":
+            from app.idempotency_redis import _SQLiteAsyncAdapter
+            _log("info", "service.idempotency_backend",
+                 service=self.service_name, backend="sqlite")
+            return _SQLiteAsyncAdapter(self._get_idempotency_store())
+
+        # ── Redis path ────────────────────────────────────────────────────
+        import redis.asyncio as _aioredis
+        from app.idempotency_redis import RedisIdempotencyStore
+
+        redis_client = _aioredis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=5,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+
+        fallback = None
+        if settings.idempotency_fallback_enabled:
+            fallback = self._get_idempotency_store()
+
+        store = RedisIdempotencyStore(
+            redis_client=redis_client,
+            ttl=settings.idempotency_ttl_seconds,
+            fallback_store=fallback,
+        )
+        _log("info", "service.idempotency_backend",
+             service=self.service_name,
+             backend="redis",
+             ttl=settings.idempotency_ttl_seconds,
+             fallback=settings.idempotency_fallback_enabled)
+        return store
 
     # ── Lag monitoring ────────────────────────────────────────────────────────
 
@@ -208,7 +266,8 @@ class BaseConsumer(ABC):
         self.metric_up.labels(service=svc).set(1)
 
         loop = asyncio.get_running_loop()
-        idem = self._get_idempotency_store()
+        self._redis_idem = await self._init_redis_idempotency()
+        idem = self._redis_idem
 
         try:
             while self._running:
@@ -241,8 +300,11 @@ class BaseConsumer(ABC):
                 event_id = raw.get("event_id") or str(uuid4())
                 bind_event_context(event_id, service=svc, topic=self.input_topic)
 
-                # ── Idempotency check ──────────────────────────────────
-                already = idem.check_and_mark(svc, event_id)
+                # ── Idempotency check (async Redis SET NX) ────────────
+                already = await idem.check_and_mark(svc, event_id)
+                # Track messages that fell back to SQLite (Redis unreachable)
+                if idem._fallback_mode:
+                    self.metric_idem_fallback.labels(service=svc).inc()
                 if already:
                     _log("debug", "service.dedup_skipped",
                          service=svc, event_id=event_id)
@@ -307,7 +369,13 @@ class BaseConsumer(ABC):
         finally:
             if self._consumer:
                 self._consumer.close()
+            if self._redis_idem:
+                # Closes the Redis client owned by the store.
+                # Does NOT close the SQLite fallback (handled next line).
+                await self._redis_idem.close()
             if self._idempotency:
+                # SQLite store — used as Redis fallback and by execution engine
+                # for order / loss tracking.
                 self._idempotency.close()
             await self.on_stop()
             _log("info", "service.stopped", service=svc)
