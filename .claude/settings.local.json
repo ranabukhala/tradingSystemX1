@@ -95,7 +95,20 @@
       "Bash(py -3.12 -m pip install tzdata -q)",
       "Bash(py -3.12 -m pip install zoneinfo)",
       "Bash(py -3.12 -c \":*)",
-      "Bash(py -3.12 -m pytest tests/test_event_dedup.py tests/test_fast_path.py -q)"
+      "Bash(py -3.12 -m pytest tests/test_event_dedup.py tests/test_fast_path.py -q)",
+      "Bash(py -3.12 -m pytest tests/test_staleness.py -v --tb=short)",
+      "Bash(py -3.12 -m pytest tests/test_staleness.py::TestStalenessEdgeCases::test_now_override_for_testing tests/test_staleness.py::TestStalenessDictHelper::test_fresh_signal_passes tests/test_staleness.py::TestKafkaLagHelpers::test_lag_too_high_false_when_zero tests/test_staleness.py::TestTimestampPropagation::test_signal_has_news_published_at_field -v --tb=long)",
+      "Bash(py -3.12 -c \"import confluent_kafka; import pytz; import prometheus_client; print\\(''all ok''\\)\")",
+      "Bash(py -3.12 -c \"import pytz; import prometheus_client; import redis; import httpx; print\\(''ok''\\)\")",
+      "Bash(py -3.12 -m pip install pytz)",
+      "Bash(py -3.12 -m pip install pytz -q)",
+      "Bash(py -3.12 -c \"import pytz; print\\(''pytz ok''\\)\")",
+      "Bash(py -3.12 -c \"import redis, sqlalchemy, httpx; print\\(''ok''\\)\")",
+      "Bash(py -3.12 -c \"import redis; print\\(''redis ok''\\)\")",
+      "Bash(py -3.12 -c \"from app.logging import get_logger; print\\(''app.logging ok''\\)\")",
+      "Bash(py -3.12 -m pip install structlog httpx sqlalchemy pydantic-settings asyncpg -q)",
+      "Bash(py -3.12 -c \"import structlog, httpx, sqlalchemy, asyncpg; from app.logging import get_logger; print\\(''all ok''\\)\")",
+      "Bash(docker cp:*)"
     ]
   }
 }

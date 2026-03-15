@@ -131,6 +131,12 @@ class TradingSignal(BaseModel):
     source: str
     prompt_version: str | None = None
 
+    # Staleness tracking (v1.5) — propagated from SummarizedRecord
+    # Used by pretrade_filter and execution_engine to enforce the staleness guard.
+    news_published_at: datetime | None = None   # When the source article was published (UTC)
+    pipeline_entry_at: datetime | None = None   # When connector first received it (received_at)
+    route_type: str | None = None               # "fast" | "slow" — from ai_summarizer
+
     def to_kafka_dict(self) -> dict:
         return self.model_dump(mode="json")
 
@@ -345,6 +351,10 @@ def build_sympathy_signal(
         impact_swing=primary.impact_swing * 0.6,
         source=primary.source,
         prompt_version=primary.prompt_version,
+        # Inherit staleness timestamps from primary signal
+        news_published_at=primary.news_published_at,
+        pipeline_entry_at=primary.pipeline_entry_at,
+        route_type=primary.route_type,
     )
 
 
@@ -536,6 +546,10 @@ class SignalAggregatorService(BaseConsumer):
             time_window_emoji=tw["window_emoji"],
             time_window_mult=tw_mult,
             time_window_quality=tw["quality"],
+            # Staleness tracking — propagate source timestamps downstream
+            news_published_at=summarized.published_at,
+            pipeline_entry_at=summarized.received_at,
+            route_type=getattr(summarized, "route_type", None),
         )
 
         await self._log_signal(summarized, conviction, passed=True,

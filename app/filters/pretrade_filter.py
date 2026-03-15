@@ -47,6 +47,7 @@ from app.filters.technicals import score_technicals
 from app.filters.options_flow import score_options_flow
 from app.filters.short_interest import score_squeeze
 from app.pipeline.base_consumer import BaseConsumer, _log
+from app.pipeline.staleness import staleness_from_signal_dict
 
 # Stock context service — provides per-ticker adjusted_threshold
 # Import lazily inside process() to avoid hard dependency at module load time.
@@ -153,6 +154,32 @@ class PreTradeFilterService(BaseConsumer):
 
         if direction == "neutral":
             return None
+
+        # ── Staleness guard — reject old signals before any I/O ───────────────
+        # This runs before fetching stock context / regime / technicals to avoid
+        # wasting network calls on signals the market has already absorbed.
+        stale = staleness_from_signal_dict(record)
+        if stale.is_stale:
+            _log("info", "pretrade_filter.staleness_blocked",
+                 ticker=ticker,
+                 direction=direction,
+                 catalyst_type=stale.catalyst_type,
+                 session=stale.session,
+                 route_type=stale.route_type,
+                 age_seconds=stale.age_seconds,
+                 max_age_seconds=stale.max_age_seconds,
+                 reason=stale.reason)
+            await self._log_staleness_block(record, stale)
+            blocked_record = {
+                **record,
+                "blocked": True,
+                "block_reason": stale.reason,
+                "signal_age_seconds": stale.age_seconds,
+                "max_age_seconds": stale.max_age_seconds,
+            }
+            await self._emit_blocked(blocked_record)
+            return None
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Fetch stock context (regime / cleanliness / adjusted threshold) ───
         stock_ctx = await self._get_stock_context(ticker)
@@ -402,6 +429,56 @@ class PreTradeFilterService(BaseConsumer):
             await conn.close()
         except Exception as e:
             _log("warning", "pretrade_filter.log_update_error", error=str(e))
+
+    async def _log_staleness_block(self, record: dict, stale) -> None:
+        """Write a row to staleness_log and update signal_log for staleness blocks."""
+        try:
+            import asyncpg
+            dsn = os.environ.get("DATABASE_URL",
+                "postgresql://trading:trading@postgres:5432/trading_db")
+            dsn = dsn.replace("postgresql+asyncpg://", "postgresql://")
+            conn = await asyncpg.connect(dsn)
+
+            # Immutable audit entry
+            await conn.execute("""
+                INSERT INTO staleness_log (
+                    source, ticker, catalyst_type, session_context, route_type,
+                    signal_age_s, max_age_s, reason, news_published_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+            """,
+                "pretrade_filter",
+                record.get("ticker", ""),
+                stale.catalyst_type,
+                stale.session,
+                stale.route_type,
+                stale.age_seconds,
+                stale.max_age_seconds,
+                stale.reason,
+                record.get("news_published_at"),
+            )
+
+            # Update matching signal_log row so dashboards see the block
+            await conn.execute("""
+                UPDATE signal_log SET
+                    staleness_blocked  = TRUE,
+                    staleness_reason   = $1,
+                    signal_age_seconds = $2,
+                    max_age_seconds    = $3,
+                    filter_blocked     = TRUE,
+                    filter_block_reason= $1
+                WHERE news_id = $4
+                  AND ticker  = $5
+                  AND created_at > now() - interval '10 minutes'
+            """,
+                stale.reason,
+                stale.age_seconds,
+                stale.max_age_seconds,
+                record.get("news_id"),
+                record.get("ticker", ""),
+            )
+            await conn.close()
+        except Exception as e:
+            _log("warning", "pretrade_filter.staleness_log_error", error=str(e))
 
 
 def _check_hard_blocks(direction: str, regime: dict, tech) -> str:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -16,6 +17,14 @@ from prometheus_client import Counter, Histogram, Gauge, start_http_server
 
 from app.config import settings
 from app.logging import get_logger, bind_event_context, clear_event_context
+
+# ── Kafka consumer lag monitoring ─────────────────────────────────────────────
+# Lag = how many messages we are behind the head of each assigned partition.
+# Computed periodically (not on every message) via a broker metadata call.
+
+import os as _os
+_LAG_CHECK_INTERVAL_S = float(_os.environ.get("LAG_CHECK_INTERVAL_SECONDS", "30"))
+_LAG_WARN_THRESHOLD   = int(_os.environ.get("LAG_WARN_MESSAGES", "100"))
 
 log = get_logger("base_consumer")
 
@@ -38,6 +47,9 @@ class BaseConsumer(ABC):
         self._running = False
         self._consumer: Consumer | None = None
         self._idempotency = None
+        # Lag tracking — updated periodically by _update_lag()
+        self._current_lag: int = 0
+        self._last_lag_check: float = 0.0
         self._setup_metrics()
 
         metrics_port = settings.metrics_port
@@ -111,6 +123,75 @@ class BaseConsumer(ABC):
             from app.idempotency import IdempotencyStore
             self._idempotency = IdempotencyStore()
         return self._idempotency
+
+    # ── Lag monitoring ────────────────────────────────────────────────────────
+
+    def _compute_lag_sync(self) -> int:
+        """
+        Synchronously compute total Kafka consumer lag across all assigned partitions.
+
+        Lag = sum over partitions of (high_watermark - current_position).
+        Runs a broker metadata call — intended to be called from run_in_executor.
+        Returns 0 on any error so a transient broker hiccup never crashes the loop.
+        """
+        if not self._consumer:
+            return 0
+        total = 0
+        try:
+            assigned = self._consumer.assignment()
+            if not assigned:
+                return 0
+            positions = self._consumer.position(assigned)
+            for tp in positions:
+                if tp.offset < 0:
+                    # OFFSET_INVALID / OFFSET_BEGINNING — not yet polled any messages
+                    continue
+                try:
+                    low, high = self._consumer.get_watermark_offsets(tp, timeout=2.0)
+                    total += max(0, high - tp.offset)
+                except Exception:
+                    pass  # partition-level failure; skip and count remaining
+        except Exception as e:
+            _log("warning", "service.lag_compute_error",
+                 service=self.service_name, error=str(e))
+        return total
+
+    async def _update_lag(self, loop: asyncio.AbstractEventLoop) -> None:
+        """
+        Update self._current_lag on a time-bounded interval.
+        Safe to call on every message — only hits the broker every
+        LAG_CHECK_INTERVAL_SECONDS (default 30 s).
+        """
+        now = time.monotonic()
+        if now - self._last_lag_check < _LAG_CHECK_INTERVAL_S:
+            return
+        self._last_lag_check = now
+        try:
+            lag = await loop.run_in_executor(None, self._compute_lag_sync)
+            self._current_lag = lag
+            self.metric_lag.labels(service=self.service_name).set(lag)
+            if lag > _LAG_WARN_THRESHOLD:
+                _log("warning", "service.consumer_lag_high",
+                     service=self.service_name,
+                     lag=lag,
+                     warn_threshold=_LAG_WARN_THRESHOLD)
+            else:
+                _log("debug", "service.consumer_lag",
+                     service=self.service_name, lag=lag)
+        except Exception as e:
+            _log("warning", "service.lag_update_error",
+                 service=self.service_name, error=str(e))
+
+    def _lag_too_high(self, threshold: int) -> bool:
+        """
+        Returns True when the cached consumer lag exceeds *threshold* messages.
+
+        The lag value is refreshed every LAG_CHECK_INTERVAL_SECONDS; this method
+        just reads the cached value — no I/O, safe to call inline in process().
+        """
+        return self._current_lag > threshold
+
+    # ── Main consume loop ─────────────────────────────────────────────────────
 
     async def run(self) -> None:
         self._running = True
@@ -215,6 +296,9 @@ class BaseConsumer(ABC):
 
                 self._consumer.commit(msg)
                 clear_event_context()
+
+                # Refresh lag estimate periodically (non-blocking — cached)
+                await self._update_lag(loop)
 
         except Exception as e:
             _log("error", "service.fatal_error", service=svc, error=str(e))

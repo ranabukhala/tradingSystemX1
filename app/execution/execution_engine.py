@@ -32,9 +32,18 @@ from app.execution.base_broker import BaseBroker, OrderResult, OrderStatus
 from app.execution.risk_manager import RiskManager, RiskConfig
 from app.pipeline.base_consumer import BaseConsumer, _log
 from app.pipeline.event_cluster import EventClusterStore
+from app.pipeline.staleness import staleness_from_signal_dict
 from app.signals.signal_aggregator import TradingSignal
 
 _ENABLE_ORDER_EVENT_GATE = os.environ.get("ENABLE_ORDER_EVENT_GATE", "true").lower() == "true"
+
+# Staleness guard — last line of defense after the pretrade filter.
+# Catches signals that aged while sitting in signals.filtered queue.
+_STALENESS_ENABLED = os.environ.get("STALENESS_ENABLED", "true").lower() == "true"
+
+# Kafka consumer lag guard — stop placing orders when we're significantly
+# behind the head of the queue.  Signals in a deep backlog are already old.
+_MAX_EXECUTION_LAG = int(os.environ.get("EXECUTION_MAX_LAG_MESSAGES", "50"))
 
 
 def _get_broker() -> BaseBroker:
@@ -126,6 +135,53 @@ class ExecutionEngine(BaseConsumer):
         if self._redis:
             await self._redis.aclose()
 
+    async def _log_lag_block(self, ticker: str, signal: TradingSignal) -> None:
+        """Write a kafka_lag_log row when execution is blocked by consumer lag."""
+        try:
+            from app.db import get_engine
+            engine = get_engine()
+            async with AsyncSession(engine) as session:
+                await session.execute(text("""
+                    INSERT INTO kafka_lag_log
+                        (service, consumer_lag, lag_threshold, blocked, ticker)
+                    VALUES ('execution_engine', :lag, :threshold, TRUE, :ticker)
+                """), {
+                    "lag":       self._current_lag,
+                    "threshold": _MAX_EXECUTION_LAG,
+                    "ticker":    ticker,
+                })
+                await session.commit()
+        except Exception as e:
+            _log("warning", "execution.lag_log_error", error=str(e))
+
+    async def _log_staleness_block(self, ticker: str, signal: TradingSignal, stale) -> None:
+        """Write a staleness_log row when execution is blocked by signal age."""
+        try:
+            from app.db import get_engine
+            engine = get_engine()
+            async with AsyncSession(engine) as session:
+                await session.execute(text("""
+                    INSERT INTO staleness_log (
+                        source, ticker, catalyst_type, session_context, route_type,
+                        signal_age_s, max_age_s, reason, news_published_at
+                    ) VALUES (
+                        'execution_engine', :ticker, :catalyst, :session, :route,
+                        :age, :max_age, :reason, :published_at
+                    )
+                """), {
+                    "ticker":       ticker,
+                    "catalyst":     stale.catalyst_type,
+                    "session":      stale.session,
+                    "route":        stale.route_type,
+                    "age":          stale.age_seconds,
+                    "max_age":      stale.max_age_seconds,
+                    "reason":       stale.reason,
+                    "published_at": signal.news_published_at,
+                })
+                await session.commit()
+        except Exception as e:
+            _log("warning", "execution.staleness_log_error", error=str(e))
+
     async def process(self, record: dict) -> dict | None:
         try:
             signal = TradingSignal.model_validate(record)
@@ -137,8 +193,39 @@ class ExecutionEngine(BaseConsumer):
         if signal.direction == "neutral":
             return None
 
-        ticker = signal.ticker
+        ticker    = signal.ticker
         direction = signal.direction
+
+        # ── Kafka consumer lag guard ───────────────────────────────────────────
+        # If we are significantly behind the head of the queue the signals we
+        # are about to execute are already old.  Stop trading until caught up.
+        if _MAX_EXECUTION_LAG > 0 and self._lag_too_high(_MAX_EXECUTION_LAG):
+            _log("info", "execution.lag_blocked",
+                 ticker=ticker,
+                 direction=direction,
+                 consumer_lag=self._current_lag,
+                 max_lag=_MAX_EXECUTION_LAG)
+            await self._log_lag_block(ticker, signal)
+            return None
+
+        # ── Staleness guard ────────────────────────────────────────────────────
+        # Second enforcement point (pretrade_filter is first).  Catches signals
+        # that were fresh when the filter ran but aged in signals.filtered queue.
+        if _STALENESS_ENABLED:
+            stale = staleness_from_signal_dict(record)
+            if stale.is_stale:
+                _log("info", "execution.staleness_blocked",
+                     ticker=ticker,
+                     direction=direction,
+                     catalyst_type=stale.catalyst_type,
+                     session=stale.session,
+                     route_type=stale.route_type,
+                     age_seconds=stale.age_seconds,
+                     max_age_seconds=stale.max_age_seconds,
+                     reason=stale.reason)
+                await self._log_staleness_block(ticker, signal, stale)
+                return None
+        # ─────────────────────────────────────────────────────────────────────
 
         # ── Get current price ─────────────────────────────────────────────────
         price = await self._broker.get_quote(ticker)
@@ -389,6 +476,20 @@ class ExecutionEngine(BaseConsumer):
             from app.db import get_engine
             from sqlalchemy.ext.asyncio import AsyncSession
             engine = get_engine()
+
+            # Compute pipeline latency: time from article publication to order submission
+            pipeline_latency_ms: int | None = None
+            if signal.news_published_at:
+                try:
+                    pub = signal.news_published_at
+                    if pub.tzinfo is None:
+                        from datetime import timezone as _tz
+                        pub = pub.replace(tzinfo=_tz.utc)
+                    latency_s = (datetime.now(timezone.utc) - pub).total_seconds()
+                    pipeline_latency_ms = int(latency_s * 1000)
+                except Exception:
+                    pass
+
             async with AsyncSession(engine) as session:
                 await session.execute(text("""
                     INSERT INTO trade (
@@ -396,30 +497,34 @@ class ExecutionEngine(BaseConsumer):
                         ticker, direction, qty, entry_price,
                         take_profit, stop_loss, conviction,
                         catalyst_type, signal_type, status,
-                        t1_summary, created_at
+                        t1_summary, consumer_lag, pipeline_latency_ms,
+                        created_at
                     ) VALUES (
                         gen_random_uuid(), :signal_id, :broker_order_id, :broker,
                         :ticker, :direction, :qty, :entry_price,
                         :take_profit, :stop_loss, :conviction,
                         :catalyst_type, :signal_type, :status,
-                        :t1_summary, now()
+                        :t1_summary, :consumer_lag, :pipeline_latency_ms,
+                        now()
                     )
                     ON CONFLICT DO NOTHING
                 """), {
-                    "signal_id": str(signal.id),
-                    "broker_order_id": result.broker_order_id,
-                    "broker": self._broker.name,
-                    "ticker": signal.ticker,
-                    "direction": signal.direction,
-                    "qty": decision.qty,
-                    "entry_price": price,
-                    "take_profit": decision.take_profit,
-                    "stop_loss": decision.stop_loss,
-                    "conviction": signal.conviction,
-                    "catalyst_type": signal.catalyst_type,
-                    "signal_type": signal.signal_type,
-                    "status": result.status.value,
-                    "t1_summary": signal.t1_summary,
+                    "signal_id":           str(signal.id),
+                    "broker_order_id":     result.broker_order_id,
+                    "broker":              self._broker.name,
+                    "ticker":              signal.ticker,
+                    "direction":           signal.direction,
+                    "qty":                 decision.qty,
+                    "entry_price":         price,
+                    "take_profit":         decision.take_profit,
+                    "stop_loss":           decision.stop_loss,
+                    "conviction":          signal.conviction,
+                    "catalyst_type":       signal.catalyst_type,
+                    "signal_type":         signal.signal_type,
+                    "status":              result.status.value,
+                    "t1_summary":          signal.t1_summary,
+                    "consumer_lag":        self._current_lag,
+                    "pipeline_latency_ms": pipeline_latency_ms,
                 })
                 await session.commit()
         except Exception as e:
