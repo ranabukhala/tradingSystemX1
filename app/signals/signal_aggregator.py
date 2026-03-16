@@ -136,6 +136,14 @@ class TradingSignal(BaseModel):
     pipeline_entry_at: datetime | None = None   # When connector first received it (received_at)
     route_type: str | None = None               # "fast" | "slow" — from ai_summarizer
 
+    # Event-level deduplication (v1.9) — propagated from SummarizedRecord.cluster_id.
+    # Stable across vendors: two vendors reporting the same earnings catalyst for the
+    # same ticker map to one event_id.  The signal gate and order gate both key on
+    # this field so duplicate trades from the same event are blocked even when
+    # news_id (vendor-specific) differs.
+    # None on legacy signals (created before v1.9) — gates fall back to signal.id.
+    event_id: UUID | None = None
+
     # Trust metadata (v1.6)
     # direction_source tracks WHAT evidence drove the final direction decision.
     # Downstream consumers (pretrade_filter, execution_engine) may use this to
@@ -772,6 +780,8 @@ class SignalAggregatorService(BaseConsumer):
             news_published_at=summarized.published_at,
             pipeline_entry_at=summarized.received_at,
             route_type=getattr(summarized, "route_type", None),
+            # Event-level dedup (v1.9) — stable cross-vendor event identity
+            event_id=summarized.cluster_id,
             # Trust metadata (v1.6)
             direction_source=direction_source,
             interpretive_cap_applied=cap_applied,

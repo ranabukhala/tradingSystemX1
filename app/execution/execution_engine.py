@@ -506,7 +506,9 @@ class ExecutionEngine(BaseConsumer):
         )
 
         # ── Order event gate — prevent double-submission for same news event ──
-        event_id = getattr(signal, "cluster_id", None) or str(signal.id)
+        # Use signal.event_id (stable cross-vendor cluster identity, v1.9).
+        # Falls back to signal.id for legacy signals that predate v1.9.
+        event_id = str(signal.event_id) if signal.event_id else str(signal.id)
         if _ENABLE_ORDER_EVENT_GATE and self._cluster_store:
             gate_open = await self._cluster_store.mark_order_submitted(
                 event_id=str(event_id),

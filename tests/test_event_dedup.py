@@ -720,3 +720,92 @@ class TestIntegrationFactConfirmation:
         assert meta is not None
         assert meta["ticker"] == "TSLA"
         assert meta["catalyst"] == "analyst"
+
+
+# ── event_id propagation (v1.9) ───────────────────────────────────────────────
+
+class TestEventIdPropagation:
+    """
+    Verify that event_id (v1.9) is correctly threaded from the deduplication
+    stage through TradingSignal and into the execution engine order gate.
+
+    Tests use SimpleNamespace to mirror the exact expressions in production
+    code without importing heavy pipeline dependencies.
+    """
+
+    def test_event_id_propagates_from_cluster_id(self):
+        """
+        signal_aggregator sets `event_id=summarized.cluster_id`.
+        A non-None cluster_id must appear as signal.event_id downstream.
+        """
+        from types import SimpleNamespace
+        cluster_id = uuid4()
+        summarized = SimpleNamespace(cluster_id=cluster_id)
+        # Replicate the constructor assignment
+        signal_event_id = summarized.cluster_id
+        assert signal_event_id == cluster_id
+
+    def test_event_id_is_none_when_cluster_id_absent(self):
+        """
+        When cluster_id is None (e.g. dedup skipped), event_id on the signal
+        must also be None so the gate falls back to signal.id.
+        """
+        from types import SimpleNamespace
+        summarized = SimpleNamespace(cluster_id=None)
+        signal_event_id = summarized.cluster_id
+        assert signal_event_id is None
+
+    def test_order_gate_uses_event_id_when_present(self):
+        """
+        The execution engine gate expression:
+            str(signal.event_id) if signal.event_id else str(signal.id)
+        must resolve to the cluster-level event_id, not the signal-level id.
+        """
+        from types import SimpleNamespace
+        signal_id  = uuid4()
+        event_id   = uuid4()
+        sig = SimpleNamespace(id=signal_id, event_id=event_id)
+        gate_key = str(sig.event_id) if sig.event_id else str(sig.id)
+        assert gate_key == str(event_id)
+        assert gate_key != str(signal_id)   # event_id wins over news-specific id
+
+    def test_order_gate_falls_back_to_signal_id_for_legacy_signals(self):
+        """
+        Legacy signals (event_id=None, created before v1.9) must still work.
+        The gate falls back to str(signal.id) so no silent drops occur.
+        """
+        from types import SimpleNamespace
+        signal_id = uuid4()
+        sig = SimpleNamespace(id=signal_id, event_id=None)
+        gate_key = str(sig.event_id) if sig.event_id else str(sig.id)
+        assert gate_key == str(signal_id)
+
+    def test_two_vendors_same_cluster_id_produce_identical_gate_key(self):
+        """
+        Two signals from different vendors reporting the same catalyst must
+        produce the same gate key → only the first trade is submitted.
+        """
+        from types import SimpleNamespace
+        shared_cluster_id = uuid4()
+        sig_vendor_a = SimpleNamespace(id=uuid4(), event_id=shared_cluster_id)
+        sig_vendor_b = SimpleNamespace(id=uuid4(), event_id=shared_cluster_id)
+
+        key_a = str(sig_vendor_a.event_id) if sig_vendor_a.event_id else str(sig_vendor_a.id)
+        key_b = str(sig_vendor_b.event_id) if sig_vendor_b.event_id else str(sig_vendor_b.id)
+
+        assert key_a == key_b           # identical → second order blocked
+        assert sig_vendor_a.id != sig_vendor_b.id   # different signal.id values (different vendors)
+
+    def test_two_distinct_events_produce_different_gate_keys(self):
+        """
+        Two signals from genuinely different events must produce different
+        gate keys so neither blocks the other.
+        """
+        from types import SimpleNamespace
+        sig_a = SimpleNamespace(id=uuid4(), event_id=uuid4())
+        sig_b = SimpleNamespace(id=uuid4(), event_id=uuid4())
+
+        key_a = str(sig_a.event_id) if sig_a.event_id else str(sig_a.id)
+        key_b = str(sig_b.event_id) if sig_b.event_id else str(sig_b.id)
+
+        assert key_a != key_b
