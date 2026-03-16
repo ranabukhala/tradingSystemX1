@@ -43,6 +43,23 @@ CLAUDE_MODEL_T2 = "claude-sonnet-4-6"        # Smarter for T2 trader analysis
 COST_PER_1K_T1 = 0.001    # Haiku
 COST_PER_1K_T2 = 0.015    # Sonnet
 
+# ── Prometheus: route selection counter ──────────────────────────────────────
+# Labels: route_type ("fast"|"slow"), catalyst_type (from CatalystType.value)
+try:
+    from prometheus_client import Counter as _PCounter
+    _ROUTE_COUNTER = _PCounter(
+        "ai_summarizer_route_total",
+        "Count of fast vs slow path route selections by catalyst type",
+        ["route_type", "catalyst_type"],
+    )
+except Exception:  # prometheus_client absent or registry conflict in tests
+    class _NoopCounter:  # type: ignore[no-redef]
+        def labels(self, **_kw):
+            return self
+        def inc(self) -> None:
+            pass
+    _ROUTE_COUNTER = _NoopCounter()  # type: ignore[assignment]
+
 
 class BudgetTracker:
     """Simple daily spend tracker. Resets at midnight UTC."""
@@ -427,6 +444,10 @@ class AISummarizerService(BaseConsumer):
             confidence=round(route.confidence, 2),
         )
         if route.is_fast:
+            _ROUTE_COUNTER.labels(
+                route_type="fast",
+                catalyst_type=enriched.catalyst_type.value,
+            ).inc()
             summarized = build_fast_path_summary(enriched, route)
             _log(
                 "info", "ai_summarizer.fast_path_complete",
@@ -523,6 +544,10 @@ class AISummarizerService(BaseConsumer):
         ][:3]  # Cap at 3
 
         # ── Assemble final record ─────────────────────────────────────────────
+        _ROUTE_COUNTER.labels(
+            route_type="slow",
+            catalyst_type=enriched.catalyst_type.value,
+        ).inc()
         summarized = SummarizedRecord(
             **enriched.model_dump(),
             t1_summary=t1_result.get("t1_summary"),

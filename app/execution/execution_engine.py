@@ -599,6 +599,7 @@ class ExecutionEngine(BaseConsumer):
                 "status": result.status.value,
                 "catalyst_type": signal.catalyst_type,
                 "signal_type": signal.signal_type,
+                "route_type": signal.route_type or "slow",
                 "t1_summary": signal.t1_summary,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
