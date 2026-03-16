@@ -185,6 +185,83 @@ class Settings(BaseSettings):
     # High volume — enable sparingly (e.g., during calibration research only).
     conviction_log_dropped_features: bool = False
 
+    # ── Catalyst-aware pretrade policies (v1.9) ───────────────────────────
+    # Kill-switch: set False to disable policy layer entirely (pure 4-filter mode).
+    enable_catalyst_policy: bool = True
+
+    # Sympathy trade threshold bump (added on top of per-catalyst threshold).
+    policy_sympathy_threshold_bump: float = 0.08
+
+    # Per-catalyst conviction thresholds (override via env: POLICY_THRESHOLD_EARNINGS=0.52)
+    policy_threshold_earnings:   float = 0.55
+    policy_threshold_analyst:    float = 0.60
+    policy_threshold_regulatory: float = 0.58
+    policy_threshold_filing:     float = 0.58
+    policy_threshold_ma:         float = 0.50
+    policy_threshold_macro:      float = 0.60
+    policy_threshold_legal:      float = 0.62
+    policy_threshold_other:      float = 0.60
+
+    # Per-catalyst interpretive (LLM-only direction) conviction penalty multipliers
+    policy_interp_penalty_earnings:   float = 0.70
+    policy_interp_penalty_analyst:    float = 0.60
+    policy_interp_penalty_regulatory: float = 0.75
+    policy_interp_penalty_filing:     float = 0.75
+    policy_interp_penalty_ma:         float = 0.65
+    policy_interp_penalty_macro:      float = 0.80
+    policy_interp_penalty_legal:      float = 0.65
+    policy_interp_penalty_other:      float = 0.80
+
+    # Per-catalyst options flow weight multipliers
+    policy_options_weight_earnings:   float = 1.30
+    policy_options_weight_analyst:    float = 0.80
+    policy_options_weight_regulatory: float = 1.10
+    policy_options_weight_filing:     float = 1.10
+    policy_options_weight_ma:         float = 1.20
+    policy_options_weight_macro:      float = 1.10
+    policy_options_weight_legal:      float = 0.90
+    policy_options_weight_other:      float = 1.00
+
+    # Market-cap tier options weight scalers
+    policy_mktcap_mega_options_scale:  float = 0.90
+    policy_mktcap_large_options_scale: float = 0.90
+    policy_mktcap_mid_options_scale:   float = 1.00
+    policy_mktcap_small_options_scale: float = 1.20
+    policy_mktcap_micro_options_scale: float = 1.20
+
+    # Market-cap tier regime scale adjustments (multiplied on top of regime_scale)
+    policy_mktcap_mega_regime_adj:  float = 1.10
+    policy_mktcap_large_regime_adj: float = 1.10
+    policy_mktcap_mid_regime_adj:   float = 1.00
+    policy_mktcap_small_regime_adj: float = 0.85
+    policy_mktcap_micro_regime_adj: float = 0.85
+
+    # Minimum 0-10 composite tech score per catalyst family (below = block)
+    policy_min_tech_score_earnings:   int = 7
+    policy_min_tech_score_analyst:    int = 8
+    policy_min_tech_score_regulatory: int = 7
+    policy_min_tech_score_filing:     int = 7
+    policy_min_tech_score_ma:         int = 6
+    policy_min_tech_score_macro:      int = 7
+    policy_min_tech_score_legal:      int = 7
+    policy_min_tech_score_other:      int = 7
+
+    # Per-catalyst sympathy conviction multipliers
+    policy_sympathy_mult_earnings:   float = 0.80
+    policy_sympathy_mult_analyst:    float = 0.75
+    policy_sympathy_mult_regulatory: float = 0.85
+    policy_sympathy_mult_filing:     float = 0.85
+    policy_sympathy_mult_ma:         float = 0.90
+    policy_sympathy_mult_macro:      float = 0.80
+    policy_sympathy_mult_legal:      float = 0.80
+    policy_sympathy_mult_other:      float = 0.80
+
+    # Volume confirmation required (blocks signals without volume > 1.5× avg)
+    policy_require_volume_earnings: bool = True
+    policy_require_volume_analyst:  bool = False
+    policy_require_volume_ma:       bool = True
+    policy_require_volume_other:    bool = False
+
     # ── Idempotency backend ───────────────────────────────────
     # "redis"  — async SET NX EX (atomic, cross-instance, default)
     # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)

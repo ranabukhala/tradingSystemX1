@@ -15,16 +15,18 @@ Four filters run in parallel for every signal:
   3. Options    — is smart money positioned in the same direction?
   4. Short      — is this a squeeze setup (adjust sizing + signal type)?
 
-Final conviction formula:
+Final conviction formula (v1.9 — catalyst-policy-aware):
   conviction_final = conviction_original
-    × regime.conviction_scale
+    × effective_regime_scale          (regime.conviction_scale × mktcap_regime_adj)
     × technicals.conviction_multiplier
-    × (1 + options.conviction_delta)
+    × (1 + effective_options_delta)   (options_delta × options_weight × mktcap_options_scale)
     × squeeze.conviction_multiplier
+    × policy_multiplier               (interpretive_penalty × sympathy_multiplier)
 
 Hard blocks (conviction → 0, signal dropped):
   - regime.block_longs/block_shorts active
   - technicals.blocked (score < -0.55 vs direction)
+  - catalyst_policy tech_score gate / volume gate (v1.9)
 
 Soft adjustments (conviction scaled, signal passes):
   - Everything else
@@ -42,6 +44,16 @@ from typing import Optional
 import httpx
 import redis.asyncio as aioredis
 
+from app.config import settings as _settings
+from app.filters.catalyst_policy import (
+    CatalystPolicy,
+    PolicyResult,
+    build_policy_table,
+    get_policy,
+    apply_policy,
+    _build_mktcap_options_scale,
+    _build_mktcap_regime_adj,
+)
 from app.filters.regime import get_current_regime
 from app.filters.technicals import score_technicals
 from app.filters.options_flow import score_options_flow
@@ -66,6 +78,10 @@ class PreTradeFilterService(BaseConsumer):
         self._redis: aioredis.Redis | None = None
         self._http: httpx.AsyncClient | None = None
         self._polygon_key = os.environ.get("POLYGON_API_KEY", "")
+        # Build catalyst policy table from settings at startup (v1.9)
+        self._policy_table: dict[str, CatalystPolicy] = build_policy_table(_settings)
+        self._mktcap_options_scale: dict[str, float] = _build_mktcap_options_scale(_settings)
+        self._mktcap_regime_adj: dict[str, float] = _build_mktcap_regime_adj(_settings)
         super().__init__()
 
     @property
@@ -290,12 +306,70 @@ class PreTradeFilterService(BaseConsumer):
                 tech.blocked      = False
                 tech.block_reason = ""
 
+        # ── Catalyst policy gate (v1.9) ───────────────────────────────────────
+        # Runs AFTER regime/tech hard blocks so regime gates always fire first.
+        # Determines per-catalyst threshold, multipliers, and adjusted deltas.
+        catalyst_type    = record.get("catalyst_type", "other")
+        is_sympathy      = bool(record.get("is_sympathy", False))
+        mktcap_tier      = record.get("market_cap_tier")
+        tech_raw_score   = getattr(tech, "technical_score", 0)
+        raw_options_delta = getattr(options, "conviction_delta", 0.0)
+
+        if _settings.enable_catalyst_policy:
+            policy = get_policy(self._policy_table, catalyst_type, is_sympathy)
+            policy_result = apply_policy(
+                policy,
+                signal=record,
+                tech_raw_score=tech_raw_score,
+                options_delta=raw_options_delta,
+                regime_scale=regime.get("conviction_scale", 1.0),
+                mktcap_tier=mktcap_tier,
+                sympathy_threshold_bump=_settings.policy_sympathy_threshold_bump,
+                mktcap_options_scale=self._mktcap_options_scale,
+                mktcap_regime_adj=self._mktcap_regime_adj,
+            )
+            if policy_result.block:
+                _log("info", "pretrade_filter.policy_blocked",
+                     ticker=ticker, direction=direction,
+                     catalyst_type=catalyst_type,
+                     conviction_in=conviction_in,
+                     reason=policy_result.block_reason)
+                await self._update_signal_log(
+                    record, conviction_in, 0.0,
+                    blocked=True, reason=policy_result.block_reason,
+                    regime=regime, tech=tech, options=options, squeeze=squeeze,
+                    policy_result=policy_result,
+                )
+                blocked_record = {
+                    **record,
+                    "blocked": True,
+                    "block_reason": policy_result.block_reason,
+                }
+                await self._emit_blocked(blocked_record)
+                return None
+
+            effective_regime_scale  = policy_result.adjusted_regime_scale
+            effective_options_delta = policy_result.adjusted_options_delta
+            policy_multiplier       = policy_result.multiplier
+            effective_threshold     = policy_result.threshold
+        else:
+            # Kill-switch path — preserve pre-v1.9 behaviour exactly
+            effective_regime_scale  = regime.get("conviction_scale", 1.0)
+            effective_options_delta = raw_options_delta
+            policy_multiplier       = 1.0
+            effective_threshold     = float(os.environ.get("SIGNAL_CONVICTION_THRESHOLD", "0.55"))
+            policy_result           = PolicyResult(
+                adjusted_options_delta=raw_options_delta,
+                adjusted_regime_scale=effective_regime_scale,
+                threshold=effective_threshold,
+            )
+
         # ── Compute final conviction ───────────────────────────────────────────
         regime_name  = regime.get("regime", "risk_on")
         is_systemic  = regime_name in ("risk_off", "high_vol")
 
         conviction = conviction_in
-        conviction *= regime.get("conviction_scale", 1.0)
+        conviction *= effective_regime_scale
 
         # Technical multiplier: in a systemic sell-off stocks are below their MAs
         # market-wide — that's the same information already in regime.conviction_scale.
@@ -309,18 +383,64 @@ class PreTradeFilterService(BaseConsumer):
         # Options delta: broad bearish flow in risk_off / high_vol is systemic noise,
         # not a stock-specific signal.  Neutralise the negative delta for LONG signals
         # only; SHORT signals get to keep the confirming bearish flow.
-        options_delta = getattr(options, "conviction_delta", 0.0)
+        options_delta = effective_options_delta
         if is_systemic and direction == "long" and options_delta < 0:
             options_delta = 0.0
         conviction *= (1.0 + options_delta)
 
         conviction *= getattr(squeeze, "conviction_multiplier", 1.0)
+
+        # Policy multiplier (interpretive_penalty × sympathy_multiplier) applied last.
+        conviction *= policy_multiplier
+
         conviction = round(min(max(conviction, 0.0), 1.0), 3)
+
+        # ── Post-formula conviction threshold gate (v1.9) ─────────────────────
+        # The signal_aggregator threshold was set before policy adjustments were
+        # applied.  After policy multipliers (interpretive_penalty, sympathy_mult)
+        # and mktcap-adjusted options/regime scalings, the adjusted conviction may
+        # fall below the per-catalyst effective threshold.  Block here so that
+        # downstream execution engine never sees sub-threshold signals.
+        if conviction < effective_threshold:
+            threshold_block_reason = (
+                f"Post-policy conviction {conviction:.3f} < "
+                f"effective_threshold {effective_threshold:.3f} "
+                f"(catalyst={catalyst_type}, "
+                f"policy_mult={policy_multiplier:.3f})"
+            )
+            _log("info", "pretrade_filter.threshold_blocked",
+                 ticker=ticker, direction=direction,
+                 conviction_in=conviction_in,
+                 conviction_out=conviction,
+                 effective_threshold=effective_threshold,
+                 catalyst_type=catalyst_type)
+            await self._update_signal_log(
+                record, conviction_in, conviction,
+                blocked=True, reason=threshold_block_reason,
+                regime=regime, tech=tech, options=options, squeeze=squeeze,
+                policy_result=policy_result,
+            )
+            blocked_record = {
+                **record,
+                "blocked": True,
+                "block_reason": threshold_block_reason,
+                "conviction": conviction,
+            }
+            await self._emit_blocked(blocked_record)
+            return None
 
         # ── Enrich record ──────────────────────────────────────────────────────
         record["conviction_original"] = conviction_in
         record["conviction"] = conviction
         record["conviction_delta"] = round(conviction - conviction_in, 3)
+
+        # Policy debug fields (v1.9) — enables research queries on policy impact
+        record["catalyst_policy_applied"]  = _settings.enable_catalyst_policy
+        record["policy_threshold_used"]    = effective_threshold
+        record["policy_block_reason"]      = None
+        record["policy_multiplier"]        = round(policy_multiplier, 4)
+        record["policy_options_weight"]    = round(policy_result.options_weight_effective, 4)
+        record["policy_regime_adj"]        = round(policy_result.regime_adj_effective, 4)
 
         record["filter_regime"] = {
             "regime":      regime.get("regime"),
@@ -374,12 +494,15 @@ class PreTradeFilterService(BaseConsumer):
              regime=regime.get("regime"),
              tech_score=getattr(tech, "score", None),
              flow_bias=getattr(options, "flow_bias", "neutral"),
-             squeeze_score=getattr(squeeze, "squeeze_score", 0.0))
+             squeeze_score=getattr(squeeze, "squeeze_score", 0.0),
+             policy_multiplier=policy_multiplier,
+             policy_threshold=effective_threshold)
 
         await self._update_signal_log(record, conviction_in, conviction,
                                       blocked=False, reason="",
                                       regime=regime, tech=tech,
-                                      options=options, squeeze=squeeze)
+                                      options=options, squeeze=squeeze,
+                                      policy_result=policy_result)
         return record
 
     async def _emit_blocked(self, record: dict) -> None:
@@ -398,6 +521,7 @@ class PreTradeFilterService(BaseConsumer):
     async def _update_signal_log(
         self, record: dict, conviction_in: float, conviction_out: float,
         blocked: bool, reason: str, regime, tech, options, squeeze,
+        policy_result: "PolicyResult | None" = None,
     ) -> None:
         """Update the signal_log row (written by signal_aggregator) with filter results."""
         try:
@@ -407,15 +531,21 @@ class PreTradeFilterService(BaseConsumer):
             conn = await asyncpg.connect(dsn)
             await conn.execute("""
                 UPDATE signal_log SET
-                    conviction          = $1,
-                    filter_blocked      = $2,
-                    filter_block_reason = $3,
-                    filter_regime       = $4,
-                    filter_tech_score   = $5,
-                    filter_flow_bias    = $6,
-                    filter_squeeze_score= $7
-                WHERE news_id = $8
-                  AND ticker  = $9
+                    conviction               = $1,
+                    filter_blocked           = $2,
+                    filter_block_reason      = $3,
+                    filter_regime            = $4,
+                    filter_tech_score        = $5,
+                    filter_flow_bias         = $6,
+                    filter_squeeze_score     = $7,
+                    catalyst_policy_applied  = $8,
+                    policy_threshold_used    = $9,
+                    policy_block_reason      = $10,
+                    policy_multiplier        = $11,
+                    policy_options_weight    = $12,
+                    policy_regime_adj        = $13
+                WHERE news_id = $14
+                  AND ticker  = $15
                   AND created_at > now() - interval '10 minutes'
             """,
                 conviction_out, blocked, reason,
@@ -423,6 +553,12 @@ class PreTradeFilterService(BaseConsumer):
                 getattr(tech, "score", None),
                 getattr(options, "flow_bias", None),
                 getattr(squeeze, "squeeze_score", None),
+                _settings.enable_catalyst_policy,
+                policy_result.threshold if policy_result else None,
+                policy_result.block_reason if (policy_result and policy_result.block) else None,
+                policy_result.multiplier if policy_result else None,
+                policy_result.options_weight_effective if policy_result else None,
+                policy_result.regime_adj_effective if policy_result else None,
                 record.get("news_id"),
                 record.get("ticker"),
             )

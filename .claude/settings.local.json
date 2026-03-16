@@ -120,7 +120,11 @@
       "Bash(python -c \"from app.models.news import CatalystType; print\\(''''import ok''''\\)\")",
       "Bash(python -m pytest tests/ -v --tb=short)",
       "Bash(python -m pytest tests/ --ignore=tests/test_schemas.py -q --tb=short)",
-      "Bash(python -m pytest tests/test_llm_trust.py tests/test_fact_cross_validator.py tests/test_conviction_features.py -v --tb=short)"
+      "Bash(python -m pytest tests/test_llm_trust.py tests/test_fact_cross_validator.py tests/test_conviction_features.py -v --tb=short)",
+      "Bash(xargs grep:*)",
+      "Bash(python -m pytest tests/test_catalyst_policy.py -v)",
+      "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py)",
+      "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py --ignore=tests/test_schemas.py)"
     ]
   }
 }
