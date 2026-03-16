@@ -37,6 +37,12 @@ from app.pipeline.llm_validation import (
     apply_regime_adjustment,
     INTERPRETIVE_MAX_CONVICTION,
 )
+from app.pipeline.fact_cross_validator import (
+    FactCrossValidationResult,
+    FactCrossValidator,
+    FactValidationStatus,
+    ENABLE_FACT_VALIDATION,
+)
 
 # Minimum conviction to emit a signal (override via SIGNAL_CONVICTION_THRESHOLD env var)
 import os
@@ -156,6 +162,13 @@ class TradingSignal(BaseModel):
     interpretive_cap_applied: bool = False
     #   True when conviction was reduced to INTERPRETIVE_MAX_CONVICTION ceiling
 
+    # Fact cross-validation metadata (v1.7)
+    # Populated by FactCrossValidator; reflects cross-check against vendor data.
+    validation_status: str | None = None             # confirmed|partial|mismatch|unverifiable|skipped
+    validated_fields: list[str] = Field(default_factory=list)
+    mismatch_fields: list[str] = Field(default_factory=list)
+    validation_confidence: float | None = None        # 0.0–1.0
+
     def to_kafka_dict(self) -> dict:
         return self.model_dump(mode="json")
 
@@ -164,6 +177,7 @@ def compute_conviction(
     record: SummarizedRecord,
     direction_source: str,
     validation: LLMValidationResult,
+    cross_val: "FactCrossValidationResult | None" = None,
 ) -> tuple[float, bool]:
     """
     Compute conviction score 0.0–1.0 with trust-aware caps.
@@ -182,6 +196,7 @@ def compute_conviction(
       2. Priced-in penalty       (interpretive: conditional on direction_source)
       3. Interpretive ceiling    (hard cap when direction_source="interpretive_prior")
       4. Regime adjustment       (interpretive: regime_flag scales conviction down only)
+      5. Fact cross-validation   (structural: vendor data confirms or contradicts facts)
     """
     # Use validated impact_day — never the raw LLM value
     base = validation.cleaned_impact_day or 0.0
@@ -232,6 +247,13 @@ def compute_conviction(
     # A "risk_off" regime flag does NOT flip a fact-backed "long" to "short".
     # It reduces conviction by 10 % to reflect the adverse macro environment.
     conviction = apply_regime_adjustment(conviction, validation.cleaned_regime_flag)
+
+    # ── 5. Fact cross-validation multiplier ───────────────────────────────
+    # Applied last so it operates on the fully-adjusted conviction value.
+    # cross_val=None (FACT_VALIDATION disabled or catalyst not verifiable) →
+    # multiplier is 1.0 (no change).
+    if cross_val is not None and cross_val.conviction_multiplier != 1.0:
+        conviction = round(conviction * cross_val.conviction_multiplier, 3)
 
     return round(conviction, 3), cap_applied
 
@@ -434,6 +456,8 @@ class SignalAggregatorService(BaseConsumer):
         super().__init__()
         self._redis: aioredis.Redis | None = None
         self._cluster_store: EventClusterStore | None = None
+        self._db_pool = None                              # asyncpg pool for validation + logging
+        self._fact_validator: FactCrossValidator | None = None
 
     async def on_start(self) -> None:
         self._producer = self._make_producer()
@@ -444,9 +468,35 @@ class SignalAggregatorService(BaseConsumer):
         if _ENABLE_SIGNAL_EVENT_GATE:
             self._cluster_store = EventClusterStore(self._redis)
 
+        # ── Fact cross-validator ───────────────────────────────────────────
+        # Create a small asyncpg pool (2 connections) for earnings + analyst
+        # cross-checks and audit writes.  Pool is optional; validator degrades
+        # to UNVERIFIABLE when the DB is unreachable.
+        if ENABLE_FACT_VALIDATION:
+            try:
+                import asyncpg
+                dsn = os.environ.get(
+                    "DATABASE_URL",
+                    "postgresql://trading:trading@postgres:5432/trading_db",
+                ).replace("postgresql+asyncpg://", "postgresql://")
+                self._db_pool = await asyncpg.create_pool(
+                    dsn,
+                    min_size=1,
+                    max_size=2,
+                    command_timeout=5,
+                )
+                self._fact_validator = FactCrossValidator(db_pool=self._db_pool)
+                _log("info", "signal_aggregator.fact_validator_ready")
+            except Exception as exc:
+                _log("warning", "signal_aggregator.fact_validator_unavailable",
+                     error=str(exc))
+                self._fact_validator = FactCrossValidator(db_pool=None)
+
     async def on_stop(self) -> None:
         if self._redis:
             await self._redis.aclose()
+        if self._db_pool:
+            await self._db_pool.close()
 
     async def _get_intraday_return(self, ticker: str) -> float | None:
         """
@@ -525,6 +575,9 @@ class SignalAggregatorService(BaseConsumer):
         if summarized.impact_day is None:
             return None
 
+        # Primary ticker — resolved first so the cross-validator can use it
+        primary_ticker = summarized.tickers[0]
+
         # ── Validate all LLM outputs before any trading logic ────────────
         # validate_llm_output() checks ranges, vocabularies, and ticker formats.
         # All downstream logic uses validation.cleaned_* values, never raw fields.
@@ -539,8 +592,32 @@ class SignalAggregatorService(BaseConsumer):
         # Classify direction first — conviction formula depends on direction_source
         direction, direction_source = classify_direction(summarized, validation)
 
-        # Compute conviction with trust-aware caps
-        conviction, cap_applied = compute_conviction(summarized, direction_source, validation)
+        # ── Fact cross-validation ─────────────────────────────────────────
+        # Cross-checks LLM-extracted facts_json against authoritative vendor data
+        # (Postgres event table for earnings, fmp_analyst_grades for analyst calls).
+        # Returns a FactCrossValidationResult whose conviction_multiplier is applied
+        # as the final adjustment in compute_conviction().
+        cross_val: FactCrossValidationResult | None = None
+        if self._fact_validator is not None:
+            cross_val = await self._fact_validator.validate(summarized, primary_ticker)
+            if cross_val.mismatch_fields:
+                _log("warning", "signal_aggregator.fact_validation_mismatch",
+                     ticker=primary_ticker,
+                     validation_status=cross_val.validation_status.value,
+                     mismatch_fields=cross_val.mismatch_fields,
+                     has_key_mismatch=cross_val.has_key_mismatch,
+                     conviction_multiplier=cross_val.conviction_multiplier,
+                     vendor_source=cross_val.vendor_source)
+            elif cross_val.validation_status == FactValidationStatus.CONFIRMED:
+                _log("debug", "signal_aggregator.fact_validation_confirmed",
+                     ticker=primary_ticker,
+                     validated_fields=cross_val.validated_fields,
+                     vendor_source=cross_val.vendor_source)
+
+        # Compute conviction with trust-aware caps (includes cross_val multiplier)
+        conviction, cap_applied = compute_conviction(
+            summarized, direction_source, validation, cross_val
+        )
 
         # Block if conviction zeroed out (interpretive + priced_in="yes")
         if conviction == 0.0 and direction != "neutral":
@@ -559,9 +636,6 @@ class SignalAggregatorService(BaseConsumer):
                  direction_source=direction_source)
             await self._log_signal(summarized, conviction, passed=False)
             return None
-
-        # Primary ticker = first resolved ticker
-        primary_ticker = summarized.tickers[0]
 
         signal_type = classify_signal_type(summarized, conviction)
 
@@ -636,6 +710,15 @@ class SignalAggregatorService(BaseConsumer):
             # Trust metadata (v1.6)
             direction_source=direction_source,
             interpretive_cap_applied=cap_applied,
+            # Fact cross-validation metadata (v1.7)
+            validation_status=(
+                cross_val.validation_status.value if cross_val else None
+            ),
+            validated_fields=(cross_val.validated_fields if cross_val else []),
+            mismatch_fields=(cross_val.mismatch_fields if cross_val else []),
+            validation_confidence=(
+                cross_val.validation_confidence if cross_val else None
+            ),
         )
 
         await self._log_signal(summarized, conviction, passed=True,

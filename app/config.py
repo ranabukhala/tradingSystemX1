@@ -123,6 +123,28 @@ class Settings(BaseSettings):
     signal_conviction_threshold: float = 0.55
     signal_alert_threshold: float = 0.60
 
+    # ── Fact cross-validation (v1.7) ──────────────────────────
+    # Kill-switch: set to false to disable DB cross-checks entirely
+    enable_fact_validation: bool = True
+    # Numeric tolerance for EPS fields (LLM rounds to 2 dp; 5 % is fair)
+    fact_eps_tolerance_pct: float = 5.0
+    # Price-target tolerance (analyst PTs vary by ±5–8 % in vendor feeds)
+    fact_pt_tolerance_pct: float = 10.0
+    # Deal price tolerance (M&A premiums are exact; 2 % is generous)
+    fact_deal_price_tolerance_pct: float = 2.0
+    # How far back to look for matching vendor earnings actuals
+    fact_earnings_lookback_days: int = 3
+    # How far back to look for matching analyst grade entries
+    fact_analyst_lookback_hours: int = 48
+    # Conviction multipliers applied after all other adjustments
+    fact_conviction_confirmed: float = 1.10       # LLM was accurate — small boost
+    fact_conviction_partial: float = 0.85         # Mixed: some unverifiable
+    fact_conviction_mismatch_key: float = 0.30    # Direction field wrong — heavy penalty
+    fact_conviction_mismatch_nonkey: float = 0.60 # Magnitude field wrong — moderate
+    fact_conviction_unverifiable: float = 0.90    # No vendor data — small uncertainty discount
+    # Write audit row for all validation statuses (not just MISMATCH)
+    fact_audit_all_statuses: bool = False
+
     # ── Idempotency backend ───────────────────────────────────
     # "redis"  — async SET NX EX (atomic, cross-instance, default)
     # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)

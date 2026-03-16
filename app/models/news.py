@@ -313,6 +313,15 @@ class SummarizedRecord(EnrichedRecord):
     # default; only the specific invalid field is dropped.
     facts_validated: bool = True
 
+    # Fact cross-validation metadata (v1.7)
+    # Populated by signal_aggregator after cross-checking facts_json against
+    # authoritative vendor data (FMP earnings calendar, analyst grades).
+    # Propagated to TradingSignal and persisted to fact_validation_audit.
+    validation_status: str | None = None             # confirmed|partial|mismatch|unverifiable|skipped
+    validated_fields: list[str] = Field(default_factory=list)    # fields confirmed vs vendor
+    mismatch_fields: list[str] = Field(default_factory=list)     # fields that diverged from vendor
+    validation_confidence: float | None = None        # 0.0–1.0 fraction verified+matching
+
     # AI metadata
     prompt_version: str | None = None
     llm_tokens_used: int | None = None
