@@ -576,6 +576,14 @@ class PreTradeFilterService(BaseConsumer):
             conn = await asyncpg.connect(dsn)
 
             # Immutable audit entry
+            # news_published_at arrives as an ISO-8601 string from Kafka;
+            # asyncpg requires a datetime object for TIMESTAMPTZ columns.
+            raw_published_at = record.get("news_published_at")
+            if isinstance(raw_published_at, str):
+                raw_published_at = datetime.fromisoformat(
+                    raw_published_at.replace("Z", "+00:00")
+                )
+
             await conn.execute("""
                 INSERT INTO staleness_log (
                     source, ticker, catalyst_type, session_context, route_type,
@@ -590,7 +598,7 @@ class PreTradeFilterService(BaseConsumer):
                 stale.age_seconds,
                 stale.max_age_seconds,
                 stale.reason,
-                record.get("news_published_at"),
+                raw_published_at,
             )
 
             # Update matching signal_log row so dashboards see the block

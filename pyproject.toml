@@ -41,6 +41,9 @@ dependencies = [
     # Anthropic API
     "anthropic>=0.23.0",
 
+    # OpenAI — embedding dedup (Tier 3.5)
+    "openai>=1.0.0",
+
     # Polygon
     "polygon-api-client>=1.13.0",
     "websocket-client>=1.7.0",

@@ -10,7 +10,9 @@ class DedupTier(str, Enum):
     """Which tier of deduplication caught the item."""
     VENDOR_ID    = "vendor_id"       # Tier 1 — exact vendor-provided ID (Redis SETNX)
     CONTENT_HASH = "content_hash"    # Tier 2 — SHA-256 of title+snippet
-    SEMANTIC     = "semantic"        # Tier 3 — SimHash headline similarity cluster
+    SEMANTIC     = "semantic"        # Tier 3 — pg_trgm fuzzy title match
+    EMBEDDING    = "embedding"       # Tier 3.5 — OpenAI cosine-similarity match
+    SIMHASH      = "simhash"         # Tier 4 — 64-bit SimHash, Hamming distance
     NONE         = "none"            # Not a duplicate — first representative
 
 
@@ -20,9 +22,11 @@ class DedupReason(str, Enum):
     VENDOR_ID_SEEN        = "vendor_id_seen"        # Same vendor ID already processed
     # Tier 2
     CONTENT_HASH_MATCH    = "content_hash_match"    # Byte-identical content from diff vendor
-    # Tier 3
-    SIMHASH_CLUSTER       = "simhash_cluster"       # Headline semantically similar
+    # Tier 3 — pg_trgm fuzzy
+    SIMHASH_CLUSTER       = "simhash_cluster"       # Headline semantically similar (fuzzy/SimHash)
     FACT_CONFIRMED        = "fact_confirmed"         # SimHash match + fact fingerprint agreed
+    # Tier 3.5 — embedding cosine similarity
+    EMBEDDING_MATCH       = "embedding_match"        # OpenAI embedding cosine similarity >= threshold
     # Signal / Order gates
     SIGNAL_ALREADY_EMITTED = "signal_already_emitted"  # Redis SETNX gate in aggregator
     ORDER_ALREADY_SUBMITTED = "order_already_submitted"  # Redis SETNX gate in execution

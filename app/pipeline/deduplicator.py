@@ -9,6 +9,7 @@ Dedup strategy (in order):
   1. Exact URL match         — Redis SET, TTL 24h
   2. Exact hash match        — Redis SET, TTL 24h
   3. Fuzzy title match       — Trigram similarity via Postgres pg_trgm (>= 0.75)
+  3.5 Semantic embedding     — OpenAI text-embedding-3-small cosine similarity (>= 0.85)
   4. Semantic SimHash match  — 64-bit locality-sensitive hash, Hamming distance
 
 For duplicates:
@@ -18,6 +19,7 @@ For duplicates:
 
 Feature flags (env vars):
   ENABLE_SEMANTIC_DEDUP=true        — activate SimHash tier (default: true)
+  ENABLE_EMBEDDING_DEDUP=true       — activate embedding tier 3.5 (default: true)
   DEDUP_EMIT_DROPPED_TOPIC=true     — emit non-rep items to news.dropped (default: true)
   DEDUP_SQLITE_FALLBACK_READ=false  — read old SQLite idempotency on startup (default: false)
 """
@@ -34,6 +36,7 @@ from app.config import settings
 from app.models.news import DedupedRecord, DroppedRecord, NormalizedRecord
 from app.pipeline.base_consumer import BaseConsumer, _log
 from app.pipeline.dedup_reason import DedupAction, DedupReason, DedupTier
+from app.pipeline.embedding import compute_embedding
 from app.pipeline.event_cluster import EventClusterStore
 
 # TTL for dedup keys in Redis
@@ -43,9 +46,14 @@ DEDUP_TTL = settings.redis_dedup_ttl_seconds  # default 86400 = 24h
 SIMILARITY_THRESHOLD = 0.75
 
 # Feature flags
-_SEMANTIC_DEDUP   = os.environ.get("ENABLE_SEMANTIC_DEDUP",     "true").lower() == "true"
-_EMIT_DROPPED     = os.environ.get("DEDUP_EMIT_DROPPED_TOPIC",  "true").lower() == "true"
+_SEMANTIC_DEDUP   = os.environ.get("ENABLE_SEMANTIC_DEDUP",    "true").lower() == "true"
+_EMBEDDING_DEDUP  = os.environ.get("ENABLE_EMBEDDING_DEDUP",   "true").lower() == "true"
+_EMIT_DROPPED     = os.environ.get("DEDUP_EMIT_DROPPED_TOPIC", "true").lower() == "true"
 _DROPPED_TOPIC    = "news.dropped"
+
+# Embedding similarity threshold (also read from settings for runtime override support)
+_EMBEDDING_THRESHOLD  = settings.embedding_similarity_threshold   # default 0.85
+_EMBEDDING_LOOKBACK_H = settings.embedding_lookback_hours         # default 6
 
 
 class DeduplicatorService(BaseConsumer):
@@ -147,6 +155,34 @@ class DeduplicatorService(BaseConsumer):
                 dedup_reason=DedupReason.SIMHASH_CLUSTER,
             )
 
+        # ── Step 3.5: Semantic embedding similarity ───────────────
+        embedding: list[float] | None = None   # computed once, reused for storage below
+        if _EMBEDDING_DEDUP and norm.raw_tickers:
+            primary_ticker = norm.raw_tickers[0].upper()
+            embedding = await compute_embedding(norm.title)
+            if embedding is not None:
+                match = await self._embedding_match(
+                    embedding=embedding,
+                    ticker=primary_ticker,
+                    published_at=norm.published_at,
+                )
+                if match and match[0] is not None:
+                    cluster_id, similarity = match
+                    _log("info", "deduplicator.embedding_match",
+                         vendor_id=norm.vendor_id,
+                         ticker=primary_ticker,
+                         similarity=round(similarity, 4),
+                         cluster_id=str(cluster_id))
+                    # Warm up Redis caches for subsequent URL / hash lookups
+                    await self._redis.setex(url_key, DEDUP_TTL, str(cluster_id))
+                    await self._redis.setex(hash_key, DEDUP_TTL, str(cluster_id))
+                    return await self._make_duplicate(
+                        norm, cluster_id, "embedding", similarity,
+                        dedup_tier=DedupTier.EMBEDDING,
+                        dedup_reason=DedupReason.EMBEDDING_MATCH,
+                    )
+                # No match — embedding will be stored below alongside the new item
+
         # ── Step 4: Semantic SimHash clustering ──────────────────
         if _SEMANTIC_DEDUP and self._cluster_store and norm.raw_tickers:
             # Use the first raw ticker as the primary for bucketing.
@@ -184,8 +220,9 @@ class DeduplicatorService(BaseConsumer):
         await self._redis.setex(url_key, DEDUP_TTL, str(new_cluster_id))
         await self._redis.setex(hash_key, DEDUP_TTL, str(new_cluster_id))
 
-        # Store title in Postgres for future fuzzy matching
-        await self._store_title(norm, new_cluster_id)
+        # Store title (and embedding if available) in Postgres for future matching.
+        # `embedding` was computed in Step 3.5 above (or is None if disabled/failed).
+        await self._store_title(norm, new_cluster_id, embedding=embedding)
 
         deduped = DedupedRecord(
             **norm.model_dump(),
@@ -238,6 +275,63 @@ class DeduplicatorService(BaseConsumer):
 
         return deduped.to_kafka_dict()
 
+    async def _embedding_match(
+        self,
+        embedding: list[float],
+        ticker: str,
+        published_at,
+    ) -> tuple[UUID | None, float | None]:
+        """
+        Query Postgres for a news_item whose title_embedding is within cosine
+        distance (1 - similarity < threshold) of *embedding*, filtered to the
+        same primary ticker within the last EMBEDDING_LOOKBACK_H hours.
+
+        Returns (cluster_id, cosine_similarity) or (None, None).
+        Falls through silently on any DB or pgvector error.
+        """
+        if not self._Session:
+            return None, None
+        try:
+            from datetime import timedelta
+
+            from sqlalchemy import text
+
+            # pgvector's <=> operator is cosine distance (0 = identical, 2 = opposite).
+            # similarity = 1 - distance.
+            query = text("""
+                SELECT ni.cluster_id,
+                       1 - (ni.title_embedding <=> CAST(:embedding AS vector)) AS similarity
+                FROM   news_item ni
+                WHERE  ni.tickers @> ARRAY[:ticker]
+                  AND  ni.published_at >= :cutoff
+                  AND  ni.title_embedding IS NOT NULL
+                  AND  ni.cluster_id IS NOT NULL
+                  AND  1 - (ni.title_embedding <=> CAST(:embedding AS vector)) >= :threshold
+                ORDER  BY similarity DESC
+                LIMIT  1
+            """)
+
+            cutoff = published_at - timedelta(hours=_EMBEDDING_LOOKBACK_H)
+            # pgvector expects the vector literal as a bracketed comma-separated string
+            embedding_str = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
+
+            async with self._Session() as session:
+                result = await session.execute(query, {
+                    "embedding":  embedding_str,
+                    "ticker":     ticker,
+                    "cutoff":     cutoff,
+                    "threshold":  _EMBEDDING_THRESHOLD,
+                })
+                row = result.fetchone()
+
+            if row:
+                return UUID(str(row.cluster_id)), float(row.similarity)
+            return None, None
+
+        except Exception as exc:
+            _log("warning", "deduplicator.embedding_match_error", error=str(exc))
+            return None, None
+
     async def _fuzzy_match(
         self,
         title: str,
@@ -284,50 +378,101 @@ class DeduplicatorService(BaseConsumer):
             _log("warning", "deduplicator.fuzzy_match_error", error=str(e))
             return None, None
 
-    async def _store_title(self, norm: NormalizedRecord, cluster_id: UUID) -> None:
+    async def _store_title(
+        self,
+        norm: NormalizedRecord,
+        cluster_id: UUID,
+        embedding: list[float] | None = None,
+    ) -> None:
         """
         Upsert into news_cluster + news_item so items are available for future
-        fuzzy matches.
+        fuzzy and embedding matches.
 
         IMPORTANT: news_cluster must be inserted BEFORE news_item because
         news_item.cluster_id has a FK constraint referencing news_cluster.id.
         Both writes are in a single transaction for atomicity.
+
+        If *embedding* is provided (1536 floats from text-embedding-3-small),
+        it is stored in the title_embedding column so future items can find
+        this one via cosine-similarity lookup.  A failure to store the
+        embedding does NOT roll back the news_item insert.
         """
         if not self._Session:
             return
         try:
             from sqlalchemy import text
+
+            # Build embedding literal for pgvector.  None → SQL NULL.
+            embedding_str: str | None = None
+            if embedding is not None:
+                embedding_str = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
+
             async with self._Session() as session:
                 # Step 1: Ensure the cluster row exists first
                 await session.execute(text("""
-                                           INSERT INTO news_cluster (id)
-                                           VALUES (:cluster_id) ON CONFLICT (id) DO NOTHING
-                                           """), {"cluster_id": str(cluster_id)})
+                    INSERT INTO news_cluster (id)
+                    VALUES (:cluster_id)
+                    ON CONFLICT (id) DO NOTHING
+                """), {"cluster_id": str(cluster_id)})
 
-                # Step 2: Insert the news_item referencing the cluster
-                await session.execute(text("""
-                                           INSERT INTO news_item (id, source, vendor_id, published_at, received_at,
-                                                                  url, canonical_url, title, snippet, content_hash,
-                                                                  cluster_id)
-                                           VALUES (:id, :source, :vendor_id, :published_at, :received_at,
-                                                   :url, :canonical_url, :title, :snippet, :content_hash,
-                                                   :cluster_id) ON CONFLICT (source, vendor_id) DO NOTHING
-                                           """), {
-                                          "id": str(norm.id),
-                                          "source": norm.source.value,
-                                          "vendor_id": norm.vendor_id,
-                                          "published_at": norm.published_at,
-                                          "received_at": norm.received_at,
-                                          "url": norm.url,
-                                          "canonical_url": norm.canonical_url,
-                                          "title": norm.title,
-                                          "snippet": norm.snippet,
-                                          "content_hash": norm.content_hash,
-                                          "cluster_id": str(cluster_id),
-                                      })
+                # Step 2: Insert the news_item referencing the cluster.
+                # title_embedding uses CAST so it works whether pgvector is present or not
+                # (the column simply won't exist pre-migration and the query will error,
+                # which is caught below and logged as a warning).
+                if embedding_str is not None:
+                    await session.execute(text("""
+                        INSERT INTO news_item (
+                            id, source, vendor_id, published_at, received_at,
+                            url, canonical_url, title, snippet, content_hash,
+                            cluster_id, title_embedding
+                        ) VALUES (
+                            :id, :source, :vendor_id, :published_at, :received_at,
+                            :url, :canonical_url, :title, :snippet, :content_hash,
+                            :cluster_id, CAST(:embedding AS vector)
+                        ) ON CONFLICT (source, vendor_id) DO NOTHING
+                    """), {
+                        "id":            str(norm.id),
+                        "source":        norm.source.value,
+                        "vendor_id":     norm.vendor_id,
+                        "published_at":  norm.published_at,
+                        "received_at":   norm.received_at,
+                        "url":           norm.url,
+                        "canonical_url": norm.canonical_url,
+                        "title":         norm.title,
+                        "snippet":       norm.snippet,
+                        "content_hash":  norm.content_hash,
+                        "cluster_id":    str(cluster_id),
+                        "embedding":     embedding_str,
+                    })
+                else:
+                    await session.execute(text("""
+                        INSERT INTO news_item (
+                            id, source, vendor_id, published_at, received_at,
+                            url, canonical_url, title, snippet, content_hash,
+                            cluster_id
+                        ) VALUES (
+                            :id, :source, :vendor_id, :published_at, :received_at,
+                            :url, :canonical_url, :title, :snippet, :content_hash,
+                            :cluster_id
+                        ) ON CONFLICT (source, vendor_id) DO NOTHING
+                    """), {
+                        "id":            str(norm.id),
+                        "source":        norm.source.value,
+                        "vendor_id":     norm.vendor_id,
+                        "published_at":  norm.published_at,
+                        "received_at":   norm.received_at,
+                        "url":           norm.url,
+                        "canonical_url": norm.canonical_url,
+                        "title":         norm.title,
+                        "snippet":       norm.snippet,
+                        "content_hash":  norm.content_hash,
+                        "cluster_id":    str(cluster_id),
+                    })
+
                 await session.commit()
-        except Exception as e:
-            _log("warning", "deduplicator.store_title_error", error=str(e))
+
+        except Exception as exc:
+            _log("warning", "deduplicator.store_title_error", error=str(exc))
 
 
 def _is_valid_uuid(s: str) -> bool:

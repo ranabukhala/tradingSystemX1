@@ -45,7 +45,8 @@ RUN pip install --no-cache-dir --upgrade pip \
         websocket-client \
         pytest \
         ib_insync \
-        docker
+        docker \
+        "openai>=1.0.0"
 
 # Copy application code
 COPY app/ ./app/

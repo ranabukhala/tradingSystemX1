@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     fmp_daily_call_limit: int = 750  # Shared across all FMP containers (10-call buffer vs 250 cap)
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
+    # OpenAI — used for embedding dedup (Tier 3.5).
+    # Pydantic-settings will also check OPENAI env var as a fallback alias.
+    openai_api_key: str = ""
+
+    # ── Embedding Dedup (Tier 3.5) ────────────────────────────
+    # Kill-switch: set False to skip embedding lookup entirely (falls through to SimHash).
+    enable_embedding_dedup: bool = True
+    # Cosine similarity threshold — headlines with cosine_similarity >= this are duplicates.
+    # Empirically calibrated using text-embedding-3-small:
+    #   Same-event, cross-vendor rewrites:  0.67 – 0.88  (should be caught)
+    #   Different events, same company:     0.38 – 0.56  (should NOT be caught)
+    #   Threshold at 0.65 sits in the 0.09-wide gap with comfortable margins either side.
+    embedding_similarity_threshold: float = 0.65
+    # Look-back window for embedding match queries (hours).
+    embedding_lookback_hours: int = 6
 
     # ── Broker ────────────────────────────────────────────────
     broker: str = "alpaca_paper"

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 import redis.asyncio as aioredis
@@ -163,25 +163,33 @@ class FMPEnrichmentService(BaseConsumer):
         return None
 
     async def _get_analyst(self, ticker: str) -> dict | None:
-        """Get analyst consensus + recent price target changes."""
-        # Latest ratings
-        ratings = await self._fmp.get(
-            "/stable/grades-latest",
+        """Get analyst consensus + FMP composite rating + price target summary.
+
+        Endpoint changes (Aug 2025):
+          REMOVED: /stable/grades-latest → 404
+          REMOVED: /api/v3/grade/{symbol} → 403 (legacy, blocked)
+          ADDED:   /stable/ratings-snapshot — overall FMP letter rating + component scores
+        """
+        # ── FMP composite ratings snapshot ──────────────────────────────────
+        # Returns: rating (A-F letter), overallScore (1-5), and individual
+        # component scores for DCF, ROE, ROA, D/E, P/E, P/B (each 1-5).
+        ratings_snapshot = await self._fmp.get(
+            "/stable/ratings-snapshot",
             symbol=ticker,
-            limit=10,
         )
 
-        # Price target summary
+        # ── Price target summary (unchanged — still works) ───────────────────
         pt_summary = await self._fmp.get(
             "/stable/price-target-summary",
             symbol=ticker,
         )
 
-        if not ratings and not pt_summary:
+        if not ratings_snapshot and not pt_summary:
             return None
 
-        result = {}
+        result: dict = {}
 
+        # ── Price targets ────────────────────────────────────────────────────
         if pt_summary and isinstance(pt_summary, list) and pt_summary:
             pt = pt_summary[0]
             result["avg_price_target"]  = pt.get("targetMedian", 0)
@@ -189,65 +197,47 @@ class FMPEnrichmentService(BaseConsumer):
             result["low_price_target"]  = pt.get("targetLow", 0)
             result["num_analysts"]      = pt.get("numberOfAnalysts", 0)
 
-        if ratings and isinstance(ratings, list):
-            # Last 5 ratings
-            recent = ratings[:5]
-            result["recent_ratings"] = [
-                {
-                    "firm":       r.get("gradingCompany", ""),
-                    "from_grade": r.get("previousGrade", ""),
-                    "to_grade":   r.get("newGrade", ""),
-                    "action":     r.get("action", ""),
-                    "date":       r.get("date", ""),
-                }
-                for r in recent
-            ]
-            # Sentiment score: upgrades - downgrades in last 5
-            upgrades   = sum(1 for r in recent if r.get("action", "").lower() == "upgrade")
-            downgrades = sum(1 for r in recent if r.get("action", "").lower() == "downgrade")
-            result["analyst_sentiment"] = upgrades - downgrades  # +ve = bullish
+        # ── FMP composite rating ─────────────────────────────────────────────
+        if ratings_snapshot and isinstance(ratings_snapshot, list) and ratings_snapshot:
+            snap = ratings_snapshot[0]
+            overall_score = int(snap.get("overallScore") or 0)
+
+            result["fmp_rating"]       = snap.get("rating", "")            # e.g. "B"
+            result["fmp_overall_score"] = overall_score                    # 1-5
+            result["fmp_dcf_score"]    = snap.get("discountedCashFlowScore", 0)
+            result["fmp_roe_score"]    = snap.get("returnOnEquityScore", 0)
+            result["fmp_roa_score"]    = snap.get("returnOnAssetsScore", 0)
+            result["fmp_de_score"]     = snap.get("debtToEquityScore", 0)
+            result["fmp_pe_score"]     = snap.get("priceToEarningsScore", 0)
+            result["fmp_pb_score"]     = snap.get("priceToBookScore", 0)
+
+            # Derive analyst_sentiment from overall score for backward compatibility
+            # with downstream consumers (signal_aggregator, ai_summarizer, etc.)
+            #   5 → +2 (strong buy), 4 → +1 (buy), 3 → 0 (neutral),
+            #   2 → -1 (underperform), 1 → -2 (sell)
+            result["analyst_sentiment"] = overall_score - 3  # maps 1-5 → -2..+2
+
+        # recent_ratings is no longer populated (grades-latest endpoint removed).
+        # Kept as empty list to avoid KeyError in any code using .get("recent_ratings", []).
+        result.setdefault("recent_ratings", [])
+        # Ensure analyst_sentiment always has a value (backward compat)
+        result.setdefault("analyst_sentiment", 0)
 
         return result
 
     async def _get_insider(self, ticker: str) -> dict | None:
-        """Get insider trading activity last 30 days."""
-        data = await self._fmp.get(
-            "/stable/insider-trading",
-            symbol=ticker,
-            limit=20,
-        )
-        if not data or not isinstance(data, list):
-            return None
+        """Get insider trading activity — currently disabled, no data source available.
 
-        # Filter last 30 days
-        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-        recent = []
-        for item in data:
-            try:
-                trade_date = datetime.fromisoformat(
-                    item.get("transactionDate", "").replace("Z", "+00:00"))
-                if trade_date >= cutoff:
-                    recent.append(item)
-            except Exception:
-                continue
+        History:
+          /stable/insider-trading       → 404 Not Found (never existed in /stable/ namespace)
+          /api/v4/insider-trading       → 403 Forbidden (legacy endpoint, blocked Aug 2025)
+          Unusual Whales / Finviz       → not available on current plans
 
-        if not recent:
-            return None
-
-        buys  = [r for r in recent if r.get("transactionType", "").upper() in ("P-PURCHASE", "BUY")]
-        sells = [r for r in recent if r.get("transactionType", "").upper() in ("S-SALE", "SELL")]
-
-        total_buy_value  = sum(float(r.get("value", 0) or 0) for r in buys)
-        total_sell_value = sum(float(r.get("value", 0) or 0) for r in sells)
-
-        return {
-            "buy_count":         len(buys),
-            "sell_count":        len(sells),
-            "total_buy_value":   round(total_buy_value, 0),
-            "total_sell_value":  round(total_sell_value, 0),
-            "net_sentiment":     "bullish" if total_buy_value > total_sell_value else "bearish",
-            "notable":           total_buy_value > 500_000 or total_sell_value > 1_000_000,
-        }
+        The asyncio.gather call in process() still invokes this so the gather
+        structure is unchanged. Downstream code gracefully handles None for fmp_insider.
+        Re-enable and restore the implementation when a provider is added.
+        """
+        return None
 
 
     async def _get_quote(self, ticker: str) -> dict | None:

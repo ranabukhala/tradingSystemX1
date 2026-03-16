@@ -269,13 +269,25 @@ class AISummarizerService(BaseConsumer):
             ctx["analyst_context"] = (
                 f"Analyst: avg PT ${avg_pt}, {num} analysts, sentiment: {sentiment_str}\n"
             )
+            # FMP composite rating (ratings-snapshot — replaced grades-latest Aug 2025)
+            fmp_rating = analyst.get("fmp_rating", "")
+            fmp_score  = analyst.get("fmp_overall_score", 0)
+            if fmp_rating:
+                ctx["analyst_context"] += (
+                    f"FMP rating: {fmp_rating} (score {fmp_score}/5 — "
+                    f"DCF:{analyst.get('fmp_dcf_score',0)} "
+                    f"ROE:{analyst.get('fmp_roe_score',0)} "
+                    f"P/E:{analyst.get('fmp_pe_score',0)})\n"
+                )
+            # recent_ratings: populated by old grades-latest endpoint (removed Aug 2025).
+            # Kept for backward compat; will be empty list going forward.
             recent = analyst.get("recent_ratings", [])
             if recent:
                 ratings_str = " | ".join(
                     f"{r['firm']} {r.get('action','')} ({r.get('from_grade','')}→{r.get('to_grade','')})"
                     for r in recent[:3]
                 )
-                ctx["analyst_context"] += f"Recent: {ratings_str}\n"
+                ctx["analyst_context"] += f"Recent grades: {ratings_str}\n"
 
         # Insider context
         insider = raw_record.get("fmp_insider")
