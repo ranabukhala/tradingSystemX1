@@ -54,6 +54,7 @@ class DeduplicatorService(BaseConsumer):
         self._redis: aioredis.Redis | None = None
         self._cluster_store: EventClusterStore | None = None
         self._db_pool = None
+        self._dropped_producer = None   # side-channel producer for news.dropped
         super().__init__()
 
     @property
@@ -82,11 +83,15 @@ class DeduplicatorService(BaseConsumer):
         from sqlalchemy.orm import sessionmaker
         engine = get_engine()
         self._Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        if _EMIT_DROPPED:
+            self._dropped_producer = self._make_producer()
         _log("info", "deduplicator.connections_ready",
              semantic_dedup=_SEMANTIC_DEDUP,
              emit_dropped=_EMIT_DROPPED)
 
     async def on_stop(self) -> None:
+        if self._dropped_producer:
+            self._dropped_producer.close()
         if self._redis:
             await self._redis.aclose()
 
@@ -227,7 +232,7 @@ class DeduplicatorService(BaseConsumer):
                     dedup_reason=dedup_reason,
                     similarity_score=score,
                 )
-                self._producer.produce(_DROPPED_TOPIC, value=dropped.to_kafka_dict())
+                self._dropped_producer.produce(_DROPPED_TOPIC, value=dropped.to_kafka_dict())
             except Exception as e:
                 _log("warning", "deduplicator.dropped_emit_error", error=str(e))
 

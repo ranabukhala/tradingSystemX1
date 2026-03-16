@@ -147,7 +147,8 @@
       "Bash(python -m pytest tests/test_event_dedup.py tests/test_execution_upgrade.py tests/test_portfolio_risk.py tests/test_catalyst_policy.py tests/test_conviction_features.py tests/test_fast_path.py tests/test_staleness.py tests/test_redis_idempotency.py tests/test_llm_trust.py tests/test_fact_cross_validator.py --ignore=tests/test_schemas.py -q)",
       "Bash(git stash:*)",
       "Bash(python -m pytest tests/test_staleness.py -q)",
-      "Bash(python -m pytest tests/test_event_dedup.py tests/test_execution_upgrade.py tests/test_portfolio_risk.py tests/test_catalyst_policy.py tests/test_conviction_features.py tests/test_fast_path.py tests/test_redis_idempotency.py tests/test_llm_trust.py tests/test_fact_cross_validator.py -q)"
+      "Bash(python -m pytest tests/test_event_dedup.py tests/test_execution_upgrade.py tests/test_portfolio_risk.py tests/test_catalyst_policy.py tests/test_conviction_features.py tests/test_fast_path.py tests/test_redis_idempotency.py tests/test_llm_trust.py tests/test_fact_cross_validator.py -q)",
+      "Bash(python -m pytest tests/test_event_dedup.py tests/test_redis_idempotency.py -q)"
     ]
   }
 }
