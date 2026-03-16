@@ -148,7 +148,17 @@
       "Bash(git stash:*)",
       "Bash(python -m pytest tests/test_staleness.py -q)",
       "Bash(python -m pytest tests/test_event_dedup.py tests/test_execution_upgrade.py tests/test_portfolio_risk.py tests/test_catalyst_policy.py tests/test_conviction_features.py tests/test_fast_path.py tests/test_redis_idempotency.py tests/test_llm_trust.py tests/test_fact_cross_validator.py -q)",
-      "Bash(python -m pytest tests/test_event_dedup.py tests/test_redis_idempotency.py -q)"
+      "Bash(python -m pytest tests/test_event_dedup.py tests/test_redis_idempotency.py -q)",
+      "Bash(Select-String -Path \"C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\docker-compose.yml\" -Pattern \"stock|8082\")",
+      "Bash(Select-Object LineNumber, Line)",
+      "Bash(python -m pytest tests/test_stock_context_classifier.py -v)",
+      "Bash(ForEach-Object { docker exec trading_redis redis-cli DEL $_ })",
+      "Bash(xargs -r docker exec -i trading_redis redis-cli DEL)",
+      "Bash(Start-Sleep -Seconds 8)",
+      "Bash(docker compose:*)",
+      "Bash(timeout 15)",
+      "Bash(Select-String \"NVDA\")",
+      "Bash(curl -s http://localhost:8082/context/NVDA)"
     ]
   }
 }

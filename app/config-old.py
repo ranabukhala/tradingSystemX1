@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     anthropic_api_key: str = ""
     fmp_api_key: str = ""
-    fmp_plan: str = "free"
+    fmp_plan: str = "starter"
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
 

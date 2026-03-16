@@ -676,7 +676,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
-      FMP_PLAN: ${FMP_PLAN:-free}
+      FMP_PLAN: ${FMP_PLAN:-starter}
     ports:
       - "8051:8051"
 
@@ -699,7 +699,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       FMP_API_KEY: ${FMP_API_KEY:-}
-      FMP_PLAN: ${FMP_PLAN:-free}
+      FMP_PLAN: ${FMP_PLAN:-starter}
     ports:
       - "8052:8052"
 
@@ -720,7 +720,7 @@ services:
       METRICS_PORT: "8053"
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
-      FMP_PLAN: ${FMP_PLAN:-free}
+      FMP_PLAN: ${FMP_PLAN:-starter}
     ports:
       - "8053:8053"
 
@@ -741,7 +741,7 @@ services:
       METRICS_PORT: "8054"
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
-      FMP_PLAN: ${FMP_PLAN:-free}
+      FMP_PLAN: ${FMP_PLAN:-starter}
     ports:
       - "8054:8054"
     healthcheck:

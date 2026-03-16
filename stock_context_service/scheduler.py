@@ -57,7 +57,10 @@ class ContextScheduler:
         self._pool    = db_pool
         self._sched   = AsyncIOScheduler(timezone="America/New_York")
         self._last_refresh: datetime | None = None
-        self._polygon = PolygonClient()
+        # NOTE: do NOT store a shared PolygonClient instance here.
+        # PolygonClient wraps an aiohttp.ClientSession which is NOT safe to
+        # share across concurrent coroutines — each refresh_ticker call creates
+        # its own instance via `async with PolygonClient()` below.
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -107,7 +110,10 @@ class ContextScheduler:
         """
         ticker = ticker.upper().strip()
         try:
-            async with self._polygon as client:
+            # Create a fresh PolygonClient per call so concurrent refresh_ticker
+            # coroutines each own their own aiohttp.ClientSession and don't
+            # stomp on each other's session reference.
+            async with PolygonClient() as client:
                 daily_bars  = await client.fetch_daily_bars(ticker, days=60)
                 hourly_bars = await client.fetch_hourly_bars(ticker, days=5)
         except Exception as exc:
@@ -265,9 +271,13 @@ class ContextScheduler:
         if not self._pool:
             return
         try:
-            async with asyncio.wait_for(
+            # asyncio.wait_for() returns a coroutine, not an async context
+            # manager, so we must await it to get the connection object and
+            # then release it manually via the pool.
+            conn = await asyncio.wait_for(
                 self._pool.acquire(), timeout=_DB_WRITE_TIMEOUT
-            ) as conn:
+            )
+            try:
                 await conn.execute(
                     """
                     INSERT INTO stock_context_log (
@@ -289,6 +299,8 @@ class ContextScheduler:
                     ctx.adjusted_threshold,
                     json.dumps(ctx.raw_metrics),
                 )
+            finally:
+                await self._pool.release(conn)
         except asyncio.TimeoutError:
             logger.warning(
                 "scheduler.db_timeout", extra={"ticker": ctx.ticker}

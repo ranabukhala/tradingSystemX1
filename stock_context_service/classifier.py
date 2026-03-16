@@ -288,9 +288,16 @@ def _true_range_series(
 
 def _wilder_smooth(values: list[float], period: int) -> list[float]:
     """
-    Wilder's smoothed moving average (used for ATR, ADX):
+    Wilder's smoothed moving average (EMA variant used for ATR and ADX):
       smooth[0] = mean(values[:period])
-      smooth[i] = smooth[i-1] - smooth[i-1]/period + values[i]
+      smooth[i] = smooth[i-1] * (period-1)/period + values[i] / period
+               = smooth[i-1] - smooth[i-1]/period + values[i]/period
+
+    The /period divisor on values[i] is required so that the output stays
+    in the same magnitude as the input.  Without it the series diverges
+    whenever consecutive input values are large (e.g. DX % values → ADX
+    would exceed 100, which is mathematically impossible).
+
     Returns a series aligned with values[period-1:].
     """
     if len(values) < period:
@@ -298,7 +305,7 @@ def _wilder_smooth(values: list[float], period: int) -> list[float]:
     first = sum(values[:period]) / period
     result = [first]
     for v in values[period:]:
-        result.append(result[-1] - result[-1] / period + v)
+        result.append(result[-1] - result[-1] / period + v / period)
     return result
 
 

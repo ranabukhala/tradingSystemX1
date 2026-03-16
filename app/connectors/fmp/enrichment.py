@@ -62,7 +62,7 @@ class FMPEnrichmentService(BaseConsumer):
             decode_responses=True,
         )
         api_key = os.environ.get("FMP_API_KEY", "")
-        plan = os.environ.get("FMP_PLAN", "free")
+        plan = os.environ.get("FMP_PLAN", "starter")
 
         if not api_key:
             _log("warning", "fmp_enrichment.no_api_key",

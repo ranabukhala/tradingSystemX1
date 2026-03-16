@@ -60,8 +60,8 @@ class Settings(BaseSettings):
     fred_api_key: str = ""
     anthropic_api_key: str = ""
     fmp_api_key: str = ""
-    fmp_plan: str = "free"
-    fmp_daily_call_limit: int = 240  # Shared across all FMP containers (10-call buffer vs 250 cap)
+    fmp_plan: str = "starter"
+    fmp_daily_call_limit: int = 750  # Shared across all FMP containers (10-call buffer vs 250 cap)
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
 
