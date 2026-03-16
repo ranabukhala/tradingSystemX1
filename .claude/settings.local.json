@@ -114,7 +114,13 @@
       "Bash(py -3.12 -c \"import redis; print\\(redis.__version__\\)\")",
       "Bash(py -3.12 -c \"import redis.asyncio; print\\(''redis.asyncio OK''\\)\")",
       "Bash(py -3.12 -m pytest tests/test_llm_trust.py -v --tb=short)",
-      "Bash(py -3.12 -m pytest tests/test_fact_cross_validator.py -v --tb=short)"
+      "Bash(py -3.12 -m pytest tests/test_fact_cross_validator.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_conviction_features.py -v)",
+      "Bash(python -m pytest tests/test_fact_cross_validator.py -x -q)",
+      "Bash(python -c \"from app.models.news import CatalystType; print\\(''''import ok''''\\)\")",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/ --ignore=tests/test_schemas.py -q --tb=short)",
+      "Bash(python -m pytest tests/test_llm_trust.py tests/test_fact_cross_validator.py tests/test_conviction_features.py -v --tb=short)"
     ]
   }
 }

@@ -145,6 +145,46 @@ class Settings(BaseSettings):
     # Write audit row for all validation statuses (not just MISMATCH)
     fact_audit_all_statuses: bool = False
 
+    # ── Conviction scoring v1.8 ───────────────────────────────
+    # Scoring formula version.
+    #   v1  Identical to pre-v1.8 multiplicative formula (default, no behaviour change).
+    #   v2  Enables optional correlation-risk mitigations (requires conviction_correlation_guard=true).
+    conviction_scoring_mode: str = "v1"
+
+    # When true AND conviction_scoring_mode=v2, apply correlation mitigations:
+    #   • Catalyst-weight compression toward 1.0 (reduces cat_w × impact_day compound)
+    #   • Earnings combined-factor cap (bounds cat_w_eff × proximity_bonus)
+    conviction_correlation_guard: bool = False
+
+    # Calibration function applied after the raw multiplicative formula.
+    #   identity  No change — preserves pre-v1.8 output exactly (default)
+    #   sigmoid   σ-curve centred at conviction_sigmoid_center
+    #   linear    Per-catalyst slope × raw + bias (set via CONVICTION_LINEAR_PARAMS JSON)
+    conviction_calibration_fn: str = "identity"
+
+    # v2 correlation mitigations — tuneable without code changes
+    # Compression factor: cat_w_eff = 1.0 + (cat_w - 1.0) × factor
+    # 0.5 → range [0.3, 1.8] compresses to [0.65, 1.40]
+    conviction_catalyst_compression: float = 0.5
+    # Cap on combined earnings amplification: cat_w_eff × proximity_bonus ≤ cap
+    conviction_earnings_cap: float = 1.80
+
+    # Sigmoid calibration parameters
+    conviction_sigmoid_center:    float = 0.55
+    conviction_sigmoid_steepness: float = 8.0
+
+    # Correlation-risk detection thresholds
+    corr_cat_weight_threshold: float = 1.4
+    corr_impact_day_threshold: float = 0.75
+
+    # Feature logging — write ConvictionBreakdown to signal_feature_log
+    #   true   Log every emitted signal (recommended for calibration research)
+    #   false  Disable logging (reduces DB writes in high-volume environments)
+    conviction_log_features: bool = True
+    # Also log dropped signals (signals that did not cross the conviction threshold).
+    # High volume — enable sparingly (e.g., during calibration research only).
+    conviction_log_dropped_features: bool = False
+
     # ── Idempotency backend ───────────────────────────────────
     # "redis"  — async SET NX EX (atomic, cross-instance, default)
     # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)

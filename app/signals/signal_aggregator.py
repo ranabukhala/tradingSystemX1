@@ -13,6 +13,7 @@ Logic:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone, timedelta
 import pytz
@@ -43,6 +44,18 @@ from app.pipeline.fact_cross_validator import (
     FactValidationStatus,
     ENABLE_FACT_VALIDATION,
 )
+from app.signals.conviction_features import (
+    CATALYST_WEIGHT,
+    SESSION_WEIGHT,
+    FLOAT_WEIGHT,
+    ConvictionBreakdown,
+    ConvictionCalibrator,
+    get_default_calibrator,
+    extract_conviction_features,
+    compute_conviction_breakdown,
+    LOG_FEATURES,
+    LOG_DROPPED,
+)
 
 # Minimum conviction to emit a signal (override via SIGNAL_CONVICTION_THRESHOLD env var)
 import os
@@ -51,27 +64,6 @@ CONVICTION_THRESHOLD = float(os.environ.get("SIGNAL_CONVICTION_THRESHOLD", "0.55
 # Signal event gate — prevent duplicate signals for the same news event
 _ENABLE_SIGNAL_EVENT_GATE = os.environ.get("ENABLE_SIGNAL_EVENT_GATE", "true").lower() == "true"
 _MULTI_SIGNAL_POLICY      = os.environ.get("MULTI_SIGNAL_POLICY", "deny")  # deny | allow | allow_opposite
-
-# Catalyst weight multipliers
-CATALYST_WEIGHT: dict[CatalystType, float] = {
-    CatalystType.EARNINGS:    1.5,
-    CatalystType.MA:          1.8,   # M&A = highest impact
-    CatalystType.REGULATORY:  1.4,
-    CatalystType.ANALYST:     0.9,
-    CatalystType.FILING:      0.6,
-    CatalystType.MACRO:       0.7,
-    CatalystType.LEGAL:       0.3,   # Lawsuits = lagging catalyst, deeply discounted
-    CatalystType.OTHER:       0.5,
-}
-
-# Session multipliers — premarket news = higher weight (less liquidity, bigger moves)
-SESSION_WEIGHT: dict[SessionContext, float] = {
-    SessionContext.PREMARKET:  1.4,
-    SessionContext.OPEN:       1.3,
-    SessionContext.INTRADAY:   1.0,
-    SessionContext.AFTERHOURS: 1.1,
-    SessionContext.OVERNIGHT:  0.7,
-}
 
 ET = pytz.timezone("America/New_York")
 
@@ -87,13 +79,6 @@ TIME_WINDOWS: list[tuple[tuple[int,int], tuple[int,int], float, str, str]] = [
     ((15, 30), (16, 0),  0.80, "MOC noise — order imbalances distort moves",   "🟠"),
     ((16, 0),  (20, 0),  0.90, "After-hours — wider spreads, thin liquidity",  "🟡"),
 ]
-
-# Float sensitivity multiplier
-FLOAT_WEIGHT: dict[FloatSensitivity, float] = {
-    FloatSensitivity.HIGH:   1.3,
-    FloatSensitivity.NORMAL: 1.0,
-}
-
 
 class TradingSignal(BaseModel):
     """
@@ -169,8 +154,45 @@ class TradingSignal(BaseModel):
     mismatch_fields: list[str] = Field(default_factory=list)
     validation_confidence: float | None = None        # 0.0–1.0
 
+    # Conviction calibration metadata (v1.8)
+    # Enables calibration research and replay without re-running the full pipeline.
+    conviction_raw_product: float | None = None       # step_after_cross_val  (pre-TW, pre-calibration)
+    conviction_pre_calibration: float | None = None   # step_after_time_window (post-TW, pre-calibration)
+    correlation_risk: list[str] = Field(default_factory=list)  # e.g. ['cat_impact_day', 'float_squeeze']
+    calibration_fn: str = "identity"                  # identity | sigmoid | linear
+
     def to_kafka_dict(self) -> dict:
         return self.model_dump(mode="json")
+
+
+def compute_conviction_with_breakdown(
+    record: SummarizedRecord,
+    direction_source: str,
+    validation: LLMValidationResult,
+    cross_val: "FactCrossValidationResult | None" = None,
+    time_window_mult: float = 1.0,
+    time_window_label: str | None = None,
+    calibrator: "ConvictionCalibrator | None" = None,
+) -> ConvictionBreakdown:
+    """
+    Compute conviction with a full step-by-step breakdown (v1.8).
+
+    Extracts ConvictionFeatures from the record and runs compute_conviction_breakdown().
+    The returned ConvictionBreakdown contains final_conviction and all intermediate
+    steps for logging, calibration research, and replay.
+
+    time_window_mult and time_window_label are integrated into step 7 of the
+    breakdown, eliminating the two-stage threshold check in process().
+    """
+    features = extract_conviction_features(
+        record,
+        direction_source,
+        validation,
+        cross_val,
+        time_window_mult=time_window_mult,
+        time_window_label=time_window_label,
+    )
+    return compute_conviction_breakdown(features, calibrator)
 
 
 def compute_conviction(
@@ -184,78 +206,27 @@ def compute_conviction(
 
     Returns (conviction, interpretive_cap_applied).
 
-    Formula:
-      base     = validated impact_day (from LLM — interpretive)
-      × catalyst_weight
-      × session_weight
-      × float_weight
-      × credibility_boost (from validated source_credibility)
+    Backward-compatible wrapper around compute_conviction_with_breakdown().
+    Signature is preserved exactly — existing callers and tests continue to work.
+    Time window is not passed here (defaults to 1.0 = no dampening); use
+    compute_conviction_with_breakdown() directly when TW integration is needed.
 
-    Post-formula adjustments (in order):
-      1. Earnings proximity bonus (factual: based on earnings_proximity_h)
-      2. Priced-in penalty       (interpretive: conditional on direction_source)
-      3. Interpretive ceiling    (hard cap when direction_source="interpretive_prior")
-      4. Regime adjustment       (interpretive: regime_flag scales conviction down only)
-      5. Fact cross-validation   (structural: vendor data confirms or contradicts facts)
+    Formula (v1 default — identical to pre-v1.8 behaviour):
+      base     = validated impact_day
+      × catalyst_weight × session_weight × float_weight × credibility_boost
+      × earnings_proximity_bonus
+      × priced_in multiplier (or 0.0 if blocked)
+      → interpretive ceiling
+      × regime_multiplier
+      × cross_val_multiplier
     """
-    # Use validated impact_day — never the raw LLM value
-    base = validation.cleaned_impact_day or 0.0
-
-    cat_w  = CATALYST_WEIGHT.get(record.catalyst_type, 0.5)
-    sess_w = SESSION_WEIGHT.get(record.session_context, 1.0)
-    float_w = FLOAT_WEIGHT.get(record.float_sensitivity, 1.0)
-
-    # Use validated source_credibility
-    cred = validation.cleaned_source_credibility or 0.6
-    cred_boost = 0.8 + (cred * 0.4)   # Range: 0.8–1.2
-
-    conviction = base * cat_w * sess_w * float_w * cred_boost
-
-    # ── 1. Earnings proximity bonus (factual context) ─────────────────────
-    if record.earnings_proximity_h is not None:
-        proximity_h = abs(record.earnings_proximity_h)
-        if proximity_h <= 2:
-            conviction *= 1.3
-        elif proximity_h <= 24:
-            conviction *= 1.1
-
-    # ── 2. Priced-in penalty (interpretive — applied conditionally) ───────
-    # Legal filings are structurally lagging — always treat as priced in
-    if record.catalyst_type == CatalystType.LEGAL:
-        priced_in = "yes"
-    else:
-        priced_in = validation.cleaned_priced_in  # already validated; None = no penalty
-
-    if direction_source == "interpretive_prior" and priced_in == "yes":
-        # BLOCK: both evidence sources say "don't trade" — the LLM thinks
-        # direction is X AND the same LLM says the market already knows about it.
-        return 0.0, False
-
-    if priced_in == "yes":
-        conviction *= 0.60      # Heavy discount — likely to fade or not extend
-    elif priced_in == "partially":
-        conviction *= 0.85      # Moderate discount
-
-    conviction = min(1.0, round(conviction, 3))
-
-    # ── 3. Interpretive ceiling ───────────────────────────────────────────
-    # Signals whose direction came from LLM opinion (not facts) are capped.
-    # This prevents a Sonnet "long" bias from generating a high-conviction trade.
-    conviction, cap_applied = apply_conviction_cap(conviction, direction_source)
-
-    # ── 4. Regime adjustment (demoted: scale only, never set direction) ───
-    # A "risk_off" regime flag does NOT flip a fact-backed "long" to "short".
-    # It reduces conviction by 10 % to reflect the adverse macro environment.
-    conviction = apply_regime_adjustment(conviction, validation.cleaned_regime_flag)
-
-    # ── 5. Fact cross-validation multiplier ───────────────────────────────
-    # Applied last so it operates on the fully-adjusted conviction value.
-    # cross_val=None (FACT_VALIDATION disabled or catalyst not verifiable) →
-    # multiplier is 1.0 (no change).
-    if cross_val is not None and cross_val.conviction_multiplier != 1.0:
-        conviction = round(conviction * cross_val.conviction_multiplier, 3)
-
-    return round(conviction, 3), cap_applied
+    bd = compute_conviction_with_breakdown(
+        record, direction_source, validation, cross_val,
+        time_window_mult=1.0,
+        time_window_label=None,
+        calibrator=None,   # identity — preserves pre-v1.8 output exactly
+    )
+    return bd.final_conviction, bd.interpretive_cap_applied
 
 
 def classify_signal_type(record: SummarizedRecord, conviction: float) -> str:
@@ -458,6 +429,7 @@ class SignalAggregatorService(BaseConsumer):
         self._cluster_store: EventClusterStore | None = None
         self._db_pool = None                              # asyncpg pool for validation + logging
         self._fact_validator: FactCrossValidator | None = None
+        self._calibrator: ConvictionCalibrator | None = None
 
     async def on_start(self) -> None:
         self._producer = self._make_producer()
@@ -467,6 +439,11 @@ class SignalAggregatorService(BaseConsumer):
         )
         if _ENABLE_SIGNAL_EVENT_GATE:
             self._cluster_store = EventClusterStore(self._redis)
+
+        # ── Conviction calibrator (v1.8) ───────────────────────────────────
+        # Instantiated once at startup; reads CONVICTION_CALIBRATION_FN env var.
+        # Default is IdentityCalibrator — no change from pre-v1.8 behaviour.
+        self._calibrator = get_default_calibrator()
 
         # ── Fact cross-validator ───────────────────────────────────────────
         # Create a small asyncpg pool (2 connections) for earnings + analyst
@@ -554,6 +531,79 @@ class SignalAggregatorService(BaseConsumer):
         except Exception as e:
             _log("warning", "signal_aggregator.log_error", error=str(e))
 
+    async def _write_feature_log(
+        self,
+        breakdown: ConvictionBreakdown,
+        ticker: str,
+        direction: str,
+        record_id: str,
+        emitted: bool,
+    ) -> None:
+        """
+        Persist a ConvictionBreakdown to signal_feature_log.
+
+        Called fire-and-forget via asyncio.ensure_future() — never blocks the hot path.
+        Silently swallows all exceptions so a DB hiccup never affects signal flow.
+
+        Controlled by CONVICTION_LOG_FEATURES (emitted) and
+        CONVICTION_LOG_DROPPED_FEATURES (dropped) env vars.
+        """
+        if self._db_pool is None:
+            return
+        d = breakdown.as_log_dict
+        try:
+            async with self._db_pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO signal_feature_log (
+                        record_id, ticker, direction, emitted,
+                        impact_day, source_credibility, cred_boost,
+                        catalyst_type, catalyst_weight, catalyst_weight_effective,
+                        session_context, session_weight,
+                        float_sensitivity, float_weight,
+                        earnings_proximity_h, earnings_proximity_bonus,
+                        earnings_proximity_bonus_effective,
+                        direction_source, priced_in, regime_flag, regime_multiplier,
+                        cross_val_status, cross_val_multiplier,
+                        time_window_label, time_window_mult, time_window_mult_effective,
+                        scoring_mode, correlation_risk,
+                        step_base_product, step_after_proximity, step_after_priced_in,
+                        step_after_cap, step_after_regime, step_after_cross_val,
+                        step_after_time_window, step_calibrated,
+                        interpretive_cap_applied, priced_in_blocked,
+                        calibration_fn, final_conviction
+                    ) VALUES (
+                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
+                        $11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                        $21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+                        $31,$32,$33,$34,$35,$36,$37,$38,$39,$40
+                    )
+                    """,
+                    record_id, ticker, direction, emitted,
+                    d["impact_day"], d["source_credibility"], d["cred_boost"],
+                    d["catalyst_type"], d["catalyst_weight"], d["catalyst_weight_effective"],
+                    d["session_context"], d["session_weight"],
+                    d["float_sensitivity"], d["float_weight"],
+                    d["earnings_proximity_h"], d["earnings_proximity_bonus"],
+                    d["earnings_proximity_bonus_effective"],
+                    d["direction_source"], d["priced_in"], d["regime_flag"],
+                    d["regime_multiplier"],
+                    d["cross_val_status"], d["cross_val_multiplier"],
+                    d["time_window_label"], d["time_window_mult"],
+                    d["time_window_mult_effective"],
+                    d["scoring_mode"], d["correlation_risk"],
+                    d["step_base_product"], d["step_after_proximity"],
+                    d["step_after_priced_in"],
+                    d["step_after_cap"], d["step_after_regime"],
+                    d["step_after_cross_val"],
+                    d["step_after_time_window"], d["step_calibrated"],
+                    d["interpretive_cap_applied"], d["priced_in_blocked"],
+                    d["calibration_fn"], d["final_conviction"],
+                )
+        except Exception as exc:
+            _log("warning", "signal_aggregator.feature_log_error",
+                 ticker=ticker, error=str(exc))
+
     async def process(self, record: dict) -> dict | None:
         try:
             summarized = SummarizedRecord.from_kafka_dict(record)
@@ -596,7 +646,7 @@ class SignalAggregatorService(BaseConsumer):
         # Cross-checks LLM-extracted facts_json against authoritative vendor data
         # (Postgres event table for earnings, fmp_analyst_grades for analyst calls).
         # Returns a FactCrossValidationResult whose conviction_multiplier is applied
-        # as the final adjustment in compute_conviction().
+        # in step 6 of compute_conviction_breakdown().
         cross_val: FactCrossValidationResult | None = None
         if self._fact_validator is not None:
             cross_val = await self._fact_validator.validate(summarized, primary_ticker)
@@ -614,28 +664,72 @@ class SignalAggregatorService(BaseConsumer):
                      validated_fields=cross_val.validated_fields,
                      vendor_source=cross_val.vendor_source)
 
-        # Compute conviction with trust-aware caps (includes cross_val multiplier)
-        conviction, cap_applied = compute_conviction(
-            summarized, direction_source, validation, cross_val
-        )
+        # ── Time window ───────────────────────────────────────────────────
+        # Computed before conviction (v1.8) so TW is integrated into step 7 of
+        # compute_conviction_breakdown(), enabling a single threshold check.
+        tw = get_time_window(summarized.published_at or datetime.now(timezone.utc))
+        tw_mult  = tw["multiplier"]
+        tw_label = tw["window_label"]
 
-        # Block if conviction zeroed out (interpretive + priced_in="yes")
-        if conviction == 0.0 and direction != "neutral":
+        # ── Conviction breakdown (v1.8) ───────────────────────────────────
+        # Returns a full 9-step trace.  Time window dampening is step 7;
+        # calibration is step 8.  final_conviction is the value used for all
+        # trading decisions.
+        bd = compute_conviction_with_breakdown(
+            summarized, direction_source, validation, cross_val,
+            time_window_mult=tw_mult,
+            time_window_label=tw_label,
+            calibrator=self._calibrator,
+        )
+        conviction  = bd.final_conviction
+        cap_applied = bd.interpretive_cap_applied
+
+        # ── Block: interpretive direction AND fully priced in → 0.0 ──────
+        # Detected in breakdown step 3; bd.priced_in_blocked is set True.
+        if bd.priced_in_blocked:
             _log("info", "signal_aggregator.interpretive_priced_in_block",
                  vendor_id=summarized.vendor_id,
                  direction_source=direction_source)
             await self._log_signal(summarized, conviction, passed=False,
                                    direction=direction)
+            if LOG_DROPPED and self._db_pool:
+                asyncio.ensure_future(self._write_feature_log(
+                    bd, primary_ticker, direction, str(summarized.id), emitted=False
+                ))
             return None
 
+        # ── Single threshold check (TW already applied in breakdown step 7) ─
         if conviction < CONVICTION_THRESHOLD:
             _log("debug", "signal_aggregator.low_conviction",
                  vendor_id=summarized.vendor_id,
                  conviction=conviction,
                  threshold=CONVICTION_THRESHOLD,
-                 direction_source=direction_source)
+                 direction_source=direction_source,
+                 time_window=tw_label)
             await self._log_signal(summarized, conviction, passed=False)
+            if LOG_DROPPED and self._db_pool:
+                asyncio.ensure_future(self._write_feature_log(
+                    bd, primary_ticker, direction, str(summarized.id), emitted=False
+                ))
             return None
+
+        # ── Time window — observability log ──────────────────────────────
+        # TW is already incorporated into conviction; this is for monitoring only.
+        if tw_mult < 1.0:
+            _log("info", "signal_aggregator.time_window_dampen",
+                 ticker=primary_ticker,
+                 window=tw_label,
+                 time_et=tw["time_et"],
+                 multiplier=tw_mult,
+                 conviction_before=round(bd.step_after_cross_val, 3),
+                 conviction_after=conviction)
+        else:
+            _log("info", "signal_aggregator.time_window",
+                 ticker=primary_ticker,
+                 time_et=tw["time_et"],
+                 window=tw_label,
+                 multiplier=tw_mult,
+                 quality=tw["quality"])
 
         signal_type = classify_signal_type(summarized, conviction)
 
@@ -647,38 +741,9 @@ class SignalAggregatorService(BaseConsumer):
              interpretive_cap=cap_applied,
              signal_type=signal_type,
              catalyst=summarized.catalyst_type.value,
+             correlation_risk=bd.correlation_risk or None,
+             calibration_fn=bd.calibration_fn,
              title=summarized.title[:80])
-
-        # Time window: apply dampening multipliers (< 1.0) now active.
-        # Boost multipliers (> 1.0) not yet validated — kept inactive.
-        tw = get_time_window(summarized.published_at or datetime.now(timezone.utc))
-        tw_mult = tw["multiplier"]
-        if tw_mult < 1.0:
-            conviction_pre_tw = conviction
-            conviction = round(conviction * tw_mult, 3)
-            _log("info", "signal_aggregator.time_window_dampen",
-                 ticker=primary_ticker,
-                 window=tw["window_label"],
-                 time_et=tw["time_et"],
-                 multiplier=tw_mult,
-                 conviction_before=conviction_pre_tw,
-                 conviction_after=conviction)
-            # Re-check threshold after dampening
-            if conviction < CONVICTION_THRESHOLD:
-                _log("info", "signal_aggregator.time_window_threshold_drop",
-                     ticker=primary_ticker,
-                     window=tw["window_label"],
-                     conviction=conviction,
-                     threshold=CONVICTION_THRESHOLD)
-                await self._log_signal(summarized, conviction, passed=False)
-                return None
-        else:
-            _log("info", "signal_aggregator.time_window",
-                 ticker=primary_ticker,
-                 time_et=tw["time_et"],
-                 window=tw["window_label"],
-                 multiplier=tw_mult,
-                 quality=tw["quality"])
 
         signal = TradingSignal(
             ticker=primary_ticker,
@@ -719,10 +784,21 @@ class SignalAggregatorService(BaseConsumer):
             validation_confidence=(
                 cross_val.validation_confidence if cross_val else None
             ),
+            # Conviction calibration metadata (v1.8)
+            conviction_raw_product=round(bd.step_after_cross_val, 4),
+            conviction_pre_calibration=round(bd.step_after_time_window, 4),
+            correlation_risk=bd.correlation_risk,
+            calibration_fn=bd.calibration_fn,
         )
 
         await self._log_signal(summarized, conviction, passed=True,
                                direction=direction, signal_type=signal_type)
+
+        # Feature log — fire-and-forget (never blocks the hot path)
+        if LOG_FEATURES and self._db_pool:
+            asyncio.ensure_future(self._write_feature_log(
+                bd, primary_ticker, direction, str(summarized.id), emitted=True
+            ))
 
         # ── Signal event gate ─────────────────────────────────────────────────
         # Prevents duplicate signals being emitted for the same underlying news event.
