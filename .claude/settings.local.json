@@ -124,7 +124,10 @@
       "Bash(xargs grep:*)",
       "Bash(python -m pytest tests/test_catalyst_policy.py -v)",
       "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py)",
-      "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py --ignore=tests/test_schemas.py)"
+      "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py --ignore=tests/test_schemas.py)",
+      "Bash(python -m pytest tests/test_portfolio_risk.py -v)",
+      "Bash(python -m pytest tests/test_conviction_features.py tests/test_catalyst_policy.py -v)",
+      "Bash(python -m pytest tests/test_portfolio_risk.py tests/test_conviction_features.py tests/test_catalyst_policy.py -v --tb=short)"
     ]
   }
 }

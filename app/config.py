@@ -262,6 +262,44 @@ class Settings(BaseSettings):
     policy_require_volume_ma:       bool = True
     policy_require_volume_other:    bool = False
 
+    # ── Portfolio Risk Manager (v1.10) ────────────────────────────────────
+    # Kill-switch: set False to bypass portfolio risk entirely
+    # (signals.filtered flows directly to execution engine).
+    enable_portfolio_risk_manager: bool = True
+
+    # Manual kill switch Redis key (set "1" to halt, delete to resume)
+    risk_kill_switch_redis_key: str = "risk:kill_switch"
+
+    # Auto-halt thresholds
+    risk_halt_drawdown_pct: float = 0.08          # Halt if equity drops 8% below HWM
+    risk_halt_consecutive_losses: int = 5          # Halt after N consecutive losses
+
+    # Portfolio-level exposure caps
+    risk_max_portfolio_heat_pct: float = 0.20     # Max 20% of equity in open risk
+    risk_max_ticker_exposure_usd: float = 10000.0 # Max USD in any single ticker
+    risk_max_ticker_exposure_pct: float = 0.05    # Max 5% of equity in any single ticker
+
+    # Sector concentration — aligns with existing risk_manager stub
+    risk_max_sector_pct: float = 0.25
+
+    # Catalyst-family max concurrent open positions
+    risk_max_catalyst_earnings_positions:   int = 3
+    risk_max_catalyst_analyst_positions:    int = 4
+    risk_max_catalyst_regulatory_positions: int = 2
+    risk_max_catalyst_ma_positions:         int = 2
+    risk_max_catalyst_macro_positions:      int = 3
+    risk_max_catalyst_default_positions:    int = 5
+
+    # Correlation proxy — block if ≥ N open positions share (sector, direction)
+    risk_max_correlated_positions: int = 3
+
+    # Per-event (news cluster) dedup
+    risk_max_trades_per_cluster: int = 1
+    risk_cluster_ttl_seconds: int = 3600          # Track clusters for 1 hour
+
+    # Position / account cache TTL inside the risk service
+    risk_position_cache_ttl_seconds: int = 30
+
     # ── Idempotency backend ───────────────────────────────────
     # "redis"  — async SET NX EX (atomic, cross-instance, default)
     # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)
@@ -313,6 +351,10 @@ class Settings(BaseSettings):
     @property
     def topic_signals_actionable(self) -> str:
         return "signals.actionable"
+
+    @property
+    def topic_signals_risk_approved(self) -> str:
+        return "signals.risk_approved"
 
     @property
     def topic_trades_executed(self) -> str:

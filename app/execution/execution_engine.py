@@ -102,11 +102,18 @@ class ExecutionEngine(BaseConsumer):
 
     @property
     def input_topic(self) -> str:
-        # Consume from filtered signals if pre-trade filter is deployed,
-        # fall back to actionable if not (controlled by env var)
+        # Routing controlled by two env-var flags (both default true):
+        #   USE_PRETRADE_FILTER          — signals.actionable → signals.filtered
+        #   USE_PORTFOLIO_RISK_MANAGER   — signals.filtered  → signals.risk_approved
         import os
         use_filter = os.environ.get("USE_PRETRADE_FILTER", "true").lower() == "true"
-        return "signals.filtered" if use_filter else "signals.actionable"
+        use_risk   = os.environ.get("USE_PORTFOLIO_RISK_MANAGER", "true").lower() == "true"
+        if use_filter and use_risk:
+            return "signals.risk_approved"
+        elif use_filter:
+            return "signals.filtered"
+        else:
+            return "signals.actionable"
 
     @property
     def output_topic(self) -> str:
