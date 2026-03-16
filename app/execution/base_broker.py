@@ -189,6 +189,41 @@ class BaseBroker(ABC):
         ...
 
     @abstractmethod
+    async def get_quote_with_timestamp(self, ticker: str) -> tuple[float, datetime]:
+        """
+        Get latest price AND the UTC timestamp of when the quote was fetched.
+        Returns (price, utc_datetime).
+        The timestamp must be offset-aware (timezone.utc).
+        """
+        ...
+
+    @abstractmethod
+    async def get_order(self, broker_order_id: str) -> "OrderResult":
+        """
+        Fetch the latest status of an existing order by broker order ID.
+        Used by FillPoller to check fill status for limit orders.
+        Returns an updated OrderResult.
+        """
+        ...
+
+    async def get_halted(self, ticker: str) -> bool:
+        """
+        Optional: check whether the exchange has halted trading for `ticker`.
+        Default returns False (fail-open — assume not halted if unsupported).
+        Brokers should override this for production use.
+        """
+        return False
+
+    async def start_trade_stream(self, callback) -> None:
+        """
+        Optional: start a WebSocket/event stream for trade updates.
+        `callback` will be called with trade update dicts as they arrive.
+        Default raises NotImplementedError — brokers override if supported.
+        PositionMonitor checks hasattr(broker, 'start_trade_stream') before calling.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support trade streaming")
+
+    @abstractmethod
     async def is_market_open(self) -> bool:
         """Is the market currently open?"""
         ...

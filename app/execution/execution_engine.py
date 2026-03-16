@@ -28,8 +28,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
 
-from app.execution.base_broker import BaseBroker, OrderResult, OrderStatus
+from app.execution.base_broker import BaseBroker, OrderResult, OrderStatus, OrderType
 from app.execution.risk_manager import RiskManager, RiskConfig
+from app.execution.entry_validator import EntryValidator
+from app.execution.order_policy import build_order_policy_table, get_order_policy
+from app.execution.fill_poller import FillPoller, FillPollConfig
+from app.execution.position_monitor import PositionMonitor
 from app.pipeline.base_consumer import BaseConsumer, _log
 from app.pipeline.event_cluster import EventClusterStore
 from app.pipeline.staleness import staleness_from_signal_dict
@@ -94,6 +98,11 @@ class ExecutionEngine(BaseConsumer):
         self._http: httpx.AsyncClient | None = None
         self._redis: aioredis.Redis | None = None
         self._cluster_store: EventClusterStore | None = None
+        # v1.11 components — initialised in on_start()
+        self._entry_validator: EntryValidator | None = None
+        self._fill_poller: FillPoller | None = None
+        self._position_monitor: PositionMonitor | None = None
+        self._order_policy_table: dict | None = None
         super().__init__()
 
     @property
@@ -129,18 +138,146 @@ class ExecutionEngine(BaseConsumer):
                 decode_responses=True,
             )
             self._cluster_store = EventClusterStore(self._redis)
+
+        # v1.11: initialise execution quality components
+        from app.config import settings as _settings
+        self._entry_validator  = EntryValidator(_settings)
+        self._fill_poller      = FillPoller(self._broker, FillPollConfig.from_env())
+        self._order_policy_table = build_order_policy_table(_settings)
+
+        # v1.11: position monitor — starts as background asyncio task
+        self._position_monitor = PositionMonitor(self._broker)
+        asyncio.create_task(self._position_monitor.start())
+
         _log("info", "execution_engine.ready",
              broker=self._broker.name,
              paper=self._broker.paper,
              order_event_gate=_ENABLE_ORDER_EVENT_GATE)
 
     async def on_stop(self) -> None:
+        if self._position_monitor:
+            self._position_monitor.stop()
         if self._broker:
             await self._broker.disconnect()
         if self._http:
             await self._http.aclose()
         if self._redis:
             await self._redis.aclose()
+
+    async def _fetch_atr(self, ticker: str) -> float | None:
+        """
+        Fetch ATR(14) from the stock context service.
+        Returns None on any error (fail-open — caller falls back to fixed % stops).
+        """
+        try:
+            stock_context_url = os.environ.get(
+                "STOCK_CONTEXT_URL", "http://stock_context:8082")
+            resp = await self._http.get(
+                f"{stock_context_url}/context/{ticker}",
+                timeout=3.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                atr = data.get("raw_metrics", {}).get("atr14")
+                if atr and float(atr) > 0:
+                    return float(atr)
+        except Exception as e:
+            _log("debug", "execution.atr_fetch_error", ticker=ticker, error=str(e))
+        return None
+
+    async def _save_execution_quality(
+        self,
+        signal: TradingSignal,
+        order,
+        result: OrderResult,
+        entry_check,
+        decision,
+        atr_14: float | None,
+        policy,
+        spread_pct: float | None,
+        submit_time: datetime,
+    ) -> None:
+        """
+        Persist an execution_quality row (v1.11).
+        Fails gracefully — never blocks the trade flow.
+        """
+        enabled = os.environ.get("EXECUTION_QUALITY_ENABLED", "true").lower() == "true"
+        if not enabled:
+            return
+        try:
+            from app.db import get_engine
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            # Compute slippage: (fill - ref) / ref * 100  (positive = paid more)
+            entry_ref_price = getattr(signal, "entry_ref_price", None)
+            avg_fill = result.avg_fill_price or 0.0
+            slippage_pct: float | None = None
+            if entry_ref_price and entry_ref_price > 0 and avg_fill > 0:
+                slippage_pct = (avg_fill - entry_ref_price) / entry_ref_price * 100.0
+
+            # Fill latency
+            fill_latency_ms: int | None = None
+            if result.filled_at and submit_time:
+                delta = (result.filled_at - submit_time).total_seconds()
+                fill_latency_ms = max(0, int(delta * 1000))
+
+            adv_tier = getattr(policy, "adv_tier", None) if policy else None
+            policy_name = getattr(policy, "policy_name", None) if policy else None
+            order_type_str = getattr(policy, "order_type", "market") if policy else "market"
+
+            engine = get_engine()
+            async with AsyncSession(engine) as session:
+                # First get the trade_id for this signal
+                row = await session.execute(text(
+                    "SELECT id FROM trade WHERE signal_id = :sid ORDER BY created_at DESC LIMIT 1"
+                ), {"sid": str(signal.id)})
+                trade_row = row.fetchone()
+                trade_id = str(trade_row[0]) if trade_row else None
+
+                await session.execute(text("""
+                    INSERT INTO execution_quality (
+                        trade_id, broker_order_id, ticker,
+                        quote_age_seconds, price_drift_pct, spread_pct,
+                        order_type, qty_requested, qty_filled,
+                        avg_fill_price, entry_ref_price, slippage_pct,
+                        fill_latency_ms, partial_fill,
+                        atr_14, atr_stop_used, stop_loss_price, take_profit_price,
+                        catalyst_type, adv_tier, policy_applied
+                    ) VALUES (
+                        :trade_id, :broker_order_id, :ticker,
+                        :quote_age_seconds, :price_drift_pct, :spread_pct,
+                        :order_type, :qty_requested, :qty_filled,
+                        :avg_fill_price, :entry_ref_price, :slippage_pct,
+                        :fill_latency_ms, :partial_fill,
+                        :atr_14, :atr_stop_used, :stop_loss_price, :take_profit_price,
+                        :catalyst_type, :adv_tier, :policy_applied
+                    )
+                """), {
+                    "trade_id":          trade_id,
+                    "broker_order_id":   result.broker_order_id,
+                    "ticker":            signal.ticker,
+                    "quote_age_seconds": getattr(entry_check, "quote_age_seconds", None),
+                    "price_drift_pct":   getattr(entry_check, "price_drift_pct", None),
+                    "spread_pct":        spread_pct,
+                    "order_type":        order_type_str,
+                    "qty_requested":     order.qty,
+                    "qty_filled":        result.qty_filled,
+                    "avg_fill_price":    avg_fill or None,
+                    "entry_ref_price":   entry_ref_price,
+                    "slippage_pct":      slippage_pct,
+                    "fill_latency_ms":   fill_latency_ms,
+                    "partial_fill":      result.status.value == "partial",
+                    "atr_14":            atr_14,
+                    "atr_stop_used":     decision.stop_type == "atr" if decision else False,
+                    "stop_loss_price":   decision.stop_loss if decision else None,
+                    "take_profit_price": decision.take_profit if decision else None,
+                    "catalyst_type":     signal.catalyst_type,
+                    "adv_tier":          adv_tier,
+                    "policy_applied":    policy_name,
+                })
+                await session.commit()
+        except Exception as e:
+            _log("warning", "execution.quality_save_error", error=str(e))
 
     async def _log_lag_block(self, ticker: str, signal: TradingSignal) -> None:
         """Write a kafka_lag_log row when execution is blocked by consumer lag."""
@@ -234,13 +371,37 @@ class ExecutionEngine(BaseConsumer):
                 return None
         # ─────────────────────────────────────────────────────────────────────
 
-        # ── Get current price ─────────────────────────────────────────────────
-        price = await self._broker.get_quote(ticker)
+        # ── Step 1: Get quote WITH timestamp ─────────────────────────────────
+        price, quote_timestamp = await self._broker.get_quote_with_timestamp(ticker)
         if not price:
             _log("warning", "execution.no_price", ticker=ticker)
             return None
 
-        # ── Get account + positions ───────────────────────────────────────────
+        # ── Step 2: Halt check ────────────────────────────────────────────────
+        halted = False
+        try:
+            halted = await self._broker.get_halted(ticker)
+        except Exception as e:
+            _log("debug", "execution.halt_check_error", ticker=ticker, error=str(e))
+
+        # ── Step 3: EntryValidator gate ───────────────────────────────────────
+        entry_check = None
+        if self._entry_validator:
+            signal_price = getattr(signal, "entry_ref_price", None)
+            entry_check = await self._entry_validator.check(
+                ticker=ticker,
+                signal_price=signal_price,
+                current_price=price,
+                quote_timestamp=quote_timestamp,
+                halted=halted,
+            )
+            if not entry_check.approved:
+                _log("info", "execution.entry_blocked",
+                     ticker=ticker, direction=direction,
+                     reason=entry_check.reason)
+                return None
+
+        # ── Step 4: Get account + positions ───────────────────────────────────
         try:
             account = await self._broker.get_account()
             positions = await self._broker.get_positions()
@@ -248,11 +409,11 @@ class ExecutionEngine(BaseConsumer):
             _log("error", "execution.account_error", error=str(e))
             return None
 
-        # ── Spread gate — pre-check BEFORE risk evaluation and order submission ──
-        # Wide spreads mean we'd pay more in slippage than the edge is worth.
-        #   > 2.0% → hard block (spread_too_wide)
-        #   > 1.0% → -30% conviction
-        #   > 0.5% → -15% conviction
+        # ── Step 5: Spread gate — BEFORE risk evaluation ──────────────────────
+        # Wide spreads → pay more slippage than edge is worth.
+        #   > 2.0% → hard block
+        #   > 1.0% → −30% conviction
+        #   > 0.5% → −15% conviction
         flow = {}
         try:
             flow = await self._broker.get_order_flow_context(ticker, price)
@@ -282,7 +443,10 @@ class ExecutionEngine(BaseConsumer):
                      conviction_in=signal.conviction, conviction_out=conviction,
                      cut_pct=15, spread_label=flow.get("spread_label", ""))
 
-        # ── Risk evaluation ───────────────────────────────────────────────────
+        # ── Step 6: Fetch ATR(14) from stock context service ──────────────────
+        atr_14 = await self._fetch_atr(ticker)
+
+        # ── Step 7: Risk evaluation (with ATR stops) ──────────────────────────
         decision = await self._risk.evaluate(
             ticker=ticker,
             direction=direction,
@@ -292,6 +456,7 @@ class ExecutionEngine(BaseConsumer):
             open_positions=positions,
             session_context=signal.session_context,
             decay_minutes=signal.decay_minutes,
+            atr_14=atr_14,
         )
 
         if not decision.approved:
@@ -302,19 +467,47 @@ class ExecutionEngine(BaseConsumer):
                  reason=decision.reason)
             return None
 
-        # ── Build and submit order ────────────────────────────────────────────
+        # ── Step 8: Order type policy lookup ──────────────────────────────────
+        policy = None
+        order_type_str = "market"
+        limit_price: float | None = None
+        time_in_force = "day"
+
+        if self._order_policy_table:
+            adv = flow.get("adv") if flow else None
+            from app.config import settings as _settings
+            policy = get_order_policy(
+                self._order_policy_table,
+                catalyst_type=signal.catalyst_type or "other",
+                adv=adv,
+                liquid_threshold=getattr(_settings, "order_adv_liquid_threshold", 5_000_000),
+                thin_threshold=getattr(_settings, "order_adv_thin_threshold", 500_000),
+            )
+            order_type_str = policy.order_type
+            time_in_force  = policy.time_in_force
+
+            # For LIMIT orders: set limit price = current price ± slippage
+            if order_type_str in ("limit", "limit_ioc") and price > 0:
+                slip = policy.limit_slippage_pct / 100.0
+                if direction == "long":
+                    limit_price = round(price * (1 + slip), 2)
+                else:
+                    limit_price = round(price * (1 - slip), 2)
+
+        # ── Step 9: Build order with policy order type ────────────────────────
         order = self._risk.build_order(
             ticker=ticker,
             direction=direction,
             decision=decision,
             signal_id=str(signal.id),
+            order_type_str=order_type_str,
+            limit_price=limit_price,
+            time_in_force=time_in_force,
         )
 
-        # ── Order event gate — prevent double-submission for same news event ─
-        # Uses cluster_id when available (set by deduplicator), falls back to signal.id.
+        # ── Order event gate — prevent double-submission for same news event ──
         event_id = getattr(signal, "cluster_id", None) or str(signal.id)
         if _ENABLE_ORDER_EVENT_GATE and self._cluster_store:
-            # Pre-register with a placeholder — will be updated with real order ID below
             gate_open = await self._cluster_store.mark_order_submitted(
                 event_id=str(event_id),
                 broker_order_id=f"pending:{signal.id}",
@@ -326,26 +519,63 @@ class ExecutionEngine(BaseConsumer):
                      event_id=str(event_id),
                      signal_id=str(signal.id))
                 return None
-        # ────────────────────────────────────────────────────────────────────
 
+        submit_time = datetime.now(timezone.utc)
         result = await self._broker.submit_order(order)
+
+        # ── Step 10: Fill poller (LIMIT orders only) ──────────────────────────
+        if (self._fill_poller
+                and order.order_type != OrderType.MARKET
+                and result.broker_order_id
+                and result.status not in (
+                    OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED)):
+            result = await self._fill_poller.wait_for_fill(result, order)
 
         _log("info", "execution.order_submitted",
              ticker=ticker,
              direction=direction,
              broker_order_id=result.broker_order_id,
              qty=result.qty_requested,
+             qty_filled=result.qty_filled,
+             avg_fill=result.avg_fill_price,
              status=result.status.value,
+             order_type=order_type_str,
              tp=decision.take_profit,
              sl=decision.stop_loss,
+             stop_type=decision.stop_type,
+             atr_14=atr_14,
              conviction=signal.conviction,
              broker=self._broker.name)
+
+        # ── Step 11: Register with position monitor ───────────────────────────
+        if (result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL)
+                and self._position_monitor):
+            self._position_monitor.register_position(ticker, {
+                "entry_price":     result.avg_fill_price or price,
+                "take_profit":     decision.take_profit,
+                "stop_loss":       decision.stop_loss,
+                "decay_minutes":   signal.decay_minutes or 60,
+                "broker_order_id": result.broker_order_id,
+            })
 
         # ── Telegram alert ────────────────────────────────────────────────────
         await self._send_trade_alert(signal, result, decision, price, flow=flow)
 
         # ── Persist to Postgres ───────────────────────────────────────────────
         await self._save_trade(signal, order, result, decision, price)
+
+        # ── Step 12: Persist execution quality row ────────────────────────────
+        await self._save_execution_quality(
+            signal=signal,
+            order=order,
+            result=result,
+            entry_check=entry_check,
+            decision=decision,
+            atr_14=atr_14,
+            policy=policy,
+            spread_pct=spread_pct,
+            submit_time=submit_time,
+        )
 
         # ── Emit to trades.executed ───────────────────────────────────────────
         if result.status not in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
@@ -356,9 +586,14 @@ class ExecutionEngine(BaseConsumer):
                 "ticker": ticker,
                 "direction": direction,
                 "qty": order.qty,
+                "qty_filled": result.qty_filled,
                 "entry_price": price,
+                "avg_fill_price": result.avg_fill_price,
                 "take_profit": decision.take_profit,
                 "stop_loss": decision.stop_loss,
+                "stop_type": decision.stop_type,
+                "atr_14": atr_14,
+                "order_type": order_type_str,
                 "conviction": signal.conviction,
                 "broker": self._broker.name,
                 "status": result.status.value,

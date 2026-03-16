@@ -1,5 +1,5 @@
 """
-Position Monitor — watches all open positions every 30s.
+Position Monitor — watches all open positions every 30s (v1.11).
 
 Actions:
   - Detects stop-loss breach → close position
@@ -7,18 +7,27 @@ Actions:
   - Time stop: exit if decay window expired and still not moving
   - Trailing stop: lock in profits as position moves in our favor
   - Sends P&L alerts on close
+
+v1.11 additions:
+  - _recover_from_db()   : on startup, re-register positions from trade table
+  - _persist_close()     : write exit_price/close_reason/closed_at to trade row
+  - start_trade_stream() : optional WebSocket fill stream (broker must support it)
 """
 from __future__ import annotations
 
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import httpx
 
 from app.config import settings
 from app.execution.base_broker import BaseBroker, OrderStatus, Position
+
+
+if TYPE_CHECKING:
+    import asyncpg
 
 
 def _log(level: str, event: str, **kw) -> None:
@@ -27,44 +36,193 @@ def _log(level: str, event: str, **kw) -> None:
     print(json.dumps(entry), flush=True)
 
 
-POLL_INTERVAL = 30   # seconds
+POLL_INTERVAL = 30   # seconds (overridden by settings.position_monitor_poll_interval_seconds)
 
 
 class PositionMonitor:
 
-    def __init__(self, broker: BaseBroker) -> None:
+    def __init__(self, broker: BaseBroker, db=None) -> None:
+        """
+        Parameters
+        ----------
+        broker : BaseBroker implementation
+        db     : asyncpg connection pool (optional — used for DB recovery and persist_close)
+        """
         self._broker = broker
+        self._db = db          # asyncpg pool; None = no DB persistence
         self._running = False
         self._http: httpx.AsyncClient | None = None
         self._telegram_token = settings.telegram_bot_token
         self._telegram_chat = settings.telegram_chat_id
+        self._stream_task: asyncio.Task | None = None
 
         # In-memory tracking: ticker → metadata from execution engine
         self._position_meta: dict[str, dict] = {}
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         self._running = True
         self._http = httpx.AsyncClient(timeout=10.0)
         _log("info", "position_monitor.started", broker=self._broker.name)
 
+        # v1.11: recover open positions from DB before first poll
+        await self._recover_from_db()
+
+        # v1.11: start trade stream if broker supports it and config enables it
+        stream_enabled = getattr(settings, "position_monitor_stream_enabled", True)
+        if stream_enabled and hasattr(self._broker, "start_trade_stream"):
+            self._stream_task = asyncio.create_task(self._run_trade_stream())
+
+        poll_interval = getattr(
+            settings, "position_monitor_poll_interval_seconds", POLL_INTERVAL)
+
         while self._running:
             try:
                 await self._check_all()
             except Exception as e:
                 _log("error", "position_monitor.check_error", error=str(e))
-            await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(poll_interval)
 
     def stop(self) -> None:
         self._running = False
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+
+    # ── Registration ──────────────────────────────────────────────────────────
 
     def register_position(self, ticker: str, meta: dict) -> None:
-        """Called by execution engine after order fills."""
+        """
+        Called by execution engine after a confirmed fill.
+        Overwrites any existing meta for this ticker (handles duplicate fills).
+        """
         self._position_meta[ticker] = {
             **meta,
             "registered_at": datetime.now(timezone.utc).isoformat(),
             "trailing_stop": meta.get("stop_loss"),
         }
         _log("info", "position_monitor.registered", ticker=ticker)
+
+    # ── DB recovery (v1.11) ───────────────────────────────────────────────────
+
+    async def _recover_from_db(self) -> None:
+        """
+        On startup, reload open positions from the trade table so positions
+        survive engine restarts.  Requires a DB pool to be provided.
+        """
+        if not self._db:
+            return
+        try:
+            rows = await self._db.fetch(
+                """
+                SELECT ticker, entry_price, take_profit_price, stop_loss_price,
+                       decay_minutes, broker_order_id
+                FROM   trade
+                WHERE  closed_at IS NULL
+                  AND  entry_price IS NOT NULL
+                """
+            )
+            for row in rows:
+                ticker = row["ticker"]
+                if ticker not in self._position_meta:
+                    meta = {
+                        "entry_price":     row["entry_price"],
+                        "take_profit":     row["take_profit_price"],
+                        "stop_loss":       row["stop_loss_price"],
+                        "decay_minutes":   row["decay_minutes"],
+                        "broker_order_id": row["broker_order_id"],
+                    }
+                    self.register_position(ticker, meta)
+                    _log("info", "position_monitor.recovered", ticker=ticker)
+            _log("info", "position_monitor.db_recovery_done", count=len(rows))
+        except Exception as e:
+            _log("warning", "position_monitor.db_recovery_error", error=str(e))
+            # Non-fatal — fall through to polling without pre-loaded state
+
+    # ── Persist close (v1.11) ─────────────────────────────────────────────────
+
+    async def _persist_close(
+        self,
+        ticker: str,
+        reason: str,
+        exit_price: float,
+        realized_pnl: float,
+    ) -> None:
+        """
+        Write exit data to the open trade row in the database.
+        UPDATE trade SET exit_price, close_reason, realized_pnl, closed_at
+        WHERE ticker = X AND closed_at IS NULL
+        """
+        if not self._db:
+            return
+        try:
+            await self._db.execute(
+                """
+                UPDATE trade
+                SET    exit_price   = $1,
+                       close_reason = $2,
+                       realized_pnl = $3,
+                       closed_at    = NOW()
+                WHERE  ticker     = $4
+                  AND  closed_at  IS NULL
+                """,
+                exit_price,
+                reason,
+                realized_pnl,
+                ticker,
+            )
+            _log("info", "position_monitor.close_persisted",
+                 ticker=ticker, reason=reason,
+                 exit_price=exit_price, realized_pnl=round(realized_pnl, 2))
+        except Exception as e:
+            _log("warning", "position_monitor.persist_close_error",
+                 ticker=ticker, error=str(e))
+
+    # ── Trade stream (v1.11) ──────────────────────────────────────────────────
+
+    async def _run_trade_stream(self) -> None:
+        """
+        Start the broker's trade stream as a background task.
+        Falls back silently to polling-only if streaming is unsupported.
+        """
+        try:
+            _log("info", "position_monitor.stream_starting",
+                 broker=self._broker.name)
+            await self._broker.start_trade_stream(self._on_trade_update)
+        except NotImplementedError:
+            _log("info", "position_monitor.stream_not_supported",
+                 broker=self._broker.name,
+                 note="falling back to polling only")
+        except asyncio.CancelledError:
+            _log("info", "position_monitor.stream_cancelled")
+        except Exception as e:
+            _log("warning", "position_monitor.stream_error",
+                 broker=self._broker.name, error=str(e),
+                 note="falling back to polling only")
+
+    async def _on_trade_update(self, event: dict) -> None:
+        """
+        Callback invoked by the trade stream for fill / partial / cancel events.
+        """
+        ev_type = event.get("event", "")
+        ticker  = event.get("symbol", "")
+        broker_order_id = event.get("broker_order_id", "")
+
+        if ev_type in ("fill", "partial_fill"):
+            _log("info", "position_monitor.stream_fill",
+                 ticker=ticker,
+                 broker_order_id=broker_order_id,
+                 qty_filled=event.get("qty_filled"),
+                 avg_price=event.get("avg_fill_price"))
+
+        elif ev_type == "canceled":
+            # Remove meta so the cancelled order doesn't trigger spurious stops
+            removed = self._position_meta.pop(ticker, None)
+            if removed:
+                _log("info", "position_monitor.stream_cancelled_removed",
+                     ticker=ticker, broker_order_id=broker_order_id)
+
+    # ── Polling logic ─────────────────────────────────────────────────────────
 
     async def _check_all(self) -> None:
         positions = await self._broker.get_positions()
@@ -139,7 +297,9 @@ class PositionMonitor:
         if decay_minutes and registered_at:
             try:
                 entered = datetime.fromisoformat(registered_at)
-                elapsed = (datetime.now(timezone.utc) - entered).seconds / 60
+                if entered.tzinfo is None:
+                    entered = entered.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - entered).total_seconds() / 60
                 # Exit if 2x decay window elapsed and position not profitable
                 if elapsed > (decay_minutes * 2) and position.unrealized_pnl <= 0:
                     _log("info", "position_monitor.time_stop",
@@ -174,6 +334,7 @@ class PositionMonitor:
 
         pnl = position.unrealized_pnl
         pnl_pct = position.unrealized_pnl_pct
+        exit_price = trigger_price
 
         _log("info", "position_monitor.closed",
              ticker=ticker,
@@ -181,6 +342,9 @@ class PositionMonitor:
              pnl=round(pnl, 2),
              pnl_pct=round(pnl_pct, 2),
              broker_order_id=result.broker_order_id)
+
+        # v1.11: persist close to DB
+        await self._persist_close(ticker, reason, exit_price, pnl)
 
         # Telegram alert
         await self._send_close_alert(position, reason, pnl, pnl_pct)

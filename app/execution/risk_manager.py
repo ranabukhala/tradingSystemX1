@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from app.execution.base_broker import AccountInfo, BaseBroker, OrderRequest, OrderSide, OrderType, Position
+from app.execution.base_broker import AccountInfo, BaseBroker, OrderRequest, OrderSide, OrderType, Position, TimeInForce
 
 
 def _log(level: str, event: str, **kw) -> None:
@@ -74,12 +74,57 @@ class RiskDecision:
     stop_loss: float | None = None
     position_value: float = 0.0
     risk_reward: float = 0.0
+    # v1.11 ATR stop fields
+    stop_type: str = "fixed_pct"          # "atr" | "fixed_pct"
+    atr_14: float | None = None           # ATR(14) used for stop calculation
 
 
 class RiskManager:
 
     def __init__(self, config: RiskConfig | None = None) -> None:
         self.config = config or RiskConfig.from_env()
+
+    def compute_atr_stops(
+        self,
+        price: float,
+        direction: str,
+        atr_14: float | None,
+        sl_mult: float | None = None,
+        tp_mult: float | None = None,
+    ) -> tuple[float | None, float | None]:
+        """
+        Compute (take_profit, stop_loss) using ATR-based stops.
+
+        Returns (take_profit, stop_loss) rounded to 2 decimal places.
+        Falls back to fixed-% calculation if atr_14 is None or zero.
+
+        sl_mult defaults to config.risk_atr_sl_multiplier (env: RISK_ATR_SL_MULTIPLIER)
+        tp_mult defaults to config.risk_atr_tp_multiplier (env: RISK_ATR_TP_MULTIPLIER)
+        """
+        _sl_mult = sl_mult if sl_mult is not None else float(
+            os.environ.get("RISK_ATR_SL_MULTIPLIER", "2.0"))
+        _tp_mult = tp_mult if tp_mult is not None else float(
+            os.environ.get("RISK_ATR_TP_MULTIPLIER", "4.0"))
+
+        if not atr_14 or atr_14 <= 0 or price <= 0:
+            # Fall back to fixed percentage
+            sl_pct = self.config.default_stop_loss_pct
+            tp_pct = self.config.default_take_profit_pct
+            if direction == "long":
+                return (round(price * (1 + tp_pct), 2),
+                        round(price * (1 - sl_pct), 2))
+            else:
+                return (round(price * (1 - tp_pct), 2),
+                        round(price * (1 + sl_pct), 2))
+
+        if direction == "long":
+            take_profit = round(price + atr_14 * _tp_mult, 2)
+            stop_loss   = round(price - atr_14 * _sl_mult, 2)
+        else:
+            take_profit = round(price - atr_14 * _tp_mult, 2)
+            stop_loss   = round(price + atr_14 * _sl_mult, 2)
+
+        return take_profit, stop_loss
 
     async def evaluate(
         self,
@@ -91,6 +136,7 @@ class RiskManager:
         open_positions: list[Position],
         session_context: str = "intraday",
         decay_minutes: int | None = None,
+        atr_14: float | None = None,     # v1.11: ATR(14) for volatility-aware stops
     ) -> RiskDecision:
         """
         Full risk evaluation. Returns RiskDecision with approved=True/False.
@@ -169,27 +215,35 @@ class RiskManager:
         # ── 8. TP/SL calculation ──────────────────────────────────────────────
         take_profit = None
         stop_loss = None
+        stop_type = "fixed_pct"
 
         if self.config.use_bracket_orders:
-            tp_pct = self.config.default_take_profit_pct
-            sl_pct = self.config.default_stop_loss_pct
-
-            # Scale TP by conviction and decay: high conviction = wider TP
-            if conviction >= 0.8:
-                tp_pct *= 1.5
-            elif conviction >= 0.6:
-                tp_pct *= 1.2
-
-            # Tighter stop for premarket (more volatile)
-            if session_context == "premarket":
-                sl_pct *= 0.8
-
-            if direction == "long":
-                take_profit = round(current_price * (1 + tp_pct), 2)
-                stop_loss   = round(current_price * (1 - sl_pct), 2)
+            if atr_14 and atr_14 > 0:
+                # v1.11: ATR-based stops
+                take_profit, stop_loss = self.compute_atr_stops(
+                    current_price, direction, atr_14)
+                stop_type = "atr"
             else:
-                take_profit = round(current_price * (1 - tp_pct), 2)
-                stop_loss   = round(current_price * (1 + sl_pct), 2)
+                # Legacy fixed-percentage stops
+                tp_pct = self.config.default_take_profit_pct
+                sl_pct = self.config.default_stop_loss_pct
+
+                # Scale TP by conviction and decay: high conviction = wider TP
+                if conviction >= 0.8:
+                    tp_pct *= 1.5
+                elif conviction >= 0.6:
+                    tp_pct *= 1.2
+
+                # Tighter stop for premarket (more volatile)
+                if session_context == "premarket":
+                    sl_pct *= 0.8
+
+                if direction == "long":
+                    take_profit = round(current_price * (1 + tp_pct), 2)
+                    stop_loss   = round(current_price * (1 - sl_pct), 2)
+                else:
+                    take_profit = round(current_price * (1 - tp_pct), 2)
+                    stop_loss   = round(current_price * (1 + sl_pct), 2)
 
         risk_reward = (
             abs(take_profit - current_price) / abs(current_price - stop_loss)
@@ -205,6 +259,8 @@ class RiskManager:
              entry=current_price,
              tp=take_profit,
              sl=stop_loss,
+             stop_type=stop_type,
+             atr_14=atr_14,
              position_value=round(position_value, 2),
              rr=round(risk_reward, 2))
 
@@ -217,6 +273,8 @@ class RiskManager:
             stop_loss=stop_loss,
             position_value=round(qty * current_price, 2),
             risk_reward=round(risk_reward, 2),
+            stop_type=stop_type,
+            atr_14=atr_14,
         )
 
     def build_order(
@@ -225,15 +283,44 @@ class RiskManager:
         direction: str,
         decision: RiskDecision,
         signal_id: str = "",
+        order_type_str: str = "market",   # v1.11: from OrderTypePolicy
+        limit_price: float | None = None, # v1.11: pre-computed limit price
+        time_in_force: str = "day",       # v1.11: from OrderTypePolicy
     ) -> OrderRequest:
-        """Build OrderRequest from approved RiskDecision."""
+        """
+        Build OrderRequest from approved RiskDecision.
+
+        v1.11: order_type_str / limit_price / time_in_force come from
+        OrderTypePolicy and are passed in by the execution engine.
+        """
         side = OrderSide.BUY if direction == "long" else OrderSide.SELL
+
+        # Map policy order type string to OrderType enum
+        _ot_map = {
+            "market":    OrderType.MARKET,
+            "limit":     OrderType.LIMIT,
+            "limit_ioc": OrderType.LIMIT,  # IOC is a time_in_force, not a separate type
+        }
+        order_type = _ot_map.get(order_type_str, OrderType.MARKET)
+
+        # Map time_in_force string to enum
+        _tif_map = {
+            "day": TimeInForce.DAY,
+            "gtc": TimeInForce.GTC,
+            "ioc": TimeInForce.IOC,
+            "fok": TimeInForce.FOK,
+        }
+        tif = _tif_map.get(time_in_force, TimeInForce.DAY)
+        if order_type_str == "limit_ioc":
+            tif = TimeInForce.IOC
 
         return OrderRequest(
             ticker=ticker,
             side=side,
             qty=decision.qty,
-            order_type=OrderType.MARKET,
+            order_type=order_type,
+            limit_price=limit_price,
+            time_in_force=tif,
             take_profit_price=decision.take_profit if self.config.use_bracket_orders else None,
             stop_loss_price=decision.stop_loss if self.config.use_bracket_orders else None,
             signal_id=signal_id,

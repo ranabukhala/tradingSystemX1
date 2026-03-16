@@ -274,8 +274,16 @@ class IBKRBroker(BaseBroker):
         return await self.submit_order(order)
 
     async def get_quote(self, ticker: str) -> float:
+        price, _ = await self.get_quote_with_timestamp(ticker)
+        return price
+
+    async def get_quote_with_timestamp(self, ticker: str) -> tuple[float, datetime]:
+        """
+        Fetch latest price + UTC timestamp via ib_insync reqTickersAsync.
+        Returns (price, utc_datetime) — datetime is always offset-aware.
+        """
         if not self._connected:
-            return 0.0
+            return 0.0, datetime.now(timezone.utc)
         try:
             from ib_insync import Stock
             contract = Stock(ticker, "SMART", "USD")
@@ -285,12 +293,132 @@ class IBKRBroker(BaseBroker):
                 t = tickers[0]
                 # Use last trade price, fall back to midpoint
                 if t.last and t.last > 0:
-                    return float(t.last)
+                    return float(t.last), datetime.now(timezone.utc)
                 if t.bid and t.ask and t.bid > 0:
-                    return float((t.bid + t.ask) / 2)
+                    return float((t.bid + t.ask) / 2), datetime.now(timezone.utc)
         except Exception as e:
             _log("warning", "ibkr.quote_error", ticker=ticker, error=str(e))
-        return 0.0
+        return 0.0, datetime.now(timezone.utc)
+
+    async def get_halted(self, ticker: str) -> bool:
+        """
+        Check whether the exchange has halted trading for `ticker`.
+        Uses reqTickersAsync → Ticker.halted field (1=halted, 0=active).
+        Fails open (returns False) on any error.
+        """
+        if not self._connected:
+            return False
+        try:
+            from ib_insync import Stock
+            contract = Stock(ticker, "SMART", "USD")
+            await self._ib.qualifyContractsAsync(contract)
+            tickers = await self._ib.reqTickersAsync(contract)
+            if tickers:
+                halted = getattr(tickers[0], "halted", 0)
+                return halted == 1
+        except Exception as e:
+            _log("warning", "ibkr.halt_check_error", ticker=ticker, error=str(e))
+        return False  # fail-open
+
+    async def get_order(self, broker_order_id: str) -> "OrderResult":
+        """
+        Fetch current order status by scanning ib_insync in-memory trades list.
+        No extra API call needed — ib_insync maintains all open trades.
+        """
+        if not self._connected:
+            return OrderResult(
+                broker_order_id=broker_order_id,
+                status=OrderStatus.PENDING,
+                error="ibkr_not_connected",
+            )
+        try:
+            trades = self._ib.trades()
+            for trade in trades:
+                if str(trade.order.orderId) == broker_order_id:
+                    os = trade.orderStatus
+                    return OrderResult(
+                        broker_order_id=broker_order_id,
+                        ticker=trade.contract.symbol,
+                        side=(OrderSide.BUY
+                              if trade.order.action == "BUY" else OrderSide.SELL),
+                        qty_requested=float(trade.order.totalQuantity),
+                        qty_filled=float(os.filled),
+                        avg_fill_price=float(os.avgFillPrice or 0),
+                        status=self._parse_status(os.status),
+                        submitted_at=datetime.now(timezone.utc),
+                        raw={"status": os.status, "order_id": broker_order_id},
+                    )
+        except Exception as e:
+            _log("warning", "ibkr.get_order_error",
+                 broker_order_id=broker_order_id, error=str(e))
+        return OrderResult(
+            broker_order_id=broker_order_id,
+            status=OrderStatus.PENDING,
+            error="order_not_found",
+        )
+
+    async def start_trade_stream(self, callback) -> None:
+        """
+        Subscribe to ib_insync order status and execution detail events.
+        `callback` is called with a dict for each fill/cancel event.
+        ib_insync events are synchronous; wrapped via call_soon_threadsafe.
+        Runs as a background coroutine that never returns normally.
+        """
+        if not self._connected:
+            raise ConnectionError("IBKR not connected; cannot start trade stream")
+
+        loop = asyncio.get_event_loop()
+
+        def _on_exec_details(trade, fill) -> None:
+            """Called on execution (fill)."""
+            try:
+                data = {
+                    "event":           "fill",
+                    "symbol":          trade.contract.symbol,
+                    "broker_order_id": str(trade.order.orderId),
+                    "qty_filled":      float(fill.execution.shares),
+                    "avg_fill_price":  float(fill.execution.price),
+                    "status":          "filled",
+                    "timestamp":       fill.execution.time,
+                }
+                loop.call_soon_threadsafe(
+                    loop.create_task, callback(data)
+                )
+            except Exception as e:
+                _log("warning", "ibkr.stream_fill_error", error=str(e))
+
+        def _on_order_status(trade) -> None:
+            """Called on order status change (includes cancellations)."""
+            try:
+                status = trade.orderStatus.status
+                if status in ("Cancelled", "Inactive"):
+                    data = {
+                        "event":           "canceled",
+                        "symbol":          trade.contract.symbol,
+                        "broker_order_id": str(trade.order.orderId),
+                        "qty_filled":      float(trade.orderStatus.filled),
+                        "avg_fill_price":  float(trade.orderStatus.avgFillPrice or 0),
+                        "status":          status.lower(),
+                        "timestamp":       datetime.now(timezone.utc).isoformat(),
+                    }
+                    loop.call_soon_threadsafe(
+                        loop.create_task, callback(data)
+                    )
+            except Exception as e:
+                _log("warning", "ibkr.stream_cancel_error", error=str(e))
+
+        self._ib.execDetailsEvent += _on_exec_details
+        self._ib.orderStatusEvent += _on_order_status
+        _log("info", "ibkr.trade_stream_started")
+
+        # Keep the coroutine alive — ib_insync drives events via its own loop
+        try:
+            while self._connected:
+                await asyncio.sleep(5)
+        finally:
+            self._ib.execDetailsEvent -= _on_exec_details
+            self._ib.orderStatusEvent -= _on_order_status
+            _log("info", "ibkr.trade_stream_stopped")
 
     async def is_market_open(self) -> bool:
         if not self._connected:

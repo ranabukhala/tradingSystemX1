@@ -233,22 +233,143 @@ class AlpacaBroker(BaseBroker):
             return OrderResult(ticker=ticker, status=OrderStatus.REJECTED, error=str(e))
 
     async def get_quote(self, ticker: str) -> float:
+        price, _ = await self.get_quote_with_timestamp(ticker)
+        return price
+
+    async def get_quote_with_timestamp(self, ticker: str) -> tuple[float, datetime]:
+        """
+        Fetch latest trade price plus the exchange trade timestamp.
+        Falls back to bar close if trade endpoint unavailable.
+        Returns (price, utc_datetime) — datetime is always offset-aware.
+        """
         try:
             resp = await self._data_http.get(
                 f"/v2/stocks/{ticker}/trades/latest"
             )
             if resp.status_code == 200:
-                return float(resp.json()["trade"]["p"])
+                d = resp.json()
+                price = float(d["trade"]["p"])
+                # "t" is ISO-8601 with offset, e.g. "2024-01-05T14:32:01.123Z"
+                ts_raw = d["trade"].get("t", "")
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    ts = datetime.now(timezone.utc)
+                return price, ts
             # Fallback to latest bar
             resp = await self._data_http.get(
                 f"/v2/stocks/{ticker}/bars/latest",
                 params={"feed": "iex"},
             )
             if resp.status_code == 200:
-                return float(resp.json()["bar"]["c"])
+                price = float(resp.json()["bar"]["c"])
+                return price, datetime.now(timezone.utc)
         except Exception as e:
             _log("warning", "alpaca.quote_error", ticker=ticker, error=str(e))
-        return 0.0
+        return 0.0, datetime.now(timezone.utc)
+
+    async def get_halted(self, ticker: str) -> bool:
+        """
+        Check whether the exchange has halted trading for `ticker`.
+        Uses GET /v2/assets/{symbol} → {"tradable": false} means halted.
+        Fails open (returns False) on any error.
+        """
+        try:
+            resp = await self._http.get(f"/v2/assets/{ticker}")
+            if resp.status_code == 200:
+                asset = resp.json()
+                # tradable=False means the asset is currently un-tradable / halted
+                return not bool(asset.get("tradable", True))
+        except Exception as e:
+            _log("warning", "alpaca.halt_check_error", ticker=ticker, error=str(e))
+        return False  # fail-open
+
+    async def get_order(self, broker_order_id: str) -> "OrderResult":
+        """
+        Fetch current order status by Alpaca order ID.
+        GET /v2/orders/{order_id} → filled_qty, filled_avg_price, status.
+        """
+        try:
+            resp = await self._http.get(f"/v2/orders/{broker_order_id}")
+            if resp.status_code == 200:
+                d = resp.json()
+                filled_at_raw = d.get("filled_at")
+                filled_at = None
+                if filled_at_raw:
+                    try:
+                        filled_at = datetime.fromisoformat(
+                            filled_at_raw.replace("Z", "+00:00")
+                        )
+                    except Exception:
+                        pass
+                return OrderResult(
+                    broker_order_id=broker_order_id,
+                    ticker=d.get("symbol", ""),
+                    side=OrderSide.BUY if d.get("side") == "buy" else OrderSide.SELL,
+                    qty_requested=float(d.get("qty", 0) or 0),
+                    qty_filled=float(d.get("filled_qty", 0) or 0),
+                    avg_fill_price=float(d.get("filled_avg_price") or 0),
+                    status=self._parse_status(d.get("status", "")),
+                    submitted_at=datetime.now(timezone.utc),
+                    filled_at=filled_at,
+                    raw=d,
+                )
+        except Exception as e:
+            _log("warning", "alpaca.get_order_error",
+                 broker_order_id=broker_order_id, error=str(e))
+        # Return last-known PENDING on error
+        return OrderResult(
+            broker_order_id=broker_order_id,
+            status=OrderStatus.PENDING,
+            error="get_order_failed",
+        )
+
+    async def start_trade_stream(self, callback) -> None:
+        """
+        Start Alpaca WebSocket trade update stream via alpaca-py TradingStream.
+        `callback` is called with a dict for each fill/partial/cancel event.
+        Runs indefinitely — caller should wrap in asyncio.create_task().
+
+        Requires: alpaca-py>=0.8.2  (pip install alpaca-py)
+        """
+        try:
+            from alpaca.trading.stream import TradingStream
+
+            stream = TradingStream(
+                api_key=self._api_key,
+                secret_key=self._secret_key,
+                paper=self.paper,
+            )
+
+            async def _handler(update) -> None:
+                try:
+                    event = update.event  # "fill" | "partial_fill" | "canceled" | ...
+                    order = update.order
+                    await callback({
+                        "event":            event,
+                        "symbol":           order.symbol,
+                        "broker_order_id":  str(order.id),
+                        "qty_filled":       float(order.filled_qty or 0),
+                        "avg_fill_price":   float(order.filled_avg_price or 0),
+                        "status":           order.status,
+                        "timestamp":        str(update.timestamp),
+                    })
+                except Exception as e:
+                    _log("warning", "alpaca.stream_handler_error", error=str(e))
+
+            stream.subscribe_trade_updates(_handler)
+            _log("info", "alpaca.trade_stream_starting", paper=self.paper)
+            await stream._run_forever()
+
+        except ImportError:
+            _log("warning", "alpaca.trade_stream_unavailable",
+                 note="alpaca-py not installed; falling back to polling")
+            raise NotImplementedError("alpaca-py not installed")
+        except Exception as e:
+            _log("error", "alpaca.trade_stream_error", error=str(e))
+            raise
 
     async def get_order_flow_context(self, ticker: str, current_price: float) -> dict:
         """

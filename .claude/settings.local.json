@@ -127,7 +127,9 @@
       "Bash(python -m pytest tests/ -v --ignore=tests/test_catalyst_policy.py --ignore=tests/test_schemas.py)",
       "Bash(python -m pytest tests/test_portfolio_risk.py -v)",
       "Bash(python -m pytest tests/test_conviction_features.py tests/test_catalyst_policy.py -v)",
-      "Bash(python -m pytest tests/test_portfolio_risk.py tests/test_conviction_features.py tests/test_catalyst_policy.py -v --tb=short)"
+      "Bash(python -m pytest tests/test_portfolio_risk.py tests/test_conviction_features.py tests/test_catalyst_policy.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_execution_upgrade.py -v)",
+      "Bash(python -m pytest tests/test_portfolio_risk.py tests/test_catalyst_policy.py tests/test_conviction_features.py tests/test_execution_upgrade.py -v --tb=short)"
     ]
   }
 }

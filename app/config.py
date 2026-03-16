@@ -300,6 +300,58 @@ class Settings(BaseSettings):
     # Position / account cache TTL inside the risk service
     risk_position_cache_ttl_seconds: int = 30
 
+    # ── Execution Quality (v1.11) ──────────────────────────────────────────────
+    # EntryValidator — pre-entry safety checks
+    entry_max_quote_age_seconds: float = 10.0        # Reject if quote older than this
+    entry_max_price_drift_pct: float = 1.5           # Reject if price moved >1.5% since signal
+    entry_halt_check_enabled: bool = True            # Set False to skip halt detection
+
+    # OrderTypePolicy — ADV tier thresholds
+    order_adv_liquid_threshold: int = 5_000_000      # ADV ≥ this → "liquid" tier
+    order_adv_thin_threshold:   int = 500_000        # ADV < this → "thin" tier
+
+    # Per-catalyst, per-ADV-tier order type  (market | limit | limit_ioc)
+    order_policy_earnings_liquid_type:     str = "market"
+    order_policy_earnings_normal_type:     str = "limit_ioc"
+    order_policy_earnings_thin_type:       str = "limit"
+    order_policy_analyst_liquid_type:      str = "limit"
+    order_policy_analyst_normal_type:      str = "limit"
+    order_policy_analyst_thin_type:        str = "limit"
+    order_policy_ma_liquid_type:           str = "market"
+    order_policy_ma_normal_type:           str = "limit_ioc"
+    order_policy_ma_thin_type:             str = "limit"
+    order_policy_regulatory_liquid_type:   str = "market"
+    order_policy_regulatory_normal_type:   str = "limit_ioc"
+    order_policy_regulatory_thin_type:     str = "limit_ioc"
+    order_policy_macro_liquid_type:        str = "market"
+    order_policy_macro_normal_type:        str = "market"
+    order_policy_macro_thin_type:          str = "limit"
+    order_policy_default_type:             str = "limit"
+
+    # Limit price slippage tolerance — how far above ask (long) / below bid (short)
+    order_limit_slippage_liquid_pct: float = 0.05    # 0.05% for liquid tickers
+    order_limit_slippage_normal_pct: float = 0.15    # 0.15% for normal
+    order_limit_slippage_thin_pct:   float = 0.30    # 0.30% for thin
+
+    # FillPoller — partial fill handling
+    fill_poll_interval_seconds: float = 2.0          # Poll every N seconds
+    fill_poll_max_attempts: int = 15                 # Give up after 15 polls (30 s)
+    fill_min_partial_pct: float = 0.80               # Accept ≥80% partial fill
+
+    # ATR-based stops
+    risk_atr_sl_multiplier: float = 2.0              # SL = entry ± ATR × multiplier
+    risk_atr_tp_multiplier: float = 4.0              # TP = entry ± ATR × multiplier (2:1 R:R)
+
+    # Stock context service URL (shared with pretrade filter)
+    stock_context_url: str = "http://stock_context:8082"
+
+    # Position monitor
+    position_monitor_stream_enabled: bool = True
+    position_monitor_poll_interval_seconds: int = 30
+
+    # Execution quality row persistence
+    execution_quality_enabled: bool = True
+
     # ── Idempotency backend ───────────────────────────────────
     # "redis"  — async SET NX EX (atomic, cross-instance, default)
     # "sqlite" — sync WAL-mode SQLite (single-container fallback / rollback path)
