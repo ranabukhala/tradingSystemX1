@@ -116,10 +116,8 @@ class PreTradeFilterService(BaseConsumer):
             _log("warning", "pretrade_filter.missing_env",
                  var="TRADIER_API_KEY",
                  impact="Options flow will fall back to Polygon only")
-        if not os.environ.get("IEX_API_KEY"):
-            _log("warning", "pretrade_filter.missing_env",
-                 var="IEX_API_KEY",
-                 impact="Squeeze filter will fall back to Finviz scrape")
+        # IEX Cloud shut down Aug 2024. Squeeze filter uses Polygon as sole source.
+        # No env var check needed.
 
         _log("info", "pretrade_filter.ready")
 

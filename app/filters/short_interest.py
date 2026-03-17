@@ -206,7 +206,13 @@ async def _get_short_data(
 
 
 async def _try_polygon_short(ticker: str, http: httpx.AsyncClient) -> dict | None:
-    """Polygon short interest from regulatory filings (bi-monthly FINRA data)."""
+    """Polygon short interest from regulatory filings (bi-monthly FINRA data).
+
+    NOTE: The /v3/trades/{ticker}/short-interest endpoint returns 404 on the current
+    Polygon plan (Starter tier). FINRA short interest data requires a higher-tier
+    subscription. The function is preserved for when the plan is upgraded — it will
+    begin returning data automatically. Until then, returns None silently.
+    """
     api_key = os.environ.get("POLYGON_API_KEY", "")
     if not api_key:
         return None
@@ -236,8 +242,11 @@ async def _try_polygon_short(ticker: str, http: httpx.AsyncClient) -> dict | Non
                      ticker=ticker,
                      note="No short interest filings found — ticker may be too new or small")
         else:
-            _log("warning", "squeeze_filter.polygon_short_error",
-                 ticker=ticker, status=resp.status_code)
+            # 404 = endpoint not available on current plan; log at debug, not warning,
+            # to avoid flooding logs every cycle for every ticker.
+            _log("debug", "squeeze_filter.polygon_short_unavailable",
+                 ticker=ticker, status=resp.status_code,
+                 note="FINRA short interest requires higher Polygon tier")
     except Exception as e:
         _log("warning", "squeeze_filter.polygon_short_exception",
              ticker=ticker, error=str(e))
