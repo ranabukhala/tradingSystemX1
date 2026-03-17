@@ -148,6 +148,18 @@ class AlpacaBroker(BaseBroker):
             if order.stop_price:
                 payload["stop_price"] = str(round(order.stop_price, 2))
 
+        # Extended hours trading (premarket 4 AM–9:30 AM / afterhours 4 PM–8 PM ET).
+        # Alpaca requirements: extended_hours=true AND time_in_force=day.
+        # Only supported for MARKET and LIMIT order types — not STOP or STOP_LIMIT.
+        # Bracket orders are incompatible with extended_hours (Alpaca rejects them).
+        if getattr(order, "extended_hours", False):
+            if order.order_type in (OrderType.MARKET, OrderType.LIMIT):
+                if not (order.take_profit_price or order.stop_loss_price):
+                    payload["extended_hours"] = True
+                    payload["time_in_force"]  = "day"   # Required by Alpaca for ext. hours
+                    _log("info", "alpaca.extended_hours_enabled",
+                         ticker=order.ticker, order_type=order.order_type.value)
+
         # Bracket order (take profit + stop loss attached)
         if order.take_profit_price or order.stop_loss_price:
             payload["order_class"] = "bracket"

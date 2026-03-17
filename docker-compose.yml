@@ -924,6 +924,15 @@ services:
       MARKET_OPEN_MIN:   ${MARKET_OPEN_MIN:-0}
       MARKET_CLOSE_HOUR: ${MARKET_CLOSE_HOUR:-16}
       MARKET_CLOSE_MIN:  ${MARKET_CLOSE_MIN:-30}
+      # Earnings-window: keep services running around BMO/AMC earnings events.
+      EARNINGS_WINDOW_BEFORE_MIN: ${EARNINGS_WINDOW_BEFORE_MIN:-90}
+      EARNINGS_WINDOW_AFTER_MIN:  ${EARNINGS_WINDOW_AFTER_MIN:-120}
+      # Postgres direct params for psycopg2 (scheduler can't use asyncpg URL).
+      POSTGRES_HOST:     postgres
+      POSTGRES_PORT:     "5432"
+      POSTGRES_USER:     ${POSTGRES_USER:-trading}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tradingpass}
+      POSTGRES_DB:       ${POSTGRES_DB:-trading_db}
     volumes:
       - ./app:/app/app                           # live code mount (from *connector)
       - ./config:/app/config                     # watchlist etc.  (from *connector)

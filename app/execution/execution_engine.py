@@ -22,6 +22,8 @@ import os
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+import pytz
+
 import httpx
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -504,6 +506,23 @@ class ExecutionEngine(BaseConsumer):
             limit_price=limit_price,
             time_in_force=time_in_force,
         )
+
+        # ── Step 9b: Flag extended hours if outside regular session ─────────────
+        # Regular session: 9:30 AM ET (570 min) to 4:00 PM ET (960 min).
+        # Premarket starts at 4:00 AM ET; afterhours ends at 8:00 PM ET.
+        # AlpacaBroker will add extended_hours=true + time_in_force=day when this
+        # flag is set, but only for MARKET/LIMIT orders without bracket legs.
+        _ET = pytz.timezone("America/New_York")
+        _now_et = datetime.now(timezone.utc).astimezone(_ET)
+        _cur_mins = _now_et.hour * 60 + _now_et.minute
+        _REGULAR_OPEN  = 9 * 60 + 30    # 570 — 9:30 AM ET
+        _REGULAR_CLOSE = 16 * 60        # 960 — 4:00 PM ET
+        if _cur_mins < _REGULAR_OPEN or _cur_mins >= _REGULAR_CLOSE:
+            order.extended_hours = True
+            _log("info", "execution.extended_hours_order",
+                 ticker=ticker,
+                 direction=direction,
+                 time_et=_now_et.strftime("%H:%M ET"))
 
         # ── Order event gate — prevent double-submission for same news event ──
         # Use signal.event_id (stable cross-vendor cluster identity, v1.9).

@@ -66,6 +66,9 @@ class OrderRequest:
     take_profit_price: float | None = None
     stop_loss_price: float | None = None
 
+    # Extended hours
+    extended_hours: bool = False   # True → submit with extended_hours=True for pre/post market
+
     # Metadata
     signal_id: str = ""
     strategy: str = "news_catalyst"

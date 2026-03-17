@@ -34,11 +34,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import docker
 import docker.errors
+import psycopg2
 import pytz
 
 # ── Timezone ───────────────────────────────────────────────────────────────────
@@ -54,6 +55,13 @@ OPEN_HOUR  = int(os.environ.get("MARKET_OPEN_HOUR",  "8"))
 OPEN_MIN   = int(os.environ.get("MARKET_OPEN_MIN",   "0"))
 CLOSE_HOUR = int(os.environ.get("MARKET_CLOSE_HOUR", "16"))
 CLOSE_MIN  = int(os.environ.get("MARKET_CLOSE_MIN",  "30"))
+
+# ── Earnings-window constants ───────────────────────────────────────────────────
+# Keep services running for BEFORE minutes before the expected report time
+# and AFTER minutes after it, even outside regular market hours.
+
+EARNINGS_WINDOW_BEFORE_MIN = int(os.environ.get("EARNINGS_WINDOW_BEFORE_MIN", "90"))
+EARNINGS_WINDOW_AFTER_MIN  = int(os.environ.get("EARNINGS_WINDOW_AFTER_MIN",  "120"))
 
 # ── Services under management ──────────────────────────────────────────────────
 # Listed in start order; stop order is the reverse.
@@ -83,6 +91,117 @@ NYSE_HOLIDAYS_2026: frozenset[date] = frozenset({
     date(2026, 12, 25),   # Christmas Day
 })
 
+# ── DB helper ──────────────────────────────────────────────────────────────────
+
+def _get_db_connection():
+    """
+    Synchronous psycopg2 connection for the scheduler.
+    Uses POSTGRES_* env vars; defaults match the project's docker-compose values.
+    Note: DATABASE_URL uses the asyncpg dialect (postgresql+asyncpg://) which
+    psycopg2 cannot parse — so we use separate params with sensible defaults.
+    """
+    host = os.environ.get("POSTGRES_HOST", "postgres")
+    return psycopg2.connect(
+        host=host,
+        port=int(os.environ.get("POSTGRES_PORT",     "5432")),
+        user=os.environ.get("POSTGRES_USER",     "trading"),
+        password=os.environ.get("POSTGRES_PASSWORD", "tradingpass"),
+        dbname=os.environ.get("POSTGRES_DB",       "trading_db"),
+    )
+
+
+# ── Earnings-window helper ──────────────────────────────────────────────────────
+
+def _in_earnings_window(dt_et: datetime) -> bool:
+    """
+    Return True if the current Eastern time falls within the configured window
+    around a scheduled earnings report.
+
+    Window logic:
+      - BMO reports: expected at 5:00 AM ET → window [5:00 - BEFORE, 5:00 + AFTER]
+      - AMC reports: expected at 4:10 PM ET → window [4:10 - BEFORE, 4:10 + AFTER]
+      - Unknown timing: skipped (can't compute window without timing)
+
+    Queries today + tomorrow to cover:
+      - AMC reports today that extend past 4:30 PM
+      - BMO reports tomorrow whose window starts tonight
+
+    Result is cached for 5 minutes to avoid a DB hit every 60-second tick.
+    Fails closed on any DB error (returns False — don't keep services up indefinitely).
+    """
+    # ── 5-minute in-process cache ────────────────────────────────────────────
+    cached_result: bool | None = getattr(_in_earnings_window, "_cache_result", None)
+    cached_ts: datetime | None = getattr(_in_earnings_window, "_cache_ts",    None)
+    if cached_result is not None and cached_ts is not None:
+        age = abs((dt_et.replace(tzinfo=None) - cached_ts.replace(tzinfo=None)).total_seconds())
+        if age < 300:
+            return cached_result
+
+    def _set_cache(value: bool) -> bool:
+        _in_earnings_window._cache_result = value
+        _in_earnings_window._cache_ts     = dt_et
+        return value
+
+    try:
+        conn = _get_db_connection()
+        cur  = conn.cursor()
+        today    = dt_et.date()
+        tomorrow = today + timedelta(days=1)
+
+        # Pull today's AND tomorrow's earnings with known timing
+        cur.execute("""
+            SELECT ticker, event_date, event_time
+            FROM event
+            WHERE event_type = 'earnings'
+              AND event_date::date IN (%s, %s)
+              AND lower(event_time) IN ('bmo', 'amc')
+        """, (today, tomorrow))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not rows:
+            return _set_cache(False)
+
+        for ticker, event_date, event_time in rows:
+            event_date_d = event_date.date() if hasattr(event_date, "date") else event_date
+            time_lower   = (event_time or "").lower()
+
+            if time_lower == "bmo":
+                # Conservative: expect report around 5:00 AM ET
+                report_dt = EASTERN.localize(
+                    datetime.combine(event_date_d, datetime.min.time().replace(hour=5, minute=0))
+                )
+            elif time_lower == "amc":
+                # Most AMC reports land 4:05–4:15 PM ET
+                report_dt = EASTERN.localize(
+                    datetime.combine(event_date_d, datetime.min.time().replace(hour=16, minute=10))
+                )
+            else:
+                continue
+
+            window_start = report_dt - timedelta(minutes=EARNINGS_WINDOW_BEFORE_MIN)
+            window_end   = report_dt + timedelta(minutes=EARNINGS_WINDOW_AFTER_MIN)
+
+            # Ensure dt_et is tz-aware for comparison
+            dt_et_aware = EASTERN.localize(dt_et) if dt_et.tzinfo is None else dt_et
+
+            if window_start <= dt_et_aware < window_end:
+                _log("info", "scheduler.earnings_window_active",
+                     ticker=ticker,
+                     event_time=event_time,
+                     report_et=report_dt.strftime("%Y-%m-%d %H:%M ET"),
+                     window_start=window_start.strftime("%H:%M ET"),
+                     window_end=window_end.strftime("%H:%M ET"))
+                return _set_cache(True)
+
+        return _set_cache(False)
+
+    except Exception as exc:
+        _log("warning", "scheduler.earnings_window_error", error=str(exc))
+        return False   # Fail closed — don't keep services running on DB errors
+
+
 # ── Logging ────────────────────────────────────────────────────────────────────
 
 def _log(level: str, event: str, **kw) -> None:
@@ -103,12 +222,23 @@ def _is_trading_day(dt_et: datetime) -> bool:
 
 
 def _should_be_running(dt_et: datetime) -> bool:
-    """True when services should be active at the given Eastern timestamp."""
-    if not _is_trading_day(dt_et):
-        return False
-    open_dt  = dt_et.replace(hour=OPEN_HOUR,  minute=OPEN_MIN,  second=0, microsecond=0)
-    close_dt = dt_et.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0, microsecond=0)
-    return open_dt <= dt_et < close_dt
+    """
+    True when services should be active at the given Eastern timestamp.
+
+    Services run when ANY of the following is true:
+      1. Normal market hours on a trading day (8:00 AM – 4:30 PM ET by default)
+      2. Within the earnings window for a scheduled earnings report
+         (covers BMO pre-open and AMC post-close opportunities)
+    """
+    # ── Normal market hours ───────────────────────────────────────────────────
+    if _is_trading_day(dt_et):
+        open_dt  = dt_et.replace(hour=OPEN_HOUR,  minute=OPEN_MIN,  second=0, microsecond=0)
+        close_dt = dt_et.replace(hour=CLOSE_HOUR, minute=CLOSE_MIN, second=0, microsecond=0)
+        if open_dt <= dt_et < close_dt:
+            return True
+
+    # ── Earnings window (any day — covers weekend BMO surprises too) ──────────
+    return _in_earnings_window(dt_et)
 
 
 # ── Scheduler ──────────────────────────────────────────────────────────────────
