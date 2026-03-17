@@ -53,3 +53,4 @@ docker-compose.override.yml
 release/
 *.zip
 *.tar.gz
+.claude/
