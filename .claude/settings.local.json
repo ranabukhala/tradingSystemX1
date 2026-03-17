@@ -171,7 +171,10 @@
       "Bash(head -30 grep -n \"analyst_sentiment\\\\|recent_ratings\\\\|fmp_analyst\\\\|fmp_insider\\\\|fmp_rating\" \"C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\app\\\\signals\\\\ai_summarizer.py\")",
       "WebFetch(domain:eodhd.com)",
       "Bash(python -m pytest tests/ --ignore=tests/test_schemas.py -q --tb=no)",
-      "Bash(xargs wc:*)"
+      "Bash(xargs wc:*)",
+      "Bash(Copy-Item \"C:\\\\Users\\\\ran.abu-khala\\\\Downloads\\\\README.md\" \"C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\README.md\" -Force)",
+      "Bash(cp \"/mnt/c/Users/ran.abu-khala/Downloads/README.md\" \"/mnt/c/work/docker/project1/trading-system/README.md\")",
+      "Bash(powershell.exe -Command \"Copy-Item ''C:\\\\Users\\\\ran.abu-khala\\\\Downloads\\\\README.md'' ''C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\README.md'' -Force\")"
     ]
   }
 }
