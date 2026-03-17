@@ -59,6 +59,29 @@ KNOWN_TICKERS: set[str] = {
     "CLSK","HUT","BITF","CIFR","WULF",
     # Crypto proxies
     "IBIT","FBTC","GBTC","ETHE",
+    # Aerospace/Defense
+    "BA","LMT","RTX","NOC","GD","LHX",
+    # Airlines/Transport
+    "DAL","UAL","AAL","LUV","FDX","UPS","UBER","LYFT",
+    # Automotive
+    "TM",
+    # Big Tech (gaps)
+    "NFLX","SPOT","PINS","SNAP","SHOP","ABNB","DASH","RBLX","TWLO","ROKU",
+    "SQ","PYPL","ADBE","CSCO","IBM",
+    # Semiconductors (gaps)
+    "ARM","ASML","TSM",
+    # Healthcare/Pharma (gaps)
+    "MRK","AMGN","NVO","AZN",
+    # Energy (gaps)
+    "HAL",
+    # Retail/Consumer (gaps)
+    "LOW","DLTR","DG","KR","CMG","YUM","DIS",
+    # Telecom/Media
+    "T","VZ","TMUS","CMCSA","WBD",
+    # Industrials
+    "CAT","DE","MMM","HON","GE",
+    # AI/Cloud (gaps)
+    "PATH","NBIS",
 }
 
 # Tickers that appear in common English words — never auto-extract these
@@ -73,65 +96,183 @@ TICKER_BLACKLIST = {
 # Catches prose mentions like "Okta reports earnings" → OKTA (score 0.90).
 COMPANY_NAME_MAP: dict[str, str] = {
     # Mega cap
-    "apple":           "AAPL",
-    "microsoft":       "MSFT",
-    "nvidia":          "NVDA",
-    "alphabet":        "GOOGL",
-    "meta":            "META",
-    "amazon":          "AMZN",
-    "tesla":           "TSLA",
+    "apple":              "AAPL",
+    "microsoft":          "MSFT",
+    "nvidia":             "NVDA",
+    "alphabet":           "GOOGL",
+    "google":             "GOOGL",
+    "meta":               "META",
+    "amazon":             "AMZN",
+    "tesla":              "TSLA",
     # Large cap tech
-    "intel":           "INTC",
-    "qualcomm":        "QCOM",
-    "broadcom":        "AVGO",
-    "oracle":          "ORCL",
-    "salesforce":      "CRM",
-    "servicenow":      "NOW",
-    "snowflake":       "SNOW",
-    "datadog":         "DDOG",
-    "cloudflare":      "NET",
-    "crowdstrike":     "CRWD",
-    "zscaler":         "ZS",
-    "okta":            "OKTA",
-    "palo alto":       "PANW",
-    "fortinet":        "FTNT",
+    "intel":              "INTC",
+    "qualcomm":           "QCOM",
+    "broadcom":           "AVGO",
+    "oracle":             "ORCL",
+    "salesforce":         "CRM",
+    "servicenow":         "NOW",
+    "snowflake":          "SNOW",
+    "datadog":            "DDOG",
+    "cloudflare":         "NET",
+    "crowdstrike":        "CRWD",
+    "zscaler":            "ZS",
+    "okta":               "OKTA",
+    "palo alto":          "PANW",
+    "fortinet":           "FTNT",
+    "netflix":            "NFLX",
+    "spotify":            "SPOT",
+    "pinterest":          "PINS",
+    "snapchat":           "SNAP",    # "snap" alone is too common a word
+    "shopify":            "SHOP",
+    "airbnb":             "ABNB",
+    "doordash":           "DASH",
+    "roblox":             "RBLX",
+    "twilio":             "TWLO",
+    "roku":               "ROKU",
+    "block inc":          "SQ",
+    "square":             "SQ",
+    "paypal":             "PYPL",
+    "adobe":              "ADBE",
+    "cisco":              "CSCO",
+    "ibm":                "IBM",
     # Financials
-    "jpmorgan":        "JPM",
-    "goldman sachs":   "GS",
-    "morgan stanley":  "MS",
-    "bank of america": "BAC",
-    "wells fargo":     "WFC",
-    "citigroup":       "C",
-    "blackrock":       "BLK",
-    "robinhood":       "HOOD",
-    "coinbase":        "COIN",
-    # Healthcare
-    "pfizer":          "PFE",
-    "moderna":         "MRNA",
-    "abbvie":          "ABBV",
-    "gilead":          "GILD",
-    # Consumer / Other
-    "costco":          "COST",
-    "starbucks":       "SBUX",
-    "mcdonald":        "MCD",
-    "rivian":          "RIVN",
-    "lucid":           "LCID",
-    "palantir":        "PLTR",
-    "microstrategy":   "MSTR",
+    "jpmorgan":           "JPM",
+    "goldman sachs":      "GS",
+    "morgan stanley":     "MS",
+    "bank of america":    "BAC",
+    "wells fargo":        "WFC",
+    "citigroup":          "C",
+    "blackrock":          "BLK",
+    "robinhood":          "HOOD",
+    "coinbase":           "COIN",
+    "mastercard":         "MA",
+    "american express":   "AXP",
+    "charles schwab":     "SCHW",
+    "capital one":        "COF",
+    "berkshire":          "BRK.B",
+    "sofi":               "SOFI",
+    # Healthcare / Pharma
+    "pfizer":             "PFE",
+    "moderna":            "MRNA",
+    "abbvie":             "ABBV",
+    "gilead":             "GILD",
+    "johnson & johnson":  "JNJ",
+    "unitedhealth":       "UNH",
+    "eli lilly":          "LLY",
+    "merck":              "MRK",
+    "amgen":              "AMGN",
+    "regeneron":          "REGN",
+    "vertex":             "VRTX",
+    "intuitive surgical": "ISRG",
+    "novo nordisk":       "NVO",
+    "astrazeneca":        "AZN",
+    # Semiconductors
+    "micron":             "MU",
+    "applied materials":  "AMAT",
+    "lam research":       "LRCX",
+    "texas instruments":  "TXN",
+    "marvell":            "MRVL",
+    "arm holdings":       "ARM",
+    "asml":               "ASML",
+    "taiwan semi":        "TSM",
+    "tsmc":               "TSM",
+    # Energy
+    "exxon":              "XOM",
+    "chevron":            "CVX",
+    "conocophillips":     "COP",
+    "schlumberger":       "SLB",
+    "halliburton":        "HAL",
+    # Retail / Consumer
+    "walmart":            "WMT",
+    "home depot":         "HD",
+    # NOTE: "target" intentionally omitted — too many false matches on "price target"
+    "lowe's":             "LOW",
+    "dollar tree":        "DLTR",
+    "dollar general":     "DG",
+    "kroger":             "KR",
+    "nike":               "NKE",
+    "lululemon":          "LULU",
+    "chipotle":           "CMG",
+    "yum brands":         "YUM",
+    "disney":             "DIS",
+    "costco":             "COST",
+    "starbucks":          "SBUX",
+    "mcdonald":           "MCD",
+    # Aerospace / Defense
+    "boeing":             "BA",
+    "lockheed":           "LMT",
+    "raytheon":           "RTX",
+    "northrop":           "NOC",
+    "general dynamics":   "GD",
+    "l3harris":           "LHX",
+    # Airlines / Transport
+    "delta air":          "DAL",
+    "united airlines":    "UAL",
+    "american airlines":  "AAL",
+    "southwest airlines": "LUV",
+    "fedex":              "FDX",
+    "ups":                "UPS",   # \b word boundary enforced by regex; safe in financial titles
+    "uber":               "UBER",
+    "lyft":               "LYFT",
+    # Automotive
+    "ford motor":         "F",     # "ford" alone risks "afford"/"Stanford" etc.
+    "general motors":     "GM",
+    "toyota":             "TM",
+    # Telecom / Media
+    "at&t":               "T",     # re.escape() handles the & correctly
+    "verizon":            "VZ",
+    "t-mobile":           "TMUS",
+    "comcast":            "CMCSA",
+    "warner bros":        "WBD",
+    # Industrials
+    "caterpillar":        "CAT",
+    "deere":              "DE",
+    "john deere":         "DE",
+    "3m company":         "MMM",   # "3m" alone risks "$3 million" false matches
+    "honeywell":          "HON",
+    "general electric":   "GE",
+    # EV / Other
+    "rivian":             "RIVN",
+    "lucid":              "LCID",
+    # AI / Cloud
+    "palantir":           "PLTR",
+    "c3.ai":              "AI",    # "AI" is in TICKER_BLACKLIST; kept for future if list evolves
+    "uipath":             "PATH",
+    "nebius":             "NBIS",
+    "microstrategy":      "MSTR",
 }
 
 # Market cap tiers (approximate, for known large names)
 MARKET_CAP_TIER_MAP: dict[str, MarketCapTier] = {
     **{t: MarketCapTier.MEGA for t in [
+        # Original mega caps
         "AAPL","MSFT","NVDA","GOOGL","GOOG","META","AMZN","TSLA","BRK.B",
         "LLY","V","JPM","UNH","XOM","JNJ","WMT","MA","PG","AVGO","HD",
+        # Newly added mega caps
+        "BA","LMT","DIS","NFLX","ADBE","CSCO","IBM","PYPL",
+        "TSM","ASML","NVO","AZN","MRK","AMGN",
+        "LOW","CAT","DE","HON","GE",
+        "T","VZ","TMUS","CMCSA",
     ]},
     **{t: MarketCapTier.LARGE for t in [
+        # Original large caps
         "AMD","INTC","QCOM","ORCL","CRM","NOW","SNOW","GS","MS","BAC",
         "WFC","PFE","MRNA","ABBV","COST","TGT","CVX","SLB","GM","F",
+        # Newly added large caps
+        "RTX","NOC","GD","LHX",
+        "FDX","UPS","UBER",
+        "SHOP","ABNB","SQ","ARM",
+        "HAL",
+        "CMG","YUM","DLTR","DG","KR","WBD","MMM",
+        "DAL","UAL",
     ]},
     **{t: MarketCapTier.MID for t in [
+        # Original mid caps
         "RIVN","LCID","PLTR","SOFI","HOOD","COIN","MSTR","RIOT","MARA",
+        # Newly added mid caps
+        "LYFT","AAL","LUV",
+        "DASH","RBLX","TWLO","ROKU","SPOT","PINS","SNAP",
+        "PATH","NBIS",
     ]},
     **{t: MarketCapTier.SMALL for t in [
         "GME","AMC","CLSK","HUT","BITF","CIFR","WULF",
