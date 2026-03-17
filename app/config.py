@@ -119,7 +119,7 @@ class Settings(BaseSettings):
     polygon_news_poll_interval_seconds: int = 60
     alphavantage_poll_interval_seconds: int = 300
     finnhub_poll_interval: int = 300              # 5 min — news doesn't change per-minute
-    finnhub_per_minute_call_limit: int = 55      # 60 req/min hard cap − 5 buffer
+    finnhub_per_minute_call_limit: int = 48      # 60 req/min hard cap − 12 buffer for rolling-window overlap
     earnings_sync_hour_et: int = 6
     earnings_lookahead_days: int = 30
 

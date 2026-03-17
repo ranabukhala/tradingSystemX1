@@ -168,7 +168,10 @@
       "Bash(python -m pytest tests/test_embedding_dedup.py tests/test_fast_path.py tests/test_stock_context_classifier.py -v --tb=short -q)",
       "Bash(python3 -c \":*)",
       "Bash(python -m pytest tests/test_embedding_dedup.py -q)",
-      "Bash(head -30 grep -n \"analyst_sentiment\\\\|recent_ratings\\\\|fmp_analyst\\\\|fmp_insider\\\\|fmp_rating\" \"C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\app\\\\signals\\\\ai_summarizer.py\")"
+      "Bash(head -30 grep -n \"analyst_sentiment\\\\|recent_ratings\\\\|fmp_analyst\\\\|fmp_insider\\\\|fmp_rating\" \"C:\\\\work\\\\docker\\\\project1\\\\trading-system\\\\app\\\\signals\\\\ai_summarizer.py\")",
+      "WebFetch(domain:eodhd.com)",
+      "Bash(python -m pytest tests/ --ignore=tests/test_schemas.py -q --tb=no)",
+      "Bash(xargs wc:*)"
     ]
   }
 }

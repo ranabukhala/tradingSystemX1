@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import random
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -92,6 +93,14 @@ class FinnhubNewsConnector(BaseConnector):
         if not self._api_key:
             return 0
 
+        # Startup jitter: spread first fetch randomly across 0–8 s to avoid
+        # coincident bursts with finnhub_fundamentals and finnhub_sentiment at
+        # minute boundaries. Subsequent fetches are unaffected (jitter only on
+        # first call via the flag set in BaseConnector / on container start).
+        if not getattr(self, "_jitter_done", False):
+            self._jitter_done = True
+            await asyncio.sleep(random.uniform(0, 8))
+
         http = self._get_http()
         producer = get_producer()
         emitted = 0
@@ -118,7 +127,7 @@ class FinnhubNewsConnector(BaseConnector):
                         _log("info", "finnhub.cache.hit", ticker=ticker)
                         articles = json.loads(cached)
                         emitted += await self._process_articles(articles, producer, ticker=ticker)
-                        await asyncio.sleep(0.2)
+                        await asyncio.sleep(0.35)
                         continue
 
                     _log("debug", "finnhub.cache.miss", ticker=ticker)
@@ -148,7 +157,7 @@ class FinnhubNewsConnector(BaseConnector):
                     else:
                         _log("warning", "finnhub.company_news_http_error",
                              ticker=ticker, status=resp.status_code)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.35)  # 350ms: ~2 calls/s burst cap, 34 calls/min
 
                 except Exception as e:
                     _log("error", "finnhub.company_news_error",
