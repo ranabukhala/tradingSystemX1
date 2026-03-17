@@ -7,16 +7,20 @@ Covers 3,000+ companies vs EarningsWhispers' 500.
 Provides:
   - EPS estimates (consensus + whisper)
   - Revenue estimates
-  - BMO/AMC timing
+  - BMO/AMC timing (cross-validated with Finnhub)
   - Prior EPS for beat/miss context
 
 Polls: once at startup, then every 6 hours.
+After each FMP sync, a Finnhub cross-validation pass fills in any Unknown
+event_time values and flags/corrects date mismatches.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, date, timezone, timedelta
 
+import httpx
 import redis.asyncio as aioredis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -148,4 +152,144 @@ class FMPEarningsConnector(BaseConnector):
              to_date=end_date.isoformat())
 
         await fmp.close()
+
+        # Cross-validate timing with Finnhub after every FMP sync
+        await self._cross_validate_finnhub()
+
         return saved
+
+    async def _cross_validate_finnhub(self) -> None:
+        """
+        Fill in missing event_time (bmo/amc) and correct date mismatches using
+        Finnhub's /api/v1/calendar/earnings endpoint.
+
+        Only processes rows with event_time = 'Unknown' in the next 14 days.
+        Never overwrites existing non-Unknown timing — purely additive.
+        """
+        finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+        if not finnhub_key:
+            _log("warning", "fmp_earnings.finnhub_xval_skipped",
+                 reason="No FINNHUB_API_KEY")
+            return
+
+        from app.db import get_engine
+        engine = get_engine()
+
+        # 1. Fetch all Unknown-timing events in the next 14 days
+        async with AsyncSession(engine) as session:
+            rows = (await session.execute(text("""
+                SELECT id, ticker, event_date
+                FROM event
+                WHERE event_type  = 'earnings'
+                  AND event_time  = 'Unknown'
+                  AND event_date >= CURRENT_DATE
+                  AND event_date <= CURRENT_DATE + INTERVAL '14 days'
+                ORDER BY event_date
+            """))).fetchall()
+
+        if not rows:
+            _log("info", "fmp_earnings.finnhub_xval_skip",
+                 reason="No Unknown timing events in next 14 days")
+            return
+
+        _log("info", "fmp_earnings.finnhub_xval_start", count=len(rows))
+        updated = 0
+        date_mismatches = 0
+
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            for row in rows:
+                ticker   = row.ticker
+                fmp_date = row.event_date  # datetime.date object
+
+                # Conservative: 1 req/sec → ≤60/min, won't crowd the shared
+                # Finnhub budget used by news polling containers
+                await asyncio.sleep(1.0)
+
+                try:
+                    # Search a ±7-day window around the FMP date to catch shifts
+                    from_date = (fmp_date - timedelta(days=7)).strftime("%Y-%m-%d")
+                    to_date   = (fmp_date + timedelta(days=7)).strftime("%Y-%m-%d")
+
+                    resp = await http.get(
+                        "https://finnhub.io/api/v1/calendar/earnings",
+                        params={
+                            "symbol": ticker,
+                            "token":  finnhub_key,
+                            "from":   from_date,
+                            "to":     to_date,
+                        },
+                    )
+
+                    if resp.status_code == 429:
+                        _log("warning", "fmp_earnings.finnhub_xval_rate_limited",
+                             ticker=ticker)
+                        await asyncio.sleep(30)
+                        continue
+
+                    if resp.status_code != 200:
+                        continue
+
+                    earnings = resp.json().get("earningsCalendar", [])
+                    if not earnings:
+                        continue
+
+                    # Use the first (most relevant) entry
+                    entry          = earnings[0]
+                    finnhub_hour   = (entry.get("hour") or "").lower()   # "bmo" or "amc"
+                    finnhub_date_s = entry.get("date", "")               # "YYYY-MM-DD"
+
+                    if finnhub_hour not in ("bmo", "amc"):
+                        continue  # Finnhub has no usable timing — leave as Unknown
+
+                    fmp_date_s = fmp_date.strftime("%Y-%m-%d") if hasattr(fmp_date, "strftime") else str(fmp_date)[:10]
+
+                    date_changed = (finnhub_date_s and finnhub_date_s != fmp_date_s)
+                    if date_changed:
+                        date_mismatches += 1
+                        _log("warning", "fmp_earnings.date_mismatch",
+                             ticker=ticker,
+                             fmp_date=fmp_date_s,
+                             finnhub_date=finnhub_date_s)
+
+                    # Parse Finnhub date string → date object (asyncpg requires it)
+                    finnhub_date_obj = (
+                        datetime.strptime(finnhub_date_s, "%Y-%m-%d").date()
+                        if finnhub_date_s else fmp_date
+                    )
+
+                    # Write back: update event_time (and event_date if it shifted)
+                    async with AsyncSession(engine) as session:
+                        if date_changed:
+                            await session.execute(text("""
+                                UPDATE event SET
+                                    event_time = :hour,
+                                    event_date = :new_date,
+                                    updated_at = now()
+                                WHERE id = :event_id
+                            """), {
+                                "hour":     finnhub_hour,
+                                "new_date": finnhub_date_obj,
+                                "event_id": str(row.id),
+                            })
+                        else:
+                            await session.execute(text("""
+                                UPDATE event SET
+                                    event_time = :hour,
+                                    updated_at = now()
+                                WHERE id = :event_id
+                            """), {
+                                "hour":     finnhub_hour,
+                                "event_id": str(row.id),
+                            })
+                        await session.commit()
+
+                    updated += 1
+
+                except Exception as e:
+                    _log("warning", "fmp_earnings.finnhub_xval_error",
+                         ticker=ticker, error=str(e))
+
+        _log("info", "fmp_earnings.finnhub_xval_complete",
+             total=len(rows),
+             updated=updated,
+             date_mismatches=date_mismatches)

@@ -3,7 +3,7 @@ Prompt templates for the AI summarizer.
 All prompts versioned — bump PROMPT_VERSION when changing.
 """
 
-PROMPT_VERSION = "v1.3"
+PROMPT_VERSION = "v1.4"
 
 # ── T1 Prompt: Fast facts extraction ─────────────────────────────────────────
 T1_SYSTEM = """You are a financial news analyst. Extract structured facts from news headlines.
@@ -22,6 +22,7 @@ Respond with this exact JSON structure:
   "t1_summary": "one sentence, max 20 words, just the facts",
   "impact_day": 0.0,
   "impact_swing": 0.0,
+  "tickers_extracted": [],
   "facts": {{
     "eps_beat": null,
     "eps_actual": null,
@@ -51,7 +52,9 @@ Rules:
 - For analyst: fill rating_new, rating_prev, price_target_new, price_target_prev, analyst_firm
 - For M&A: fill deal_price, deal_premium_pct, deal_type
 - For FDA: fill fda_outcome
-- For macro: fill actual_value, estimate_value"""
+- For macro: fill actual_value, estimate_value
+- tickers_extracted: list of US stock ticker symbols for companies DIRECTLY discussed in the article (e.g., ["BA", "DOCU", "FDX"]). Maximum 3 tickers. Return empty list if no specific company is identified.
+- If the Tickers field above is "unknown" or empty, you MUST attempt to identify the relevant ticker(s) from the title and snippet. Examples: "Boeing" = BA, "DocuSign" = DOCU, "FedEx" = FDX, "Carnival" = CCL, "Palantir" = PLTR, "Snowflake" = SNOW. Only include companies directly and primarily discussed — not tangential or sympathy mentions."""
 
 
 # ── T2 Prompt: Trader intelligence (with FMP context) ────────────────────────

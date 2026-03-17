@@ -502,10 +502,15 @@ class EntityResolverService(BaseConsumer):
             self._upcoming_earnings = {}
             for row in rows:
                 ticker = row.ticker
-                # Approximate datetime: BMO = 9:30 AM ET, AMC = 4:30 PM ET
-                event_dt = datetime.combine(row.event_date, __import__("datetime").time(9, 30))
-                if row.event_time == "AMC":
+                # Normalize timing: Finnhub stores lowercase "bmo"/"amc";
+                # legacy FMP rows may be uppercase "BMO"/"AMC". Handle both.
+                event_time_lower = (row.event_time or "").lower()
+                if event_time_lower == "amc":
+                    # AMC: 4:30 PM ET (prime premarket setup the following morning)
                     event_dt = datetime.combine(row.event_date, __import__("datetime").time(16, 30))
+                else:
+                    # BMO, DMH, Unknown — default to 9:30 AM ET open
+                    event_dt = datetime.combine(row.event_date, __import__("datetime").time(9, 30))
                 self._upcoming_earnings[ticker] = ET.localize(event_dt).astimezone(timezone.utc)
 
             self._earnings_loaded_at = datetime.now(timezone.utc)

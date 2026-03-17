@@ -98,6 +98,7 @@ class AISummarizerService(BaseConsumer):
     def __init__(self) -> None:
         self._budget = BudgetTracker(settings.llm_daily_budget_usd)
         self._http: httpx.AsyncClient | None = None
+        self._Session: Any | None = None
         # Simple rate limit: max 50 req/min to Claude API
         self._req_times: list[float] = []
         super().__init__()
@@ -126,6 +127,22 @@ class AISummarizerService(BaseConsumer):
             },
             timeout=30.0,
         )
+        # DB session — used to back-fill tickers on news_item rows after LLM extraction
+        import os
+        if os.environ.get("DATABASE_URL"):
+            try:
+                from app.db import get_engine
+                from sqlalchemy.ext.asyncio import AsyncSession
+                from sqlalchemy.orm import sessionmaker
+                engine = get_engine()
+                self._Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+                _log("info", "ai_summarizer.db_session_ready")
+            except Exception as db_err:
+                _log("warning", "ai_summarizer.db_session_failed", error=str(db_err))
+        else:
+            _log("warning", "ai_summarizer.no_database_url",
+                 note="LLM ticker DB back-fill disabled")
+
         _log("info", "ai_summarizer.ready",
              model_t1=CLAUDE_MODEL,
              model_t2=CLAUDE_MODEL_T2,
@@ -499,6 +516,47 @@ class AISummarizerService(BaseConsumer):
                  impact_swing=t1_result.get("impact_swing"),
                  tokens=t1_tokens,
                  cost_usd=round(t1_cost, 5))
+
+            # ── Merge LLM-extracted tickers if entity resolver found none ──────
+            llm_tickers = t1_result.get("tickers_extracted", [])
+            if llm_tickers and not enriched.tickers:
+                valid_llm_tickers = [
+                    t.upper().strip() for t in llm_tickers
+                    if isinstance(t, str) and 1 <= len(t.strip()) <= 5
+                       and t.strip().isalpha()
+                ][:3]  # Cap at 3
+
+                if valid_llm_tickers:
+                    enriched.tickers = valid_llm_tickers
+                    _log("info", "ai_summarizer.llm_tickers_merged",
+                         vendor_id=enriched.vendor_id,
+                         llm_tickers=valid_llm_tickers,
+                         title=enriched.title[:80])
+
+                    # Back-fill the news_item row so dedup + future queries are consistent
+                    if self._Session:
+                        try:
+                            from sqlalchemy import text
+                            async with self._Session() as session:
+                                await session.execute(text("""
+                                    UPDATE news_item SET
+                                        tickers = :tickers,
+                                        ticker_confidence = :confidence
+                                    WHERE source = :source AND vendor_id = :vendor_id
+                                      AND (tickers = '{}' OR tickers IS NULL)
+                                """), {
+                                    "tickers": valid_llm_tickers,
+                                    "confidence": json.dumps(
+                                        {t: 0.80 for t in valid_llm_tickers}
+                                    ),
+                                    "source": enriched.source.value,
+                                    "vendor_id": enriched.vendor_id,
+                                })
+                                await session.commit()
+                        except Exception as db_err:
+                            _log("warning", "ai_summarizer.llm_ticker_db_update_error",
+                                 error=str(db_err))
+            # ──────────────────────────────────────────────────────────────────
 
         except Exception as e:
             _log("error", "ai_summarizer.t1_error",
