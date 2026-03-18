@@ -180,6 +180,7 @@ class AdminBot:
             "run_outcomes": self._cmd_run_outcomes,
             "trades":       self._cmd_trades,
             "apistatus":    self._cmd_apistatus,
+            "logreport":    self._cmd_logreport,
         }
 
         handler = handlers.get(cmd)
@@ -208,6 +209,7 @@ class AdminBot:
             "/run_outcomes - fetch outcomes from Polygon",
             "/trades - show recent executed trades",
             "/apistatus - test all external API connections",
+            "/logreport [mins] - AI diagnosis of errors & warnings (default 30m)",
             "",
             "Shortcuts: benzinga, normalizer, summarizer, aggregator",
         ]
@@ -967,6 +969,83 @@ class AdminBot:
         except Exception as e:
             await self._send(f"DB error: {e}")
 
+
+    async def _cmd_logreport(self, args: list) -> None:
+        """
+        Collect errors & warnings from all containers for the last N minutes,
+        feed them to Claude, and return an AI-generated system health summary.
+
+        Usage: /logreport [minutes]   default = 30
+        """
+        minutes = 30
+        if args:
+            try:
+                minutes = max(5, min(int(args[0]), 180))
+            except ValueError:
+                pass
+
+        await self._send(
+            f"🔍 Collecting logs from all containers (last {minutes}m)...\n"
+            f"_This may take 15–20 seconds_"
+        )
+
+        reporter = LogReporter(self._docker_socket, self._http, redis=self._redis)
+        log_bundle = await reporter.collect(minutes=minutes)
+
+        if not log_bundle["entries"]:
+            await self._send(
+                f"✅ No errors or warnings found in the last {minutes} minutes.\n"
+                f"Scanned {log_bundle['containers_scanned']} containers, "
+                f"{log_bundle['lines_scanned']:,} log lines."
+            )
+            return
+
+        await self._send(
+            f"📦 Collected {log_bundle['total_issues']} issues from "
+            f"{log_bundle['containers_with_issues']} containers — analysing with Claude..."
+        )
+
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not anthropic_key:
+            # Fallback: send raw summary without AI
+            await self._send_raw_log_summary(log_bundle)
+            return
+
+        summary = await reporter.analyse_with_claude(log_bundle, anthropic_key)
+
+        # Send as plain text — AI output uses ## headers and **bold** which
+        # are not valid Telegram Markdown v1 and cause parse failures.
+        # _send() also has an auto-fallback, but better to be explicit.
+        for chunk in _split_message(summary, limit=4000):
+            await self._send(chunk, markdown=False)
+
+        _log("info", "admin_bot.logreport_sent",
+             containers=log_bundle["containers_with_issues"],
+             issues=log_bundle["total_issues"],
+             minutes=minutes)
+
+    async def _send_raw_log_summary(self, log_bundle: dict) -> None:
+        """Fallback: send a plain-text error summary (no Claude key)."""
+        lines = [
+            f"⚠️ *ANTHROPIC_API_KEY not set — raw summary*\n",
+            f"Scanned: {log_bundle['containers_scanned']} containers, "
+            f"{log_bundle['lines_scanned']:,} lines",
+            f"Issues: {log_bundle['total_issues']} across "
+            f"{log_bundle['containers_with_issues']} containers\n",
+        ]
+        for container, entries in log_bundle["entries"].items():
+            display = SERVICE_DISPLAY.get(container, container.replace("trading_", ""))
+            errors   = [e for e in entries if e["level"] == "error"]
+            warnings = [e for e in entries if e["level"] == "warning"]
+            lines.append(
+                f"*{display}*: {len(errors)} errors, {len(warnings)} warnings"
+            )
+            for e in errors[:3]:
+                msg = e["message"][:120]
+                lines.append(f"  🔴 `{msg}`")
+        await self._send("\n".join(lines))
+
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _resolve_service(self, shortname: str) -> str | None:
@@ -1025,11 +1104,15 @@ class AdminBot:
             return None
 
     async def _send(self, text: str, markdown: bool = True) -> None:
-        """Send message to admin chat."""
+        """
+        Send message to admin chat.
+        If Markdown parse fails (e.g. unmatched backticks from log content),
+        automatically retries as plain text so the message is never silently lost.
+        """
         if not self._admin_chat_id:
             _log("warning", "admin_bot.send_no_chat_id")
             return
-        params = {
+        params: dict = {
             "chat_id": self._admin_chat_id,
             "text": text,
             "disable_web_page_preview": True,
@@ -1039,13 +1122,474 @@ class AdminBot:
         result = await self._api("sendMessage", params)
         if not result:
             _log("warning", "admin_bot.send_no_response", text_preview=text[:60])
-        elif not result.get("ok"):
-            _log("warning", "admin_bot.send_failed",
-                 error=result.get("description", "unknown"),
-                 error_code=result.get("error_code"),
-                 text_preview=text[:60])
+            return
+        if not result.get("ok"):
+            error_desc = result.get("description", "unknown")
+            error_code = result.get("error_code")
+            # Telegram returns 400 when Markdown is malformed (unmatched ` * _ etc.)
+            # Retry as plain text so the message always gets through.
+            if markdown and error_code == 400 and "parse" in error_desc.lower():
+                _log("warning", "admin_bot.markdown_parse_failed_retrying",
+                     error=error_desc, text_preview=text[:60])
+                plain_params = {
+                    "chat_id": self._admin_chat_id,
+                    "text": _strip_markdown(text),
+                    "disable_web_page_preview": True,
+                }
+                retry = await self._api("sendMessage", plain_params)
+                if retry and retry.get("ok"):
+                    _log("debug", "admin_bot.send_ok_plain_fallback",
+                         text_preview=text[:60])
+                else:
+                    _log("error", "admin_bot.send_failed_both_modes",
+                         text_preview=text[:60])
+            else:
+                _log("warning", "admin_bot.send_failed",
+                     error=error_desc, error_code=error_code,
+                     text_preview=text[:60])
         else:
             _log("debug", "admin_bot.send_ok", text_preview=text[:60])
+
+
+
+def _strip_markdown(text: str) -> str:
+    """
+    Remove Telegram Markdown v1 formatting characters so a message that failed
+    to parse can be re-sent as plain text without losing the content.
+    Strips: *bold*, _italic_, `code`, [links](url)
+    """
+    import re
+    # Remove inline code spans first (may contain other special chars)
+    text = re.sub(r"`+[^`]*`+", lambda m: m.group(0).replace("`", ""), text)
+    # Remove bold/italic markers
+    text = re.sub(r"[*_]", "", text)
+    # Remove backticks
+    text = text.replace("`", "'")
+    # Remove [text](url) links — keep display text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"", text)
+    return text
+
+
+def _split_message(text: str, limit: int = 4000) -> list[str]:
+    """Split a long string into Telegram-safe chunks at newline boundaries."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        split_at = text.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = limit
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
+
+
+class LogReporter:
+    """
+    Collects structured and plain log lines from Docker containers,
+    filters to errors and warnings, then asks Claude for a diagnosis.
+    """
+
+    # Infra containers we still want to scan
+    ALL_CONTAINERS = list({
+        "trading_connector_benzinga", "trading_connector_polygon_news",
+        "trading_connector_polygon_prices", "trading_connector_earnings",
+        "trading_connector_fred",
+        "trading_finnhub_news", "trading_finnhub_press_releases",
+        "trading_finnhub_fundamentals", "trading_finnhub_websocket",
+        "trading_finnhub_sentiment",
+        "trading_fmp_earnings", "trading_fmp_enrichment",
+        "trading_fmp_sectors", "trading_fmp_technical",
+        "trading_pipeline_normalizer", "trading_pipeline_deduplicator",
+        "trading_pipeline_entity_resolver",
+        "trading_signals_ai_summarizer", "trading_signals_aggregator",
+        "trading_pretrade_filter", "trading_signals_telegram",
+        "trading_execution_engine", "trading_position_monitor",
+        "trading_volatility_monitor", "trading_stock_context",
+        "trading_regime_poller", "trading_scheduler",
+        "trading_admin_watchdog", "trading_admin_bot",
+        "trading_redpanda", "trading_postgres", "trading_redis",
+    })
+
+    # Keywords that identify an error/warning in plain-text (non-JSON) logs
+    ERROR_KEYWORDS   = ("error", "exception", "traceback", "critical", "fatal",
+                        "failed", "failure", "crash")
+    WARNING_KEYWORDS = ("warning", "warn", "deprecated", "timeout", "retry",
+                        "rate.limit", "rate_limit", "backoff")
+
+    # High-volume benign patterns — suppressed before any classification.
+    # These inflate issue counts and confuse the AI without indicating real problems.
+    NOISE_PATTERNS = (
+        # Redpanda: services auto-create topics on every startup;
+        # already-existing topics are rejected with this warning — harmless.
+        "topic_already_exists",
+        # Grafana plugin update checker emits level=info lines — not errors.
+        "flag evaluation succeeded",
+        "pluginsAutoUpdate",
+        # Prometheus: after restart it re-ingests historical metric samples
+        # that arrive out of chronological order — self-resolving.
+        "out-of-order samples",
+        "ingesting out-of-order",
+        # asyncpg pool churn during normal operation
+        "connection was closed in the middle of operation",
+        # Redpanda internal raft/controller heartbeat noise
+        "raft - raft_log",
+        "controller_backend",
+    )
+
+    def __init__(self, docker_socket: str, http: httpx.AsyncClient,
+                 redis=None) -> None:
+        self._socket = docker_socket
+        self._http   = http
+        self._redis  = redis  # optional — used for pipeline context enrichment
+
+    async def collect(self, minutes: int = 30) -> dict:
+        """
+        Fetch logs from all containers and return a structured bundle.
+
+        Returns:
+            {
+              "entries": { container_name: [{"level", "message", "ts", "event", ...}] },
+              "containers_scanned": int,
+              "containers_with_issues": int,
+              "lines_scanned": int,
+              "total_issues": int,
+              "window_minutes": int,
+            }
+        """
+        since_seconds = minutes * 60
+        tasks = [
+            self._fetch_container_issues(c, since_seconds)
+            for c in self.ALL_CONTAINERS
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        entries: dict[str, list[dict]] = {}
+        lines_scanned = 0
+        for container, result in zip(self.ALL_CONTAINERS, results):
+            if isinstance(result, Exception) or result is None:
+                continue
+            issues, scanned = result
+            lines_scanned += scanned
+            if issues:
+                entries[container] = issues
+
+        return {
+            "entries":                entries,
+            "containers_scanned":     len(self.ALL_CONTAINERS),
+            "containers_with_issues": len(entries),
+            "lines_scanned":          lines_scanned,
+            "total_issues":           sum(len(v) for v in entries.values()),
+            "window_minutes":         minutes,
+        }
+
+    async def _fetch_container_issues(
+        self, container: str, since_seconds: int
+    ) -> tuple[list[dict], int] | None:
+        """Fetch and filter logs for a single container."""
+        try:
+            transport = httpx.AsyncHTTPTransport(uds=self._socket)
+            async with httpx.AsyncClient(transport=transport, timeout=8.0) as docker:
+                resp = await docker.get(
+                    f"http://docker/containers/{container}/logs"
+                    f"?since={since_seconds}&stdout=true&stderr=true"
+                    f"&timestamps=false&tail=500"
+                )
+                if resp.status_code == 404:
+                    return None  # container doesn't exist
+                raw = resp.content.decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+        # Strip Docker multiplexing 8-byte headers
+        clean_lines = []
+        for line in raw.split("\n"):
+            if not line:
+                continue
+            clean_lines.append(line[8:] if len(line) > 8 and line[0] in "\x01\x02" else line)
+
+        issues: list[dict] = []
+        for line in clean_lines:
+            issue = self._classify_line(line)
+            if issue:
+                issues.append(issue)
+
+        return issues, len(clean_lines)
+
+    def _classify_line(self, line: str) -> dict | None:
+        """
+        Return a classified issue dict if line is an error or warning,
+        else return None. Handles both JSON-structured and plain-text logs.
+        """
+        line = line.strip()
+        if not line:
+            return None
+
+        # Suppress known-noisy benign patterns before any further classification.
+        # Check against the raw line (not lowercased) to preserve case-sensitive matches.
+        for noise in self.NOISE_PATTERNS:
+            if noise in line:
+                return None
+
+        # Try JSON first (all our services emit structured JSON logs)
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+                level = str(obj.get("level", "")).lower()
+                if level in ("error", "critical", "fatal"):
+                    return {
+                        "level":   "error",
+                        "event":   obj.get("event", ""),
+                        "message": obj.get("error", obj.get("msg", obj.get("message", ""))),
+                        "ts":      obj.get("ts", ""),
+                        "extra":   {k: v for k, v in obj.items()
+                                    if k not in ("ts", "level", "event", "error",
+                                                 "msg", "message")},
+                    }
+                if level == "warning":
+                    return {
+                        "level":   "warning",
+                        "event":   obj.get("event", ""),
+                        "message": obj.get("error", obj.get("msg", obj.get("message", ""))),
+                        "ts":      obj.get("ts", ""),
+                        "extra":   {},
+                    }
+                return None
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Plain-text fallback
+        lower = line.lower()
+        if any(k in lower for k in self.ERROR_KEYWORDS):
+            return {"level": "error",   "event": "", "message": line[:300], "ts": "", "extra": {}}
+        if any(k in lower for k in self.WARNING_KEYWORDS):
+            return {"level": "warning", "event": "", "message": line[:300], "ts": "", "extra": {}}
+        return None
+
+    async def analyse_with_claude(self, log_bundle: dict, api_key: str) -> str:
+        """
+        Send the collected log data to Claude and return a formatted summary.
+        Uses claude-haiku-4-5 for speed and low cost.
+        """
+        # Build a compact log digest for the prompt
+        # Enrich digest with live pipeline context from watchdog snapshot
+        pipeline_ctx = ""
+        try:
+            if self._redis:
+                snap_raw = await self._redis.get("watchdog:snapshot")
+                if snap_raw:
+                    snap = json.loads(snap_raw)
+                    sig_today    = snap.get("signals_today", 0)
+                    blocked_today = snap.get("signals_blocked_today", 0)
+                    block_rate   = snap.get("block_rate_1h", 0)
+                    news_today   = snap.get("news_processed_today", 0)
+                    budget_used  = snap.get("llm_budget_used", 0)
+                    budget_limit = snap.get("llm_budget_limit", 5)
+                    infra        = snap.get("infra_health", {})
+                    pipeline_ctx = (
+                        "Pipeline context (live):\n"
+                        f"  Signals today: {sig_today} ({blocked_today} blocked, "
+                        f"block rate last 1h: {block_rate*100:.0f}%)\n"
+                        f"  News processed today: {news_today}\n"
+                        f"  LLM budget: ${budget_used:.3f} / ${budget_limit:.2f}\n"
+                        f"  Postgres reachable: {infra.get('postgres', 'unknown')}\n"
+                        f"  Redis reachable: {infra.get('redis', 'unknown')}\n"
+                    )
+        except Exception:
+            pass
+
+        digest_lines = [
+            f"Trading system log digest — last {log_bundle['window_minutes']} minutes",
+            f"Containers scanned: {log_bundle['containers_scanned']}",
+            f"Total issues found: {log_bundle['total_issues']} "
+            f"across {log_bundle['containers_with_issues']} containers",
+            pipeline_ctx,
+            "",
+        ]
+
+        for container, entries in sorted(log_bundle["entries"].items()):
+            display = SERVICE_DISPLAY.get(container, container.replace("trading_", ""))
+            errors   = [e for e in entries if e["level"] == "error"]
+            warnings = [e for e in entries if e["level"] == "warning"]
+            digest_lines.append(
+                f"[{display}] {len(errors)} errors, {len(warnings)} warnings"
+            )
+
+            # Deduplicate by event name — repeated identical events bloat the
+            # digest and push the AI toward over-counting a single root cause.
+            # Keep one representative sample + occurrence count per unique event.
+            def _dedup(items: list[dict], limit: int) -> list[tuple[dict, int]]:
+                """Return [(entry, count)] deduplicated by event key."""
+                seen: dict[str, list] = {}
+                for item in items:
+                    key = item.get("event") or item.get("message", "")[:80]
+                    seen.setdefault(key, []).append(item)
+                # Sort by frequency desc, take top `limit` unique events
+                deduped = sorted(seen.values(), key=len, reverse=True)[:limit]
+                return [(group[-1], len(group)) for group in deduped]
+
+            for e, count in _dedup(errors, limit=8):
+                event = f" ({e['event']})" if e.get("event") else ""
+                msg   = e.get("message", "")[:200]
+                count_str = f" [x{count}]" if count > 1 else ""
+                extra = ""
+                if e.get("extra"):
+                    kv = ", ".join(
+                        f"{k}={str(v)[:60]}"
+                        for k, v in list(e["extra"].items())[:4]
+                        if v
+                    )
+                    extra = f" | {kv}" if kv else ""
+                digest_lines.append(f"  ERROR{event}{count_str}: {msg}{extra}")
+
+            for w, count in _dedup(warnings, limit=5):
+                event = f" ({w['event']})" if w.get("event") else ""
+                msg   = w.get("message", "")[:150]
+                count_str = f" [x{count}]" if count > 1 else ""
+                digest_lines.append(f"  WARN{event}{count_str}: {msg}")
+
+            digest_lines.append("")
+
+        digest = "\n".join(digest_lines)
+
+        # Cap digest size to avoid huge token usage
+        if len(digest) > 12_000:
+            digest = digest[:12_000] + "\n... [truncated]"
+
+        system_prompt = """You are a senior DevOps engineer and quantitative trading system expert.
+You are monitoring a production algorithmic trading system built with:
+- Python async microservices in Docker containers
+- Redpanda (Kafka) message bus with topics: signals.raw, signals.actionable, signals.filtered, signals.blocked, news.enriched
+- PostgreSQL + pgvector database
+- Redis for caching and state
+- News-driven signal pipeline: connectors → normalizer → deduplicator → entity resolver → AI summarizer → signal aggregator → pre-trade filter → execution engine
+- External data: Polygon.io, Finnhub, FMP (Financial Modeling Prep), Benzinga
+- Paper trading via Alpaca
+
+You will receive a log digest and must produce a clear, actionable system health report.
+Be direct and specific. Prioritise critical issues. Group related problems together.
+Use emojis sparingly for visual scanning. Do not repeat the raw log lines back.
+
+The following patterns are known benign operational noise — dismiss them without listing as issues:
+- Redpanda "topic_already_exists": every service attempts to auto-create its topics on startup; duplicates are rejected harmlessly.
+- Grafana "flag evaluation succeeded" / "pluginsAutoUpdate": routine plugin update checks, always INFO level.
+- Prometheus "out-of-order samples" / "ingesting out-of-order": post-restart metric catch-up, self-resolving within minutes.
+- Redpanda raft/controller_backend log lines: internal consensus heartbeats, not errors.
+- asyncpg "connection was closed in the middle of operation": connection pool recycling during idle periods, harmless.
+
+If you see these, acknowledge them in the "What's Working" section as expected behavior, not in warnings."""
+
+        user_prompt = f"""Analyse the following log digest from the trading system.
+
+Format your response using ONLY these section headers (plain text, no ## or ###):
+
+OVERALL STATUS
+One sentence: healthy / degraded / critical and why.
+
+CRITICAL ISSUES
+Each issue as: [SERVICE] Short title
+- Impact: what breaks
+- Cause: root cause
+- Fix: concrete command or code change (be specific)
+
+WARNINGS
+Each as: [SERVICE] Short title — impact — recommended action
+
+ROOT CAUSES
+Group related errors across services. Identify shared causes (e.g. schema migration needed, rate limit budget shared across services).
+
+WHAT IS WORKING
+One line per healthy service group. Confirm what to ignore.
+
+Rules:
+- No markdown headers (## ###). Use CAPS section titles only.
+- No ** bold. Use CAPS for emphasis if needed.
+- Be concise. Max 1200 words total.
+- If an error count says [x48] that means 48 identical occurrences — treat as one issue.
+- Do not list Redpanda topic_already_exists, Grafana flag evaluation, or Prometheus out-of-order samples as issues.
+
+---
+{digest}"""
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key":         api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type":      "application/json",
+                    },
+                    json={
+                        "model":      "claude-haiku-4-5-20251001",
+                        "max_tokens": 3000,
+                        "system":     system_prompt,
+                        "messages":   [{"role": "user", "content": user_prompt}],
+                    },
+                )
+
+            if resp.status_code != 200:
+                _log("error", "admin_bot.claude_api_error",
+                     status=resp.status_code, body=resp.text[:200])
+                return (
+                    f"❌ Claude API error ({resp.status_code})\n"
+                    f"Falling back to raw summary:\n\n"
+                    + self._format_raw_summary(log_bundle)
+                )
+
+            data    = resp.json()
+            content = data.get("content", [])
+            text    = "\n".join(
+                block.get("text", "") for block in content if block.get("type") == "text"
+            ).strip()
+
+            usage = data.get("usage", {})
+            cost  = (
+                usage.get("input_tokens",  0) * 0.00000025 +
+                usage.get("output_tokens", 0) * 0.00000125
+            )
+            _log("info", "admin_bot.logreport_claude_done",
+                 input_tokens=usage.get("input_tokens"),
+                 output_tokens=usage.get("output_tokens"),
+                 cost_usd=round(cost, 5))
+
+            header = (
+                f"🤖 *System Log Report* — "
+                f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
+                f"_{log_bundle['total_issues']} issues · "
+                f"{log_bundle['containers_with_issues']} containers · "
+                f"last {log_bundle['window_minutes']}m · "
+                f"${cost:.4f}_\n\n"
+            )
+            return header + text
+
+        except Exception as e:
+            _log("error", "admin_bot.claude_call_failed", error=str(e))
+            return (
+                f"❌ Failed to reach Claude API: {e}\n\n"
+                + self._format_raw_summary(log_bundle)
+            )
+
+    def _format_raw_summary(self, log_bundle: dict) -> str:
+        """Compact plain-text summary used as fallback when Claude is unavailable."""
+        lines = [
+            f"📋 Raw Log Summary — last {log_bundle['window_minutes']}m",
+            f"Scanned {log_bundle['containers_scanned']} containers, "
+            f"{log_bundle['lines_scanned']:,} lines",
+            f"Found {log_bundle['total_issues']} issues\n",
+        ]
+        for container, entries in sorted(log_bundle["entries"].items()):
+            display = SERVICE_DISPLAY.get(container, container.replace("trading_", ""))
+            errors   = [e for e in entries if e["level"] == "error"]
+            warnings = [e for e in entries if e["level"] == "warning"]
+            lines.append(f"*{display}* — {len(errors)}E {len(warnings)}W")
+            for e in errors[:5]:
+                msg = (e.get("event") or e.get("message") or "")[:120]
+                lines.append(f"  🔴 {msg}")
+        return "\n".join(lines)
 
 
 async def main() -> None:
