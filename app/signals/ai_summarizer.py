@@ -369,10 +369,22 @@ class AISummarizerService(BaseConsumer):
                         f"trend: {d.get('trend','stable')}\n"
                     )
 
-            # News sentiment score
-            raw = await r.get(f"finnhub:sentiment:{ticker}")
-            if raw:
-                d = json.loads(raw)
+            # News sentiment score — Finlight takes priority, Finnhub as fallback
+            fl_raw = await r.get(f"finlight:sentiment:{ticker}")
+            fh_raw = await r.get(f"finnhub:sentiment:{ticker}")
+            if fl_raw:
+                d = json.loads(fl_raw)
+                bias  = d.get("bias", "neutral")
+                score = d.get("score", 0)
+                ctx["sentiment_score"] = f"Finlight real-time sentiment: {bias} (score {score:.2f})\n"
+                if fh_raw:
+                    dh = json.loads(fh_raw)
+                    ctx["sentiment_score"] += (
+                        f"Finnhub NLP sentiment (cross-check): {dh.get('bias','neutral')} "
+                        f"(score {dh.get('score', 0):.2f})\n"
+                    )
+            elif fh_raw:
+                d = json.loads(fh_raw)
                 bias  = d.get("bias", "neutral")
                 score = d.get("score", 0)
                 ctx["sentiment_score"] = f"Finnhub NLP sentiment: {bias} (score {score:.2f})\n"

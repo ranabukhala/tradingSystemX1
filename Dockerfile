@@ -46,7 +46,8 @@ RUN pip install --no-cache-dir --upgrade pip \
         pytest \
         ib_insync \
         docker \
-        "openai>=1.0.0"
+        "openai>=1.0.0" \
+        "finlight-client>=0.1.0"
 
 # Copy application code
 COPY app/ ./app/

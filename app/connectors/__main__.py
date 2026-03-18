@@ -29,6 +29,11 @@ async def run_connector(name: str) -> None:
     elif name == "alphavantage":
         from app.connectors.alphavantage import AlphaVantageConnector
         connector = AlphaVantageConnector()
+    elif name == "finlight":
+        # Finlight is WebSocket-based — run via its own __main__ dispatcher
+        from app.connectors.finlight.__main__ import run_connector
+        await run_connector()
+        return
     else:
         _log("error", "unknown_connector", name=name)
         sys.exit(1)

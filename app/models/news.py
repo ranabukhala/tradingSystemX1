@@ -35,6 +35,7 @@ class NewsSource(str, Enum):
     TIINGO = "tiingo"
     DJNEWS = "djnews"
     FINNHUB = "finnhub"
+    FINLIGHT = "finlight"
     UNKNOWN = "unknown"
 
 

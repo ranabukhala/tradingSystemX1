@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     fmp_daily_call_limit: int = 200  # Shared across all FMP containers; 200 leaves 50 as buffer on free/starter tier
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
+    finlight_api_key: str = ""
     # OpenAI — used for embedding dedup (Tier 3.5).
     # Pydantic-settings will also check OPENAI env var as a fallback alias.
     openai_api_key: str = ""

@@ -63,6 +63,9 @@ dependencies = [
 
     # Docker SDK — used by market scheduler to start/stop sibling containers
     "docker>=7.0.0",
+
+    # Finlight — real-time financial news WebSocket with sentiment + entity extraction
+    "finlight-client>=0.1.0",
 ]
 
 [project.optional-dependencies]

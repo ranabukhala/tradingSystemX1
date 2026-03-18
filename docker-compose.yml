@@ -402,6 +402,32 @@ services:
       retries: 3
       start_period: 20s
 
+  connector_finlight:
+    <<: *connector
+    container_name: trading_finlight_connector
+    entrypoint: ["python", "-m", "app.connectors.__main__"]
+    command: ["finlight"]
+    environment:
+      CONNECTOR_NAME: finlight_connector
+      METRICS_PORT: "8007"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      POSTGRES_HOST: postgres
+      FINLIGHT_API_KEY: ${FINLIGHT_API_KEY}
+      FINLIGHT_LANGUAGE: en
+      FINLIGHT_COUNTRIES: US
+      ENABLE_REDIS_SENTIMENT: "true"
+    ports:
+      - "8007:8007"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   # ══════════════════════════════════════════════════════════
   #  LAYER 4 — PIPELINE SERVICES (Phase 2)
   # ══════════════════════════════════════════════════════════
