@@ -68,6 +68,20 @@ _CONTEXT_SERVICE_URL = os.environ.get(
 )
 POLYGON_BASE = "https://api.polygon.io"
 
+# Macro volatility regime conviction multipliers.
+# Applied to the final conviction AFTER all other multipliers (regime_scale,
+# tech_mult, options_delta, squeeze_mult, policy_mult) and BEFORE the threshold
+# gate.  Keys match the regime names published by volatility_monitor_service.
+# HIGH_VOL_BACKWARDATION shorts still pass the signal_aggregator gate; the 0.80
+# multiplier here provides a secondary conviction reduction so position sizing
+# remains conservative during a fear spike.
+REGIME_VOL_MULTIPLIERS: dict[str, float] = {
+    "LOW_VOL_STABLE":         1.05,   # +5 %  — calm market, slight upside bias
+    "ELEVATED_VOL_CONTANGO":  0.92,   # −8 %  — term structure elevated, caution
+    "HIGH_VOL_BACKWARDATION": 0.80,   # −20 % — acute fear spike (longs blocked upstream)
+    "VOL_MEAN_REVERSION":     1.10,   # +10 % — regime transitioning out of fear; reversal bias
+}
+
 
 class PreTradeFilterService(BaseConsumer):
     """
@@ -227,6 +241,25 @@ class PreTradeFilterService(BaseConsumer):
             regime_task, tech_task, options_task, squeeze_task,
             return_exceptions=True,
         )
+
+        # ── Fetch macro vol regime (written by volatility_monitor_service) ─────
+        # Passed in on the signal record by signal_aggregator — use that value to
+        # avoid an extra Redis round-trip.  Fall back to a direct Redis read if
+        # the field is absent (e.g. older messages in the queue).
+        vol_regime_name:   str  = record.get("vol_regime", "") or "LOW_VOL_STABLE"
+        vol_regime_detail: dict = record.get("vol_regime_detail") or {}
+        if not record.get("vol_regime") and self._redis:
+            try:
+                raw_vr = await self._redis.get("vol:regime")
+                if raw_vr:
+                    vd               = json.loads(raw_vr)
+                    vol_regime_name  = vd.get("regime", "LOW_VOL_STABLE")
+                    vol_regime_detail = vd
+            except Exception as exc:
+                _log("warning", "pretrade_filter.vol_regime_fetch_error",
+                     ticker=ticker, error=str(exc))
+        vol_mult = REGIME_VOL_MULTIPLIERS.get(vol_regime_name, 1.0)
+        # ──────────────────────────────────────────────────────────────────────
 
         # Handle partial failures gracefully — never let a filter crash the pipeline
         if isinstance(regime, Exception):
@@ -391,6 +424,12 @@ class PreTradeFilterService(BaseConsumer):
         # Policy multiplier (interpretive_penalty × sympathy_multiplier) applied last.
         conviction *= policy_multiplier
 
+        # Macro volatility regime multiplier — applied after all other adjustments.
+        # In HIGH_VOL_BACKWARDATION long signals are already blocked upstream in the
+        # signal_aggregator; this multiplier primarily affects SHORT signals and the
+        # LOW_VOL_STABLE / VOL_MEAN_REVERSION cases.
+        conviction *= vol_mult
+
         conviction = round(min(max(conviction, 0.0), 1.0), 3)
 
         # ── Post-formula conviction threshold gate (v1.9) ─────────────────────
@@ -467,6 +506,13 @@ class PreTradeFilterService(BaseConsumer):
             "dtc":         getattr(squeeze, "days_to_cover", None),
             "multiplier":  getattr(squeeze, "conviction_multiplier", 1.0),
         }
+        record["filter_vol_regime"] = {
+            "regime":     vol_regime_name,
+            "multiplier": round(vol_mult, 4),
+            "vxx_5d_roc": vol_regime_detail.get("vxx_5d_roc"),
+            "leverage_ratio": vol_regime_detail.get("leverage_ratio"),
+            "source":     "signal_record" if record.get("vol_regime") else "redis_fallback",
+        }
 
         # Promote signal type if squeeze candidate
         if getattr(squeeze, "signal_type_override", None):
@@ -490,6 +536,8 @@ class PreTradeFilterService(BaseConsumer):
              conviction_in=conviction_in,
              conviction_out=conviction,
              regime=regime.get("regime"),
+             vol_regime=vol_regime_name,
+             vol_mult=round(vol_mult, 4),
              tech_score=getattr(tech, "score", None),
              flow_bias=getattr(options, "flow_bias", "neutral"),
              squeeze_score=getattr(squeeze, "squeeze_score", 0.0),

@@ -47,6 +47,7 @@ $Containers = @(
     "trading_signals_ai_summarizer"
     "trading_signals_telegram"
     "trading_stock_context"
+    "trading_volatility_monitor"
 )
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }

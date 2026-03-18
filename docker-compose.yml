@@ -1028,6 +1028,48 @@ services:
         max-file: "3"
 
 # ══════════════════════════════════════════════════════════
+#  VOLATILITY MONITOR
+#  Polls VXX/UVXY from Polygon, classifies vol regime,
+#  caches in Redis, publishes changes to Redpanda.
+#  Exposes /health and /regime on port 8083.
+# ══════════════════════════════════════════════════════════
+
+  volatility_monitor:
+    build:
+      context: .
+      dockerfile: volatility_monitor_service/Dockerfile
+    container_name: trading_volatility_monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POLYGON_API_KEY:         ${POLYGON_API_KEY}
+      REDIS_URL:               redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      LOG_LEVEL:               ${LOG_LEVEL:-INFO}
+      TZ:                      America/New_York
+    ports:
+      - "8083:8083"
+    depends_on:
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8083/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - trading_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ══════════════════════════════════════════════════════════
 #  VOLUMES & NETWORKS
 # ══════════════════════════════════════════════════════════
 

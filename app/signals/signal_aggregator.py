@@ -65,6 +65,12 @@ CONVICTION_THRESHOLD = float(os.environ.get("SIGNAL_CONVICTION_THRESHOLD", "0.55
 _ENABLE_SIGNAL_EVENT_GATE = os.environ.get("ENABLE_SIGNAL_EVENT_GATE", "true").lower() == "true"
 _MULTI_SIGNAL_POLICY      = os.environ.get("MULTI_SIGNAL_POLICY", "deny")  # deny | allow | allow_opposite
 
+# Macro volatility regime gate — blocks new LONG signals when VXX term structure
+# shows acute backwardation (VXX 5-day spike + UVXY leverage ratio > threshold).
+# Short signals are allowed because the regime CONFIRMS downside direction.
+# Disable entirely via ENABLE_VOL_REGIME_GATE=false.
+_ENABLE_VOL_REGIME_GATE = os.environ.get("ENABLE_VOL_REGIME_GATE", "true").lower() == "true"
+
 ET = pytz.timezone("America/New_York")
 
 # Time-of-day windows with conviction multiplier and label
@@ -828,6 +834,34 @@ class SignalAggregatorService(BaseConsumer):
                 return None
         # ─────────────────────────────────────────────────────────────────────
 
+        # ── Macro volatility regime gate ──────────────────────────────────────
+        # Reads vol:regime (written by volatility_monitor_service) from Redis.
+        # HIGH_VOL_BACKWARDATION = acute VXX spike + UVXY leverage > 1.7 threshold.
+        # Block LONG signals — fighting the regime in a fear spike destroys alpha.
+        # Allow SHORT signals — the regime confirms downside direction.
+        vol_regime_name:   str  = "LOW_VOL_STABLE"
+        vol_regime_detail: dict = {}
+        if _ENABLE_VOL_REGIME_GATE and self._redis:
+            try:
+                raw_vr = await self._redis.get("vol:regime")
+                if raw_vr:
+                    vol_data          = json.loads(raw_vr)
+                    vol_regime_name   = vol_data.get("regime", "LOW_VOL_STABLE")
+                    vol_regime_detail = vol_data
+            except Exception as exc:
+                _log("warning", "signal_aggregator.vol_regime_fetch_error",
+                     ticker=primary_ticker, error=str(exc))
+
+        if _ENABLE_VOL_REGIME_GATE and vol_regime_name == "HIGH_VOL_BACKWARDATION" and direction == "long":
+            _log("info", "signal_aggregator.vol_regime_gate_blocked",
+                 ticker=primary_ticker,
+                 direction=direction,
+                 vol_regime=vol_regime_name,
+                 vxx_5d_roc=vol_regime_detail.get("vxx_5d_roc"),
+                 leverage_ratio=vol_regime_detail.get("leverage_ratio"))
+            return None
+        # ──────────────────────────────────────────────────────────────────────
+
         # Emit sympathy signals for secondary tickers.
         # Requires: (a) direction_source="facts" on primary — interpretive-only
         # primaries may not spawn sympathy chains; (b) not fully priced in;
@@ -857,4 +891,9 @@ class SignalAggregatorService(BaseConsumer):
                         value=sym_signal.to_kafka_dict()
                     )
 
-        return signal.to_kafka_dict()
+        # Attach macro vol regime so pretrade_filter / execution_engine can
+        # apply conviction adjustments without re-fetching Redis.
+        d = signal.to_kafka_dict()
+        d["vol_regime"]        = vol_regime_name
+        d["vol_regime_detail"] = vol_regime_detail
+        return d
