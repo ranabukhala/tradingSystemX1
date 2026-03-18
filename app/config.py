@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     fmp_api_key: str = ""
     fmp_plan: str = "starter"
-    fmp_daily_call_limit: int = 750  # Shared across all FMP containers (10-call buffer vs 250 cap)
+    fmp_daily_call_limit: int = 200  # Shared across all FMP containers; 200 leaves 50 as buffer on free/starter tier
     finnhub_api_key: str = ""
     finnhub_input_topic: str = "news.fmp_enriched"
     # OpenAI — used for embedding dedup (Tier 3.5).

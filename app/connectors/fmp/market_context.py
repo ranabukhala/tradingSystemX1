@@ -7,7 +7,7 @@ Provides two data streams:
    - RSI, MACD, EMA, SMA, Bollinger Bands
    - Stored in Redis keyed by ticker for AI summarizer to pull
 
-2. Sector Performance (market-wide, every 15 min)
+2. Sector Performance (market-wide, every 60 min during market hours)
    - Sector returns for today
    - Used by regime detection and conviction scoring
 
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import zoneinfo
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -26,13 +27,20 @@ from app.config import settings
 from app.connectors.fmp.client import FMPClient
 from app.connectors.base import BaseConnector, _log
 
+_ET = zoneinfo.ZoneInfo("America/New_York")
+
 
 class FMPTechnicalConnector(BaseConnector):
     """
     Polls technical indicators for all active signal tickers.
-    Writes to Redis: fmp:technical:{ticker} with TTL 5min.
+    Writes to Redis: fmp:technical:{ticker} with TTL 24 h.
     AI summarizer reads this to add RSI/MACD context to prompts.
     """
+
+    def __init__(self) -> None:
+        self._redis: aioredis.Redis | None = None
+        self._fmp: FMPClient | None = None
+        super().__init__()
 
     @property
     def source_name(self) -> str:
@@ -47,22 +55,49 @@ class FMPTechnicalConnector(BaseConnector):
     def validate_config(self) -> None:
         pass
 
+    async def _get_redis(self) -> aioredis.Redis:
+        if self._redis is None:
+            self._redis = await aioredis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                max_connections=3,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+        return self._redis
+
+    def _get_fmp(self, redis) -> FMPClient:
+        if self._fmp is None:
+            self._fmp = FMPClient(
+                api_key=settings.fmp_api_key,
+                redis=redis,
+                plan=settings.fmp_plan,
+            )
+        return self._fmp
+
+    @staticmethod
+    def _is_market_day() -> bool:
+        """True if today is a weekday (ignores holidays — good enough)."""
+        return datetime.now(_ET).weekday() < 5
+
     async def fetch(self) -> int:
         if not settings.fmp_api_key:
             return 0
 
-        redis_conn = await aioredis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-        )
-        fmp = FMPClient(api_key=settings.fmp_api_key, redis=redis_conn, plan=settings.fmp_plan)
+        # Only fetch technicals on market days — data is stale overnight/weekends
+        if not self._is_market_day():
+            _log("debug", "fmp_technical.skipped_weekend",
+                 reason="weekend — technical indicators unchanged")
+            return 0
+
+        redis_conn = await self._get_redis()
+        fmp = self._get_fmp(redis_conn)
 
         # Get active signal tickers from Redis (written by signal aggregator)
         active_tickers_raw = await redis_conn.smembers("active_signal_tickers")
         tickers = list(active_tickers_raw) if active_tickers_raw else []
 
         if not tickers:
-            await fmp.close()
             return 0
 
         updated = 0
@@ -81,7 +116,6 @@ class FMPTechnicalConnector(BaseConnector):
              tickers=updated,
              requests_remaining=fmp.daily_requests_remaining)
 
-        await fmp.close()
         return updated
 
     async def _fetch_technicals(self, fmp: FMPClient, ticker: str) -> dict | None:
@@ -125,10 +159,19 @@ class FMPTechnicalConnector(BaseConnector):
 
 class FMPSectorConnector(BaseConnector):
     """
-    Polls sector performance every 15 minutes.
-    Writes to Redis: fmp:sectors with TTL 15min.
+    Polls sector performance every 60 minutes during market hours.
+    Writes to Redis: fmp:sectors with TTL 1 h.
     Used by regime detection and conviction scoring.
+
+    Market-hours guard: skips fetches outside 09:30–16:00 ET Mon–Fri so
+    overnight/weekend polls (which return identical data) don't burn quota.
+    Math: ~6.5 market hours × 1 call/hour ≈ 7 calls/day (down from 48).
     """
+
+    def __init__(self) -> None:
+        self._redis: aioredis.Redis | None = None
+        self._fmp: FMPClient | None = None
+        super().__init__()
 
     @property
     def source_name(self) -> str:
@@ -136,21 +179,58 @@ class FMPSectorConnector(BaseConnector):
 
     @property
     def poll_interval_seconds(self) -> int:
-        return 1_800  # Every 30 minutes
-        # Math: 1 call/cycle × 48 cycles/day = 48 calls/day within the shared 200-call budget.
+        return 3_600  # Every 60 minutes (market hours only via _is_market_hours guard)
 
     def validate_config(self) -> None:
         pass
+
+    async def _get_redis(self) -> aioredis.Redis:
+        if self._redis is None:
+            self._redis = await aioredis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                max_connections=3,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+        return self._redis
+
+    def _get_fmp(self, redis) -> FMPClient:
+        if self._fmp is None:
+            self._fmp = FMPClient(
+                api_key=settings.fmp_api_key,
+                redis=redis,
+                plan=settings.fmp_plan,
+            )
+        return self._fmp
+
+    @staticmethod
+    def _is_market_hours() -> bool:
+        """True if current ET time is within regular market hours Mon–Fri."""
+        now = datetime.now(_ET)
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+        t = (now.hour, now.minute)
+        return (9, 30) <= t < (16, 0)
+
+    @staticmethod
+    def _is_market_day() -> bool:
+        """True if today is a weekday (ignores holidays — good enough)."""
+        return datetime.now(_ET).weekday() < 5
 
     async def fetch(self) -> int:
         if not settings.fmp_api_key:
             return 0
 
-        redis_conn = await aioredis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-        )
-        fmp = FMPClient(api_key=settings.fmp_api_key, redis=redis_conn)
+        # Skip sector fetches outside market hours — data is static overnight
+        # and on weekends. Reduces 48 calls/day → ~7 (market hours only).
+        if not self._is_market_hours():
+            _log("debug", "fmp_sectors.skipped_outside_hours",
+                 reason="market closed — sector data unchanged")
+            return 0
+
+        redis_conn = await self._get_redis()
+        fmp = self._get_fmp(redis_conn)
 
         # Stable endpoint requires a date parameter — use today
         from datetime import date as _date
@@ -158,7 +238,6 @@ class FMPSectorConnector(BaseConnector):
         data = await fmp.get("/stable/sector-performance-snapshot", date=today_str)
 
         if not data or not isinstance(data, list):
-            await fmp.close()
             return 0
 
         # Build sector map
@@ -200,14 +279,13 @@ class FMPSectorConnector(BaseConnector):
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        await redis_conn.setex("fmp:sectors", 3_600, json.dumps(payload))  # 1 h TTL (poll: 30 min)
+        await redis_conn.setex("fmp:sectors", 3_600, json.dumps(payload))  # 1 h TTL
 
         _log("info", "fmp_sectors.updated",
              regime=regime,
              avg_change=avg_change,
              sectors=len(sectors))
 
-        await fmp.close()
         return len(sectors)
 
 

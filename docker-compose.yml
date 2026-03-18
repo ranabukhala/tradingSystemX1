@@ -698,6 +698,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
       FMP_PLAN: ${FMP_PLAN:-starter}
+      FMP_DAILY_CALL_LIMIT: ${FMP_DAILY_CALL_LIMIT:-200}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     ports:
       - "8051:8051"
@@ -722,6 +723,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       FMP_API_KEY: ${FMP_API_KEY:-}
       FMP_PLAN: ${FMP_PLAN:-starter}
+      FMP_DAILY_CALL_LIMIT: ${FMP_DAILY_CALL_LIMIT:-200}
     ports:
       - "8052:8052"
 
@@ -743,6 +745,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
       FMP_PLAN: ${FMP_PLAN:-starter}
+      FMP_DAILY_CALL_LIMIT: ${FMP_DAILY_CALL_LIMIT:-200}
     ports:
       - "8053:8053"
 
@@ -764,6 +767,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
       FMP_PLAN: ${FMP_PLAN:-starter}
+      FMP_DAILY_CALL_LIMIT: ${FMP_DAILY_CALL_LIMIT:-200}
     ports:
       - "8054:8054"
     healthcheck:
