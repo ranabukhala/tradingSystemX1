@@ -696,6 +696,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FMP_API_KEY: ${FMP_API_KEY:-}
       FMP_PLAN: ${FMP_PLAN:-starter}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
     ports:
       - "8051:8051"
 
@@ -854,6 +855,37 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+  finnhub_press_releases:
+    <<: *connector
+    container_name: trading_finnhub_press_releases
+    entrypoint: ["python", "-m", "app.connectors.finnhub"]
+    command: ["press_releases"]
+    environment:
+      SERVICE_NAME: finnhub_press_releases
+      METRICS_PORT: "8065"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-250}
+    ports:
+      - "8065:8065"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   # ══════════════════════════════════════════════════════════
   #  LAYER 10 — PRE-TRADE FILTERS (Phase 5)
   # ══════════════════════════════════════════════════════════

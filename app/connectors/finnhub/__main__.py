@@ -56,13 +56,25 @@ async def run_fundamentals():
     await svc.run()
 
 
+async def run_press_releases():
+    """Press releases + SEC 8-K fast-path for earnings-day tickers."""
+    from app.connectors.finnhub.press_releases import FinnhubPressReleasesConnector
+    svc = FinnhubPressReleasesConnector()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, svc.stop)
+    loop.add_signal_handler(signal.SIGINT, svc.stop)
+    _log("info", "service.starting", service="finnhub_press_releases")
+    await svc.run()
+
+
 if __name__ == "__main__":
     name = sys.argv[1] if len(sys.argv) > 1 else ""
     runners = {
-        "news":         run_news,
-        "websocket":    run_websocket,
-        "sentiment":    run_sentiment,
-        "fundamentals": run_fundamentals,
+        "news":           run_news,
+        "websocket":      run_websocket,
+        "sentiment":      run_sentiment,
+        "fundamentals":   run_fundamentals,
+        "press_releases": run_press_releases,
     }
     runner = runners.get(name)
     if not runner:

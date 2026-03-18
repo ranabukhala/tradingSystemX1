@@ -6,7 +6,8 @@ A positive news catalyst on a heavily shorted stock can produce
 30-100% moves in hours. This filter identifies squeeze setups.
 
 Data sources:
-  - Polygon (sole source) — regulatory filing data (bi-monthly FINRA reports)
+  - Polygon — regulatory filing data (bi-monthly FINRA reports, requires higher plan)
+  - Finnhub — insider transactions (SEC Form 4, real-time; supplements short data)
   Note: IEX Cloud removed — API shut down in 2024
   Note: Finviz Elite export API is screener-only, not suitable for per-ticker short lookups
 
@@ -34,7 +35,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import httpx
@@ -184,10 +185,19 @@ async def _get_short_data(
     except Exception:
         pass
 
-    # Polygon is the sole source for short interest — regulatory filing data (bi-monthly FINRA).
-    # Finviz Elite export API is screener-only and doesn't support per-ticker short data lookups.
-    # IEX Cloud removed — API shut down in 2024.
+    # Polygon: regulatory filing data (bi-monthly FINRA). Requires higher plan.
     data = await _try_polygon_short(ticker, http)
+
+    # Finnhub: insider transactions (SEC Form 4) — supplements short data.
+    # Even when Polygon returns no short interest, insider sentiment adds signal.
+    insider = await _try_finnhub_insider(ticker, redis_conn, http)
+    if insider:
+        if data is None:
+            data = {}
+        data["insider_buys"]          = insider.get("total_buy_value", 0)
+        data["insider_sells"]         = insider.get("total_sell_value", 0)
+        data["insider_net_sentiment"] = insider.get("net_sentiment", "neutral")
+        data["insider_notable"]       = insider.get("notable_transactions", False)
 
     if data:
         try:
@@ -203,6 +213,104 @@ async def _get_short_data(
 #   Short float data lives on quote.ashx (HTML scrape) which is fragile.
 #   Polygon regulatory filing data covers this need adequately.
 
+
+
+async def _try_finnhub_insider(
+    ticker: str,
+    redis_conn: aioredis.Redis,
+    http: httpx.AsyncClient,
+) -> dict | None:
+    """Insider transactions from Finnhub /stock/insider-transactions (SEC Form 4).
+
+    Filters to last 90 days, P (Purchase) and S (Sale) codes only.
+    Returns:
+        total_buy_value   — sum of (|change| * price) for Purchase codes
+        total_sell_value  — sum of (|change| * price) for Sale codes
+        net_sentiment     — "bullish" | "bearish" | "neutral"
+        notable_transactions — True if any single trade > $1M notional
+    """
+    cache_key = f"insider:finnhub:{ticker}"
+    try:
+        cached = await redis_conn.get(cache_key)
+        if cached:
+            return json.loads(cached)
+    except Exception:
+        pass
+
+    finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+    if not finnhub_key:
+        return None
+
+    try:
+        resp = await http.get(
+            "https://finnhub.io/api/v1/stock/insider-transactions",
+            params={"symbol": ticker, "token": finnhub_key},
+            timeout=8.0,
+        )
+        if resp.status_code != 200:
+            return None
+
+        txns = resp.json().get("data", [])
+        if not txns:
+            return None
+
+        # Filter: last 90 days, Purchase (P) and Sale (S) only
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+        buy_value  = 0.0
+        sell_value = 0.0
+        notable    = False
+
+        for t in txns:
+            code  = t.get("transactionCode", "")
+            if code not in ("P", "S"):
+                continue
+            txn_date = t.get("transactionDate", "") or t.get("filingDate", "")
+            if txn_date < cutoff:
+                continue
+
+            shares = abs(t.get("change", 0) or 0)
+            price  = float(t.get("transactionPrice", 0) or 0)
+            value  = shares * price
+
+            if code == "P":
+                buy_value += value
+            else:
+                sell_value += value
+
+            if value >= 1_000_000:
+                notable = True
+
+        if buy_value == 0 and sell_value == 0:
+            return None
+
+        if buy_value > sell_value * 1.5:
+            sentiment = "bullish"
+        elif sell_value > buy_value * 1.5:
+            sentiment = "bearish"
+        else:
+            sentiment = "neutral"
+
+        result = {
+            "total_buy_value":      round(buy_value, 2),
+            "total_sell_value":     round(sell_value, 2),
+            "net_sentiment":        sentiment,
+            "notable_transactions": notable,
+        }
+
+        try:
+            await redis_conn.setex(cache_key, 3600 * 4, json.dumps(result))
+        except Exception:
+            pass
+
+        _log("debug", "squeeze_filter.finnhub_insider_ok",
+             ticker=ticker, sentiment=sentiment,
+             buys=round(buy_value / 1e6, 2), sells=round(sell_value / 1e6, 2))
+        return result
+
+    except Exception as e:
+        _log("warning", "squeeze_filter.finnhub_insider_error",
+             ticker=ticker, error=str(e))
+        return None
 
 
 async def _try_polygon_short(ticker: str, http: httpx.AsyncClient) -> dict | None:

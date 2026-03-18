@@ -18,6 +18,7 @@ New topic: news.fmp_enriched
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -226,18 +227,103 @@ class FMPEnrichmentService(BaseConsumer):
         return result
 
     async def _get_insider(self, ticker: str) -> dict | None:
-        """Get insider trading activity — currently disabled, no data source available.
+        """Get insider trading activity from Finnhub (replaces dead FMP endpoint Aug 2025).
 
         History:
-          /stable/insider-trading       → 404 Not Found (never existed in /stable/ namespace)
-          /api/v4/insider-trading       → 403 Forbidden (legacy endpoint, blocked Aug 2025)
-          Unusual Whales / Finviz       → not available on current plans
+          /stable/insider-trading       → 404 Not Found
+          /api/v4/insider-trading       → 403 Forbidden (blocked Aug 2025)
+          Finnhub /stock/insider-transactions → active, SEC Form 4 data
 
-        The asyncio.gather call in process() still invokes this so the gather
-        structure is unchanged. Downstream code gracefully handles None for fmp_insider.
-        Re-enable and restore the implementation when a provider is added.
+        Filters to last 90 days, Purchase (P) and Sale (S) codes only.
+        Returns net_sentiment, buy/sell totals, and notable_transactions flag.
+        Cached in Redis for 4 hours (insider data changes infrequently).
         """
-        return None
+        finnhub_key = os.environ.get("FINNHUB_API_KEY", "")
+        if not finnhub_key:
+            return None
+
+        cache_key = f"insider:finnhub:{ticker}"
+        try:
+            cached = await self._redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
+        try:
+            import httpx as _httpx
+            from datetime import timedelta
+
+            async with _httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(
+                    "https://finnhub.io/api/v1/stock/insider-transactions",
+                    params={"symbol": ticker, "token": finnhub_key},
+                )
+            if resp.status_code != 200:
+                return None
+
+            txns = resp.json().get("data", [])
+            if not txns:
+                return None
+
+            from datetime import datetime, timezone
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=90)
+            ).strftime("%Y-%m-%d")
+
+            buy_value = sell_value = 0.0
+            notable = False
+
+            for t in txns:
+                code = t.get("transactionCode", "")
+                if code not in ("P", "S"):
+                    continue
+                txn_date = t.get("transactionDate", "") or t.get("filingDate", "")
+                if txn_date < cutoff:
+                    continue
+                shares = abs(t.get("change", 0) or 0)
+                price  = float(t.get("transactionPrice", 0) or 0)
+                value  = shares * price
+                if code == "P":
+                    buy_value += value
+                else:
+                    sell_value += value
+                if value >= 1_000_000:
+                    notable = True
+
+            if buy_value == 0 and sell_value == 0:
+                return None
+
+            if buy_value > sell_value * 1.5:
+                sentiment = "bullish"
+            elif sell_value > buy_value * 1.5:
+                sentiment = "bearish"
+            else:
+                sentiment = "neutral"
+
+            result = {
+                "total_buy_value":      round(buy_value, 2),
+                "total_sell_value":     round(sell_value, 2),
+                "net_sentiment":        sentiment,
+                "notable_transactions": notable,
+                "source":               "finnhub",
+            }
+
+            try:
+                await self._redis.setex(cache_key, 3600 * 4, json.dumps(result))
+            except Exception:
+                pass
+
+            _log("debug", "fmp_enrichment.insider_resolved",
+                 ticker=ticker, sentiment=sentiment,
+                 buys_m=round(buy_value / 1e6, 2),
+                 sells_m=round(sell_value / 1e6, 2))
+            return result
+
+        except Exception as e:
+            _log("warning", "fmp_enrichment.insider_error",
+                 ticker=ticker, error=str(e))
+            return None
 
 
     async def _get_quote(self, ticker: str) -> dict | None:
