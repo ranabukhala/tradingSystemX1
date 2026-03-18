@@ -79,13 +79,14 @@ ET = pytz.timezone("America/New_York")
 # Dampening multipliers (< 1.0) are applied; boost multipliers (> 1.0) logged only.
 TIME_WINDOWS: list[tuple[tuple[int,int], tuple[int,int], float, str, str]] = [
     # (start_hhmm, end_hhmm, multiplier, label, emoji)
-    ((9, 30),  (9, 45),  0.50, "Open shakeout — high noise, fades quickly",    "🔴"),
+    # v1.6: softened dampening — Open 0.50→0.65, Dead zone 0.70→0.85, MOC 0.80→0.88, AH 0.90→0.92
+    ((9, 30),  (9, 45),  0.65, "Open shakeout — high noise, fades quickly",    "🔴"),
     ((9, 45),  (11, 30), 1.10, "Prime window — best intraday trend quality",   "🟢"),
     ((11, 30), (12, 0),  1.00, "Late morning — decent, momentum slowing",      "🟡"),
-    ((12, 0),  (14, 0),  0.70, "Dead zone — low volume, false breakouts",      "🔴"),
+    ((12, 0),  (14, 0),  0.85, "Dead zone — low volume, false breakouts",      "🔴"),
     ((14, 0),  (15, 30), 1.00, "Afternoon trend — ok if volume confirms",      "🟡"),
-    ((15, 30), (16, 0),  0.80, "MOC noise — order imbalances distort moves",   "🟠"),
-    ((16, 0),  (20, 0),  0.90, "After-hours — wider spreads, thin liquidity",  "🟡"),
+    ((15, 30), (16, 0),  0.88, "MOC noise — order imbalances distort moves",   "🟠"),
+    ((16, 0),  (20, 0),  0.92, "After-hours — wider spreads, thin liquidity",  "🟡"),
 ]
 
 class TradingSignal(BaseModel):
@@ -337,11 +338,11 @@ def get_time_window(dt_utc: datetime) -> dict:
                 "quality":       "good" if mult >= 1.0 else ("caution" if mult >= 0.8 else "poor"),
             }
 
-    # Pre-market or overnight
+    # Pre-market or overnight — v1.6: softened 0.90 → 0.92
     return {
         "window_label":  "Pre-market / Overnight",
         "window_emoji":  "🌙",
-        "multiplier":    0.90,
+        "multiplier":    0.92,
         "time_et":       et_now.strftime("%H:%M ET"),
         "quality":       "caution",
     }
@@ -430,6 +431,10 @@ class SignalAggregatorService(BaseConsumer):
     @property
     def service_name(self) -> str:
         return "signal_aggregator"
+
+    @property
+    def pipeline_stage(self) -> str | None:
+        return "signal_aggregated"
 
     @property
     def input_topic(self) -> str:

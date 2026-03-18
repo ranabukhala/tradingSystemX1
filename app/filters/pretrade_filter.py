@@ -103,6 +103,10 @@ class PreTradeFilterService(BaseConsumer):
         return "pretrade_filter"
 
     @property
+    def pipeline_stage(self) -> str | None:
+        return "pretrade_filtered"
+
+    @property
     def input_topic(self) -> str:
         return "signals.actionable"
 

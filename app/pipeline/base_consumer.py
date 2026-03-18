@@ -87,6 +87,24 @@ class BaseConsumer(ABC):
         """Process one record. Return dict to emit or None to drop. Raise to DLQ."""
         ...
 
+    @property
+    def pipeline_stage(self) -> str | None:
+        """
+        Override in subclasses to enable automatic pipeline timestamping.
+
+        When set, BaseConsumer stamps this stage name on every outgoing message
+        immediately after process() returns and before producing to Kafka.
+        The stage_timestamps dict is also automatically propagated from the
+        input message so that earlier stages are never lost even when
+        process() returns a fresh Pydantic model dict without the field.
+
+        Example:
+            @property
+            def pipeline_stage(self) -> str | None:
+                return "normalized"
+        """
+        return None
+
     async def on_start(self) -> None:
         pass
 
@@ -369,6 +387,24 @@ class BaseConsumer(ABC):
                             result["event_id"] = str(uuid4())
                         if "parent_id" not in result:
                             result["parent_id"] = event_id
+
+                        # ── Pipeline timestamp propagation ────────────────
+                        # Copy stage_timestamps from the input message into
+                        # result when process() returns a fresh dict that
+                        # doesn't carry the field (common with Pydantic models
+                        # that don't declare stage_timestamps).  Then stamp
+                        # this service's own stage so downstream consumers
+                        # always see a complete, append-only history.
+                        if "stage_timestamps" not in result:
+                            result["stage_timestamps"] = (
+                                raw.get("stage_timestamps") or {}
+                            )
+                        if self.pipeline_stage:
+                            from app.utils.pipeline_timer import PipelineTimer
+                            result["stage_timestamps"] = PipelineTimer.stamp(
+                                result["stage_timestamps"],
+                                self.pipeline_stage,
+                            )
 
                         key = result.get("vendor_id") or result.get("id")
                         producer.produce(

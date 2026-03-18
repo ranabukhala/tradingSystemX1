@@ -329,6 +329,11 @@ class ExecutionEngine(BaseConsumer):
             _log("warning", "execution.staleness_log_error", error=str(e))
 
     async def process(self, record: dict) -> dict | None:
+        # Capture stage_timestamps from upstream BEFORE Pydantic validation
+        # (model_validate drops unknown fields, so we preserve it separately).
+        from app.utils.pipeline_timer import PipelineTimer
+        _stage_ts: dict = dict(record.get("stage_timestamps") or {})
+
         try:
             signal = TradingSignal.model_validate(record)
         except Exception as e:
@@ -541,6 +546,7 @@ class ExecutionEngine(BaseConsumer):
                      signal_id=str(signal.id))
                 return None
 
+        _stage_ts = PipelineTimer.stamp(_stage_ts, "execution_submitted")
         submit_time = datetime.now(timezone.utc)
         result = await self._broker.submit_order(order)
 
@@ -551,6 +557,8 @@ class ExecutionEngine(BaseConsumer):
                 and result.status not in (
                     OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED)):
             result = await self._fill_poller.wait_for_fill(result, order)
+
+        _stage_ts = PipelineTimer.stamp(_stage_ts, "execution_filled")
 
         _log("info", "execution.order_submitted",
              ticker=ticker,
@@ -583,7 +591,7 @@ class ExecutionEngine(BaseConsumer):
         await self._send_trade_alert(signal, result, decision, price, flow=flow)
 
         # ── Persist to Postgres ───────────────────────────────────────────────
-        await self._save_trade(signal, order, result, decision, price)
+        await self._save_trade(signal, order, result, decision, price, _stage_ts)
 
         # ── Step 12: Persist execution quality row ────────────────────────────
         await self._save_execution_quality(
@@ -623,6 +631,8 @@ class ExecutionEngine(BaseConsumer):
                 "route_type": signal.route_type or "slow",
                 "t1_summary": signal.t1_summary,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                # Pipeline latency — carries the full timestamp chain to trades.executed
+                "stage_timestamps": _stage_ts,
             }
         return None
 
@@ -734,7 +744,15 @@ class ExecutionEngine(BaseConsumer):
         except Exception as e:
             _log("warning", "execution.telegram_error", error=str(e))
 
-    async def _save_trade(self, signal, order, result, decision, price) -> None:
+    async def _save_trade(
+        self,
+        signal,
+        order,
+        result,
+        decision,
+        price,
+        stage_timestamps: dict | None = None,
+    ) -> None:
         """Persist trade to Postgres trades table."""
         try:
             from app.db import get_engine
@@ -754,6 +772,10 @@ class ExecutionEngine(BaseConsumer):
                 except Exception:
                     pass
 
+            # Compute stage-by-stage end-to-end latency from the timestamp chain
+            from app.utils.pipeline_timer import PipelineTimer
+            e2e_ms = PipelineTimer.calculate_e2e_latency_ms(stage_timestamps or {})
+
             async with AsyncSession(engine) as session:
                 await session.execute(text("""
                     INSERT INTO trade (
@@ -762,6 +784,7 @@ class ExecutionEngine(BaseConsumer):
                         take_profit, stop_loss, conviction,
                         catalyst_type, signal_type, status,
                         t1_summary, consumer_lag, pipeline_latency_ms,
+                        stage_timestamps, end_to_end_latency_ms,
                         created_at
                     ) VALUES (
                         gen_random_uuid(), :signal_id, :broker_order_id, :broker,
@@ -769,26 +792,29 @@ class ExecutionEngine(BaseConsumer):
                         :take_profit, :stop_loss, :conviction,
                         :catalyst_type, :signal_type, :status,
                         :t1_summary, :consumer_lag, :pipeline_latency_ms,
+                        :stage_timestamps::jsonb, :end_to_end_latency_ms,
                         now()
                     )
                     ON CONFLICT DO NOTHING
                 """), {
-                    "signal_id":           str(signal.id),
-                    "broker_order_id":     result.broker_order_id,
-                    "broker":              self._broker.name,
-                    "ticker":              signal.ticker,
-                    "direction":           signal.direction,
-                    "qty":                 decision.qty,
-                    "entry_price":         price,
-                    "take_profit":         decision.take_profit,
-                    "stop_loss":           decision.stop_loss,
-                    "conviction":          signal.conviction,
-                    "catalyst_type":       signal.catalyst_type,
-                    "signal_type":         signal.signal_type,
-                    "status":              result.status.value,
-                    "t1_summary":          signal.t1_summary,
-                    "consumer_lag":        self._current_lag,
-                    "pipeline_latency_ms": pipeline_latency_ms,
+                    "signal_id":              str(signal.id),
+                    "broker_order_id":        result.broker_order_id,
+                    "broker":                 self._broker.name,
+                    "ticker":                 signal.ticker,
+                    "direction":              signal.direction,
+                    "qty":                    decision.qty,
+                    "entry_price":            price,
+                    "take_profit":            decision.take_profit,
+                    "stop_loss":              decision.stop_loss,
+                    "conviction":             signal.conviction,
+                    "catalyst_type":          signal.catalyst_type,
+                    "signal_type":            signal.signal_type,
+                    "status":                 result.status.value,
+                    "t1_summary":             signal.t1_summary,
+                    "consumer_lag":           self._current_lag,
+                    "pipeline_latency_ms":    pipeline_latency_ms,
+                    "stage_timestamps":       json.dumps(stage_timestamps or {}),
+                    "end_to_end_latency_ms":  e2e_ms,
                 })
                 await session.commit()
         except Exception as e:

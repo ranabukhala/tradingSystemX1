@@ -91,9 +91,11 @@ _SIGMOID_STEEPNESS = float(os.environ.get("CONVICTION_SIGMOID_STEEPNESS", "8.0")
 _CORR_CAT_WEIGHT_THRESHOLD  = float(os.environ.get("CORR_CAT_WEIGHT_THRESHOLD",  "1.4"))
 _CORR_IMPACT_DAY_THRESHOLD  = float(os.environ.get("CORR_IMPACT_DAY_THRESHOLD",  "0.75"))
 
-# Priced-in multipliers (mirrors signal_aggregator constants)
-_PRICED_IN_YES_MULT      = 0.60
-_PRICED_IN_PARTIAL_MULT  = 0.85
+# Priced-in multipliers — paper trading calibration (v1.6)
+# Softened from 0.60/0.85 to allow genuine catalysts to execute and be measured.
+# Tighten back toward 0.60/0.85 before live trading once priced_in accuracy is known.
+_PRICED_IN_YES_MULT      = 0.75   # was 0.60 — reduce from 40% to 25% haircut
+_PRICED_IN_PARTIAL_MULT  = 0.90   # was 0.85 — reduce from 15% to 10% haircut
 
 
 # ── Catalog weight dicts (authoritative source) ────────────────────────────────
@@ -106,10 +108,10 @@ CATALYST_WEIGHT: dict[CatalystType, float] = {
     CatalystType.MA:          1.8,   # M&A = highest impact
     CatalystType.REGULATORY:  1.4,
     CatalystType.ANALYST:     0.9,
-    CatalystType.FILING:      0.6,
-    CatalystType.MACRO:       0.7,
+    CatalystType.FILING:      0.7,   # was 0.6 — filings often contain material facts
+    CatalystType.MACRO:       0.8,   # was 0.7 — macro moves sectors, not just stocks
     CatalystType.LEGAL:       0.3,   # Lawsuits = lagging catalyst, deeply discounted
-    CatalystType.OTHER:       0.5,
+    CatalystType.OTHER:       0.75,  # was 0.5 — reduces floor, enables direction_from_facts to pass
 }
 
 SESSION_WEIGHT: dict[SessionContext, float] = {

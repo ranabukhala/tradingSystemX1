@@ -285,6 +285,13 @@ class FactsJson(BaseModel):
     # Set to True by signal_aggregator ONLY after Polygon cross-validation passes
     headline_move_validated: bool = False
 
+    # Headline direction signals (v1.6) — lexical extraction by T1
+    # Used in direction_from_facts() Phase 7 to promote headline direction to factual
+    # when the headline explicitly names a direction + the move is today + no EPS facts
+    price_direction: str | None = None   # "up" | "down" | null
+    move_magnitude: str | None = None    # "large" | "small" | null
+    move_is_today: bool | None = None    # true = intraday move; false = historical
+
 
 class SummarizedRecord(EnrichedRecord):
     """

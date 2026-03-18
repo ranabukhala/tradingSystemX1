@@ -67,6 +67,10 @@ class NormalizerService(BaseConsumer):
         return "normalizer"
 
     @property
+    def pipeline_stage(self) -> str | None:
+        return "normalized"
+
+    @property
     def input_topic(self) -> str:
         from app.config import settings
         return settings.topic_news_raw
@@ -77,6 +81,14 @@ class NormalizerService(BaseConsumer):
         return settings.topic_news_normalized
 
     async def process(self, record: dict) -> dict | None:
+        # Stamp news_ingested on the input record NOW — before any processing.
+        # BaseConsumer will copy this into the result dict and then add "normalized".
+        # Result: both stages are set, with news_ingested < normalized.
+        from app.utils.pipeline_timer import PipelineTimer
+        record["stage_timestamps"] = PipelineTimer.stamp(
+            record.get("stage_timestamps"), "news_ingested"
+        )
+
         try:
             raw = RawNewsRecord.from_kafka_dict(record)
         except Exception as e:

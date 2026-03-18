@@ -333,6 +333,16 @@ def direction_from_facts(facts_json) -> str:
             return "long"
         # Between -10% and +10%: too small for strong directional signal → fall through
 
+    # Phase 7: Headline lexical direction promotion (v1.6)
+    # Promote to facts when T1 extracted an explicit directional word + move_is_today=True.
+    # Only applies when no stronger factual signal exists above.
+    # Requires: explicit direction word ("up"/"down") + move confirmed as today's move.
+    # Does NOT require headline_move_validated (no Polygon call needed — lexical only).
+    price_dir = getattr(facts_json, "price_direction", None)
+    move_today = getattr(facts_json, "move_is_today", None)
+    if price_dir in ("up", "down") and move_today is True:
+        return "long" if price_dir == "up" else "short"
+
     return "neutral"
 
 
@@ -557,5 +567,40 @@ def _validate_facts_json(facts, result: LLMValidationResult) -> tuple[bool, bool
             # Non-blocking: unknown outcome → neutral direction, not invalid record
         else:
             has_fact = True
+
+    # Headline direction fields (v1.6) — vocabulary checks (non-blocking)
+    price_dir = getattr(facts, "price_direction", None)
+    if price_dir is not None:
+        if price_dir not in ("up", "down"):
+            result.issues.append(ValidationIssue(
+                field="price_direction", raw_value=price_dir,
+                reason="must be 'up', 'down', or null",
+                trust_class=LLMTrustClass.INTERPRETIVE,
+            ))
+            # Sanitize invalid value so Phase 7 can't act on it
+            try:
+                object.__setattr__(facts, "price_direction", None)
+            except Exception:
+                pass
+
+    move_mag = getattr(facts, "move_magnitude", None)
+    if move_mag is not None and move_mag not in ("large", "small"):
+        result.issues.append(ValidationIssue(
+            field="move_magnitude", raw_value=move_mag,
+            reason="must be 'large', 'small', or null",
+            trust_class=LLMTrustClass.INTERPRETIVE,
+        ))
+
+    move_today = getattr(facts, "move_is_today", None)
+    if move_today is not None and not isinstance(move_today, bool):
+        result.issues.append(ValidationIssue(
+            field="move_is_today", raw_value=move_today,
+            reason="must be bool or null",
+            trust_class=LLMTrustClass.INTERPRETIVE,
+        ))
+        try:
+            object.__setattr__(facts, "move_is_today", None)
+        except Exception:
+            pass
 
     return all_ok, has_fact

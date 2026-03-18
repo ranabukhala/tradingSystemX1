@@ -226,6 +226,21 @@ def format_signal_message(
         lines.append("")
         lines.append(f"🕐 _Timing:_ {tw_emoji} {tw_label}{tw_warn}{mult_str}")
 
+    # ── Slow-pipeline warning ─────────────────────────────────────────────────
+    stage_ts = ctx.get("stage_timestamps") or {}
+    if stage_ts:
+        from app.utils.pipeline_timer import PipelineTimer
+        e2e = PipelineTimer.calculate_e2e_latency_ms(stage_ts)
+        if e2e and e2e > 10_000:   # 10 s threshold
+            slowest = PipelineTimer.slowest_stage(stage_ts)
+            bottleneck = (
+                f"{slowest[0]} @ {slowest[1] / 1000:.1f}s"
+                if slowest else "unknown"
+            )
+            lines.append(
+                f"⚠️ _Slow pipeline: {e2e / 1000:.1f}s total · bottleneck: {bottleneck}_"
+            )
+
     # ── Footer: signal ID + Item 4 event dedup indicator ─────────────────────
     lines.append("")
     id_parts = [f"🆔 `{str(signal.id)[:8]}`"]
@@ -592,7 +607,7 @@ class TelegramAlertsService(BaseConsumer):
 
         if self._http and self._bot_token and self._chat_id:
             tech_checks = record.get("filter_technicals", {}).get("checks", {})
-            await self._send_alert(signal, tech_checks)
+            await self._send_alert(signal, tech_checks, record=record)
 
         return None   # pass-through; don't re-emit to Kafka
 
@@ -652,13 +667,28 @@ class TelegramAlertsService(BaseConsumer):
 
         return ctx
 
+    def _enrich_context_with_record(self, ctx: dict, record: dict) -> dict:
+        """
+        Merge stage_timestamps from the raw Kafka record into the context dict.
+        Called in _send_alert() so the slow-pipeline warning has timing data.
+        """
+        stage_ts = record.get("stage_timestamps")
+        if stage_ts:
+            ctx["stage_timestamps"] = stage_ts
+        return ctx
+
     async def _send_alert(
         self,
         signal:      TradingSignal,
         tech_checks: dict | None = None,
+        record:      dict | None = None,
     ) -> None:
         """Fetch context, format, and send the Telegram alert."""
         context = await self._fetch_context(signal)
+        # Merge stage_timestamps from the raw Kafka record so the slow-pipeline
+        # warning in format_signal_message() has the full timing chain.
+        if record:
+            self._enrich_context_with_record(context, record)
         message = format_signal_message(signal, tech_checks=tech_checks, context=context)
 
         try:

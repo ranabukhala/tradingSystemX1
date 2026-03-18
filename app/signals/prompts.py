@@ -3,7 +3,7 @@ Prompt templates for the AI summarizer.
 All prompts versioned — bump PROMPT_VERSION when changing.
 """
 
-PROMPT_VERSION = "v1.5"
+PROMPT_VERSION = "v1.6"
 
 # ── T1 Prompt: Fast facts extraction ─────────────────────────────────────────
 T1_SYSTEM = """You are a financial news analyst. Extract structured facts from news headlines.
@@ -41,7 +41,10 @@ Respond with this exact JSON structure:
     "fda_outcome": null,
     "actual_value": null,
     "estimate_value": null,
-    "headline_move_pct": null
+    "headline_move_pct": null,
+    "price_direction": null,
+    "move_magnitude": null,
+    "move_is_today": null
   }}
 }}
 
@@ -60,6 +63,19 @@ Rules:
   Examples that MUST be null: "Could drop 25% if...", "Has risen 198% this year", "Analyst sees 30% upside"
   Sign convention: negative for drops (e.g. -25.0), positive for gains (e.g. +40.0)
   Must be null if the move is hypothetical, historical, or about a different company than the primary ticker.
+- price_direction: "up"|"down"|null — the EXPLICIT directional word in the headline for the primary ticker.
+  "up" for: surges, jumps, gains, rises, rallies, spikes, soars, climbs, beats.
+  "down" for: falls, drops, sinks, tumbles, slides, plunges, misses, cuts, warns.
+  null if: no explicit direction stated, or direction is ambiguous/mixed.
+  This is purely lexical — do NOT infer direction from context, only from explicit words present.
+- move_magnitude: "large"|"small"|null — size of the described move.
+  "large" if: move_pct >= 5%, OR words like "surge", "plunge", "crash", "soar", "tank".
+  "small" if: move_pct < 5% AND words like "edge", "tick", "inch", "slight", "modest".
+  null if: no magnitude information available.
+- move_is_today: true|false|null — is the described price move happening TODAY (intraday)?
+  true if: "today", "intraday", present tense verb (surges, falls), "on earnings", "after report".
+  false if: "this year", "past month", "historically", "since IPO", past tense about prior days.
+  null if: unclear or no move described.
 - tickers_extracted: list of US stock ticker symbols for companies DIRECTLY discussed in the article (e.g., ["BA", "DOCU", "FDX"]). Maximum 3 tickers. Return empty list if no specific company is identified.
 - If the Tickers field above is "unknown" or empty, you MUST attempt to identify the relevant ticker(s) from the title and snippet. Examples: "Boeing" = BA, "DocuSign" = DOCU, "FedEx" = FDX, "Carnival" = CCL, "Palantir" = PLTR, "Snowflake" = SNOW. Only include companies directly and primarily discussed — not tangential or sympathy mentions."""
 
@@ -113,8 +129,18 @@ Rules:
 - signal_bias: directional lean for primary ticker
 - key_levels: list of important price levels mentioned or implied (numbers only)
 - watch_for: one sentence — specific price level or event that invalidates this thesis in next 30 min
-- priced_in: yes=market already moved on this, partially=some anticipation priced, no=genuine surprise
-- priced_in_reason: cite pre-market move, whisper numbers, or prior analyst coverage as evidence
+- priced_in: yes|partially|no — Has the market ALREADY FULLY reacted to this specific catalyst?
+  "yes" ONLY if: (a) the stock has already moved >3% in the direction this catalyst implies, AND
+  (b) the move happened AFTER this specific news was published, AND (c) there is no remaining
+  information asymmetry (e.g., full earnings details are now public for 2+ hours).
+  "partially" if: the stock moved somewhat but the full implications aren't priced (e.g., earnings
+  beat is known but guidance hasn't been digested, or the move is <2%).
+  "no" if: the news is breaking/recent AND the stock hasn't moved significantly yet, OR if the
+  catalyst has multi-day implications that can't be fully priced in one session.
+  DEFAULT TO "no" when uncertain — for paper trading it's better to trade a priced-in signal
+  than to miss a genuine catalyst. You can always exit if wrong.
+- priced_in_reason: cite specific evidence — pre-market move %, whisper numbers vs actual, or
+  prior analyst coverage. If defaulting to "no" due to uncertainty, state that explicitly.
 - sympathy_plays: list up to 3 tickers in same sector/theme likely to move in sympathy (NOT the primary ticker). Empty list if no clear sympathy plays. Only well-known liquid tickers."""
 
 

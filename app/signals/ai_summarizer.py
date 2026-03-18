@@ -78,6 +78,10 @@ class AISummarizerService(BaseConsumer):
         return "ai_summarizer"
 
     @property
+    def pipeline_stage(self) -> str | None:
+        return "ai_summarized"
+
+    @property
     def input_topic(self) -> str:
         return settings.topic_news_fmp_enriched
 

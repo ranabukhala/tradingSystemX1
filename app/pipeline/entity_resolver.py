@@ -455,6 +455,10 @@ def estimate_decay(catalyst: CatalystType, mode: NewsMode, session: SessionConte
 
 class EntityResolverService(BaseConsumer):
 
+    @property
+    def pipeline_stage(self) -> str | None:
+        return "entity_resolved"
+
     def __init__(self) -> None:
         self._upcoming_earnings: dict[str, datetime] = {}
         self._earnings_loaded_at: datetime | None = None
@@ -549,7 +553,7 @@ class EntityResolverService(BaseConsumer):
         catalyst = classify_catalyst(deduped.raw_categories, deduped.title)
 
         # 3. Session context
-        session_ctx = get_session_context(deduped.published_at)
+        session_ctx = get_session_context(datetime.now(timezone.utc))
 
         # 4. Mode
         mode = detect_mode(tickers, catalyst)

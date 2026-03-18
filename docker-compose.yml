@@ -520,6 +520,9 @@ services:
       ENABLE_SIGNAL_EVENT_GATE: ${ENABLE_SIGNAL_EVENT_GATE:-true}
       MULTI_SIGNAL_POLICY: ${MULTI_SIGNAL_POLICY:-deny}
       SIGNAL_DEDUP_TTL_SEC: ${SIGNAL_DEDUP_TTL_SEC:-14400}
+      # Conviction feature logging — log dropped signals for diagnostics
+      CONVICTION_LOG_FEATURES: ${CONVICTION_LOG_FEATURES:-true}
+      CONVICTION_LOG_DROPPED_FEATURES: "true"
     ports:
       - "8022:8022"
 
