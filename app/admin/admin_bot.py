@@ -1,20 +1,20 @@
 """
-Admin Bot — Telegram bot for remote system management.
+Admin Bot  -  Telegram bot for remote system management.
 
 Commands:
-  /status    — full system health dashboard
-  /ps        — list all containers with status
-  /stop      — stop all trading services (keeps infra running)
-  /start     — start all trading services
-  /restart   — restart a specific service
-  /logs      — get last 20 lines of a service
-  /budget    — LLM daily spend summary
-  /signals   — recent signals summary
-  /lag       — Kafka consumer lag
-  /apistatus — test all external API connections live
-  /help      — command list
+  /status     -  full system health dashboard
+  /ps         -  list all containers with status
+  /stop       -  stop all trading services (keeps infra running)
+  /start      -  start all trading services
+  /restart    -  restart a specific service
+  /logs       -  get last 20 lines of a service
+  /budget     -  LLM daily spend summary
+  /signals    -  recent signals summary
+  /lag        -  Kafka consumer lag
+  /apistatus  -  test all external API connections live
+  /help       -  command list
 
-Security: only responds to ADMIN_CHAT_ID — ignores all other chats.
+Security: only responds to ADMIN_CHAT_ID  -  ignores all other chats.
 """
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ class AdminBot:
     async def start(self) -> None:
         if not self._bot_token:
             _log("error", "admin_bot.no_token",
-                 msg="ADMIN_BOT_TOKEN not set — admin bot disabled")
+                 msg="ADMIN_BOT_TOKEN not set  -  admin bot disabled")
             return
 
         self._running = True
@@ -228,7 +228,7 @@ class AdminBot:
 
         overall = "✅ All systems operational" if snap.get("overall_healthy") else "⚠️ Issues detected"
 
-        lines = [f"📊 *System Status* — {ts} UTC", f"", overall, ""]
+        lines = [f"📊 *System Status*  -  {ts} UTC", f"", overall, ""]
 
         services = snap.get("services", {})
         # Group: connectors, pipeline, signals, infra
@@ -389,65 +389,29 @@ class AdminBot:
             await self._send(f"❌ Error fetching logs: {e}")
 
     async def _cmd_budget(self, args: list) -> None:
-        """LLM daily + monthly budget summary."""
-        try:
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            month = datetime.now(timezone.utc).strftime("%Y-%m")
+        """LLM daily budget summary."""
+        snapshot_raw = await self._redis.get("watchdog:snapshot")
+        if snapshot_raw:
+            snap = json.loads(snapshot_raw)
+            used = snap.get("llm_budget_used", 0)
+            limit = snap.get("llm_budget_limit", 5)
+        else:
+            used, limit = 0.0, 5.0
 
-            keys = [
-                f"llm:budget:{today}",
-                f"llm:budget:{today}:anthropic",
-                f"llm:budget:{today}:openai",
-                f"llm:budget:monthly:{month}",
-                f"llm:budget:monthly:{month}:anthropic",
-                f"llm:budget:monthly:{month}:openai",
-                f"llm:calls:{today}:anthropic",
-                f"llm:calls:{today}:openai",
-            ]
-            values = await self._redis.mget(*keys)
+        pct = used / limit * 100 if limit else 0
+        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+        remaining = limit - used
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-            def _f(v): return float(v) if v else 0.0
-
-            d_total  = _f(values[0])
-            d_anthro = _f(values[1])
-            d_openai = _f(values[2])
-            m_total  = _f(values[3])
-            m_anthro = _f(values[4])
-            m_openai = _f(values[5])
-            c_anthro = int(values[6] or 0)
-            c_openai = int(values[7] or 0)
-
-            # Read limits from watchdog snapshot if available
-            snap_raw = await self._redis.get("watchdog:snapshot")
-            d_limit = 25.0
-            m_limit = 500.0
-            if snap_raw:
-                snap = json.loads(snap_raw)
-                d_limit = snap.get("llm_budget_limit", 25.0)
-
-            d_pct = d_total / d_limit * 100 if d_limit else 0
-            m_pct = m_total / m_limit * 100 if m_limit else 0
-            d_bar = "█" * int(d_pct / 10) + "░" * (10 - int(d_pct / 10))
-            m_bar = "█" * int(m_pct / 10) + "░" * (10 - int(m_pct / 10))
-
-            await self._send(
-                f"LLM BUDGET\n\n"
-                f"TODAY ({today})\n"
-                f"{d_bar} {d_pct:.1f}%\n"
-                f"  Total:     ${d_total:.4f} / ${d_limit:.2f}\n"
-                f"  Anthropic: ${d_anthro:.4f}  ({c_anthro} calls)\n"
-                f"  OpenAI:    ${d_openai:.5f}  ({c_openai} embeddings)\n"
-                f"  Remaining: ${max(0, d_limit - d_total):.4f}\n\n"
-                f"THIS MONTH ({month})\n"
-                f"{m_bar} {m_pct:.1f}%\n"
-                f"  Total:     ${m_total:.2f} / ${m_limit:.2f}\n"
-                f"  Anthropic: ${m_anthro:.2f}\n"
-                f"  OpenAI:    ${m_openai:.3f}\n"
-                f"  Remaining: ${max(0, m_limit - m_total):.2f}",
-                markdown=False,
-            )
-        except Exception as e:
-            await self._send(f"Budget error: {e}", markdown=False)
+        await self._send(
+            f"💰 *LLM Budget  -  {today}*\n\n"
+            f"`{bar}` {pct:.1f}%\n\n"
+            f"Spent:     ${used:.4f}\n"
+            f"Remaining: ${remaining:.4f}\n"
+            f"Limit:     ${limit:.2f}/day\n\n"
+            f"T1 (Haiku):  ~$0.0008/item\n"
+            f"T2 (Sonnet): ~$0.011/item"
+        )
 
     async def _cmd_signals(self, args: list) -> None:
         """Recent signals from Redis."""
@@ -468,7 +432,7 @@ class AdminBot:
                     ticker = sig.get("ticker", "?")
                     conviction = int(sig.get("conviction", 0) * 100)
                     signal_type = sig.get("signal_type", "")
-                    lines.append(f"{emoji} *{ticker}* {conviction}% — {signal_type}")
+                    lines.append(f"{emoji} *{ticker}* {conviction}%  -  {signal_type}")
 
             await self._send("\n".join(lines))
         except Exception as e:
@@ -560,7 +524,7 @@ class AdminBot:
                         arrow = "↑" if r["direction"] == "long" else "↓"
                         lines.append(f"  {arrow} {r['ticker']} x{r['n']}")
             else:
-                lines.append("trade table not found — run migration 004")
+                lines.append("trade table not found  -  run migration 004")
 
             if has_signal_log:
                 sig_stats = await conn.fetchrow("""
@@ -585,9 +549,9 @@ class AdminBot:
                         f"Accuracy:        {emoji} {acc}%  ({s['evaluated']} outcomes)",
                     ]
                 else:
-                    lines.append("\nsignal_log empty — aggregator not writing yet")
+                    lines.append("\nsignal_log empty  -  aggregator not writing yet")
             else:
-                lines.append("\nsignal_log not found — run migration 005")
+                lines.append("\nsignal_log not found  -  run migration 005")
 
             await conn.close()
             await self._send("\n".join(lines), markdown=False)
@@ -596,7 +560,7 @@ class AdminBot:
             await self._send(f"DB error: {e}")
 
     async def _cmd_outcomes(self, args: list) -> None:
-        """Yesterday's signal outcomes — ✓/✗ per ticker."""
+        """Yesterday's signal outcomes  -  ✓/✗ per ticker."""
         try:
             import asyncpg
             conn = await asyncpg.connect(self._db_url)
@@ -636,7 +600,7 @@ class AdminBot:
             evaluated = correct + incorrect
             acc = int(correct / evaluated * 100) if evaluated else 0
 
-            lines = [f"📊 Outcomes — {correct}/{evaluated} correct ({acc}%)\n"]
+            lines = [f"📊 Outcomes  -  {correct}/{evaluated} correct ({acc}%)\n"]
 
             for r in rows:
                 if r["outcome_correct"] is True:
@@ -655,7 +619,7 @@ class AdminBot:
                 )
 
             if pending:
-                lines.append(f"\n⏳ {pending} signals still pending outcomes — run /run_outcomes")
+                lines.append(f"\n⏳ {pending} signals still pending outcomes  -  run /run_outcomes")
 
             await self._send("\n".join(lines))
 
@@ -686,7 +650,7 @@ class AdminBot:
             else:
                 await self._send(f"❌ Outcome tracker failed:\n```\n{stderr or output}\n```")
         except subprocess.TimeoutExpired:
-            await self._send("⏰ Timed out — try again after market close")
+            await self._send("⏰ Timed out  -  try again after market close")
         except Exception as e:
             await self._send(f"❌ Error: {e}")
 
@@ -734,7 +698,7 @@ class AdminBot:
 
         icon = "✅" if not fail else "❌"
         ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        lines = [f"{icon} *API Status* — {ts}",
+        lines = [f"{icon} *API Status*  -  {ts}",
                  f"✅ {len(ok)} OK  ❌ {len(fail)} FAIL  ⚠️ {len(warn)} WARN  ⏭ {len(skip)} SKIP",
                  ""]
 
@@ -758,7 +722,7 @@ class AdminBot:
             lines.append("*OK:*")
             for r in ok:
                 lat = f" {r['latency']:.0f}ms" if r["latency"] else ""
-                lines.append(f"  ✅ {r['api']} / {r['check']}{lat} — {r['detail'][:50]}")
+                lines.append(f"  ✅ {r['api']} / {r['check']}{lat}  -  {r['detail'][:50]}")
 
         if skip:
             skipped = ", ".join(f"{r['api']}" for r in skip)
@@ -881,9 +845,9 @@ class AdminBot:
                 row = rows[0]
                 sf = row.get("Short Float") or row.get("Short Float %", "?")
                 return "OK", f"NVDA short float: {sf}", lat
-            return "WARN", "CSV empty — check filter params", lat
+            return "WARN", "CSV empty  -  check filter params", lat
         elif resp.status_code == 401:
-            return "FAIL", "401 Unauthorized — key invalid or expired", lat
+            return "FAIL", "401 Unauthorized  -  key invalid or expired", lat
         return "FAIL", f"HTTP {resp.status_code}", lat
 
     async def _api_fmp_quote(self, keys: dict, http: httpx.AsyncClient):
@@ -919,7 +883,7 @@ class AdminBot:
                 return "OK", f"RSI(14)={float(rsi):.2f}" if rsi is not None else "RSI null", lat
             if isinstance(data, dict) and "Error Message" in data:
                 return "FAIL", data["Error Message"][:60], lat
-            return "WARN", "No RSI data — check FMP plan", lat
+            return "WARN", "No RSI data  -  check FMP plan", lat
         return "FAIL", f"HTTP {resp.status_code}", lat
 
     async def _api_finnhub_news(self, keys: dict, http: httpx.AsyncClient):
@@ -1036,9 +1000,11 @@ class AdminBot:
             )
             return
 
+        total_suppressed = sum(log_bundle.get("suppressed_counts", {}).values())
+        suppress_note = f" ({total_suppressed} restart-cascade errors suppressed)" if total_suppressed else ""
         await self._send(
             f"📦 Collected {log_bundle['total_issues']} issues from "
-            f"{log_bundle['containers_with_issues']} containers — analysing with Claude..."
+            f"{log_bundle['containers_with_issues']} containers{suppress_note}  -  analysing with Claude..."
         )
 
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -1049,7 +1015,7 @@ class AdminBot:
 
         summary = await reporter.analyse_with_claude(log_bundle, anthropic_key)
 
-        # Send as plain text — AI output uses ## headers and **bold** which
+        # Send as plain text  -  AI output uses ## headers and **bold** which
         # are not valid Telegram Markdown v1 and cause parse failures.
         # _send() also has an auto-fallback, but better to be explicit.
         for chunk in _split_message(summary, limit=4000):
@@ -1063,7 +1029,7 @@ class AdminBot:
     async def _send_raw_log_summary(self, log_bundle: dict) -> None:
         """Fallback: send a plain-text error summary (no Claude key)."""
         lines = [
-            f"⚠️ *ANTHROPIC_API_KEY not set — raw summary*\n",
+            f"⚠️ *ANTHROPIC_API_KEY not set  -  raw summary*\n",
             f"Scanned: {log_bundle['containers_scanned']} containers, "
             f"{log_bundle['lines_scanned']:,} lines",
             f"Issues: {log_bundle['total_issues']} across "
@@ -1120,7 +1086,20 @@ class AdminBot:
                 resp = await docker.post(
                     f"http://docker/containers/{container}/{action}"
                 )
-                return resp.status_code in (200, 204, 304)
+                ok = resp.status_code in (200, 204, 304)
+                # Record restart timestamp in Redis so logreport can suppress
+                # cascade errors that occur in the restart window
+                if ok and action in ("restart", "start") and self._redis:
+                    try:
+                        import time as _time
+                        await self._redis.setex(
+                            f"watchdog:restart:{container}",
+                            3600,  # 1 hour TTL
+                            str(int(_time.time())),
+                        )
+                    except Exception:
+                        pass
+                return ok
         except Exception as e:
             _log("error", "admin_bot.docker_action_error",
                  container=container, action=action, error=str(e))
@@ -1201,7 +1180,7 @@ def _strip_markdown(text: str) -> str:
     text = re.sub(r"[*_]", "", text)
     # Remove backticks
     text = text.replace("`", "'")
-    # Remove [text](url) links — keep display text
+    # Remove [text](url) links  -  keep display text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"", text)
     return text
 
@@ -1256,17 +1235,17 @@ class LogReporter:
     WARNING_KEYWORDS = ("warning", "warn", "deprecated", "timeout", "retry",
                         "rate.limit", "rate_limit", "backoff")
 
-    # High-volume benign patterns — suppressed before any classification.
+    # High-volume benign patterns  -  suppressed before any classification.
     # These inflate issue counts and confuse the AI without indicating real problems.
     NOISE_PATTERNS = (
         # Redpanda: services auto-create topics on every startup;
-        # already-existing topics are rejected with this warning — harmless.
+        # already-existing topics are rejected with this warning  -  harmless.
         "topic_already_exists",
-        # Grafana plugin update checker emits level=info lines — not errors.
+        # Grafana plugin update checker emits level=info lines  -  not errors.
         "flag evaluation succeeded",
         "pluginsAutoUpdate",
         # Prometheus: after restart it re-ingests historical metric samples
-        # that arrive out of chronological order — self-resolving.
+        # that arrive out of chronological order  -  self-resolving.
         "out-of-order samples",
         "ingesting out-of-order",
         # asyncpg pool churn during normal operation
@@ -1280,7 +1259,7 @@ class LogReporter:
                  redis=None) -> None:
         self._socket = docker_socket
         self._http   = http
-        self._redis  = redis  # optional — used for pipeline context enrichment
+        self._redis  = redis  # optional  -  used for pipeline context enrichment
 
     async def collect(self, minutes: int = 30) -> dict:
         """
@@ -1294,24 +1273,44 @@ class LogReporter:
               "lines_scanned": int,
               "total_issues": int,
               "window_minutes": int,
+              "restart_events": { container_name: unix_timestamp },
+              "suppressed_counts": { container_name: int },
             }
         """
         since_seconds = minutes * 60
+
+        # Fetch recent restart timestamps from Redis for all containers.
+        # Errors occurring within RESTART_SUPPRESS_WINDOW_S seconds after a
+        # restart are tagged as restart-induced so Claude can discount them.
+        restart_events: dict[str, int] = {}
+        if self._redis:
+            try:
+                keys = [f"watchdog:restart:{c}" for c in self.ALL_CONTAINERS]
+                values = await self._redis.mget(*keys)
+                for container, val in zip(self.ALL_CONTAINERS, values):
+                    if val:
+                        restart_events[container] = int(val)
+            except Exception:
+                pass
+
         tasks = [
-            self._fetch_container_issues(c, since_seconds)
+            self._fetch_container_issues(c, since_seconds, restart_events.get(c))
             for c in self.ALL_CONTAINERS
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         entries: dict[str, list[dict]] = {}
+        suppressed_counts: dict[str, int] = {}
         lines_scanned = 0
         for container, result in zip(self.ALL_CONTAINERS, results):
             if isinstance(result, Exception) or result is None:
                 continue
-            issues, scanned = result
+            issues, scanned, suppressed = result
             lines_scanned += scanned
             if issues:
                 entries[container] = issues
+            if suppressed:
+                suppressed_counts[container] = suppressed
 
         return {
             "entries":                entries,
@@ -1320,19 +1319,52 @@ class LogReporter:
             "lines_scanned":          lines_scanned,
             "total_issues":           sum(len(v) for v in entries.values()),
             "window_minutes":         minutes,
+            "restart_events":         restart_events,
+            "suppressed_counts":      suppressed_counts,
         }
 
+    # Errors occurring within this many seconds after a restart are treated as
+    # restart-induced cascade noise and suppressed from the digest.
+    RESTART_SUPPRESS_WINDOW_S = 180  # 3 minutes
+
+    # Patterns that indicate a restart-induced cascade error (not real failures)
+    RESTART_NOISE_PATTERNS = (
+        "Connect to ipv4",           # rdkafka reconnecting after broker restart
+        "Failed to resolve",         # DNS blip during restart
+        "Connection refused",        # service not yet up
+        "Connect call failed",       # connection during startup
+        "bootstrap: Disconnected",   # Kafka bootstrap reconnect
+        "Name or service not known", # DNS during restart window
+        "FAIL|rdkafka",              # rdkafka connection failure
+        "Disconnected while",        # clean disconnect on restart
+    )
+
     async def _fetch_container_issues(
-        self, container: str, since_seconds: int
-    ) -> tuple[list[dict], int] | None:
-        """Fetch and filter logs for a single container."""
+        self, container: str, since_seconds: int,
+        restart_ts: int | None = None,
+    ) -> tuple[list[dict], int, int] | None:
+        """
+        Fetch and filter logs for a single container.
+
+        Args:
+            container:    container name
+            since_seconds: how far back to fetch (relative to now)
+            restart_ts:   unix timestamp of last restart, or None
+
+        Returns:
+            (issues, lines_scanned, suppressed_count) or None
+        """
+        import time as _time
+        now_ts = int(_time.time())
+
+        # Request logs with timestamps so we can correlate with restart time
         try:
             transport = httpx.AsyncHTTPTransport(uds=self._socket)
             async with httpx.AsyncClient(transport=transport, timeout=8.0) as docker:
                 resp = await docker.get(
                     f"http://docker/containers/{container}/logs"
                     f"?since={since_seconds}&stdout=true&stderr=true"
-                    f"&timestamps=false&tail=500"
+                    f"&timestamps=true"   # no tail limit — since= handles the window
                 )
                 if resp.status_code == 404:
                     return None  # container doesn't exist
@@ -1341,19 +1373,58 @@ class LogReporter:
             return None
 
         # Strip Docker multiplexing 8-byte headers
+        # With timestamps=true, each line is: "2026-03-18T13:06:32.123456789Z <content>"
         clean_lines = []
         for line in raw.split("\n"):
             if not line:
                 continue
-            clean_lines.append(line[8:] if len(line) > 8 and line[0] in "\x01\x02" else line)
+            stripped = line[8:] if len(line) > 8 and line[0] in "\x01\x02" else line
+            clean_lines.append(stripped)
+
+        # Safety cap: if a container generated an enormous number of lines within
+        # the window (e.g. a crash loop), take only the most recent 800.
+        # Unlike Docker --tail, this always preserves the NEWEST lines.
+        if len(clean_lines) > 800:
+            clean_lines = clean_lines[-800:]
 
         issues: list[dict] = []
+        suppressed = 0
+
         for line in clean_lines:
-            issue = self._classify_line(line)
+            # Extract timestamp prefix if present (Docker timestamps=true format)
+            line_ts: int | None = None
+            content = line
+            if line and len(line) > 30 and line[0].isdigit():
+                try:
+                    # Format: "2026-03-18T13:06:32.123456789Z rest of line"
+                    ts_part = line[:30].split(" ")[0].rstrip("Z")
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(ts_part[:26])
+                    dt = dt.replace(tzinfo=timezone.utc)
+                    line_ts = int(dt.timestamp())
+                    content = line[31:] if len(line) > 31 else line
+                except Exception:
+                    content = line
+
+            # Suppress restart-induced cascade errors
+            if restart_ts and line_ts:
+                seconds_after_restart = line_ts - restart_ts
+                if 0 <= seconds_after_restart <= self.RESTART_SUPPRESS_WINDOW_S:
+                    # Within restart window  -  check if it's a known cascade pattern
+                    if any(p in content for p in self.RESTART_NOISE_PATTERNS):
+                        suppressed += 1
+                        continue
+
+            issue = self._classify_line(content)
             if issue:
+                # Tag issue with whether it's in a restart window
+                if restart_ts and line_ts:
+                    seconds_after = line_ts - restart_ts
+                    if 0 <= seconds_after <= self.RESTART_SUPPRESS_WINDOW_S:
+                        issue["restart_induced"] = True
                 issues.append(issue)
 
-        return issues, len(clean_lines)
+        return issues, len(clean_lines), suppressed
 
     def _classify_line(self, line: str) -> dict | None:
         """
@@ -1437,12 +1508,35 @@ class LogReporter:
         except Exception:
             pass
 
+        # Build restart context summary for the AI
+        restart_ctx = ""
+        restart_events = log_bundle.get("restart_events", {})
+        suppressed_counts = log_bundle.get("suppressed_counts", {})
+        if restart_events or suppressed_counts:
+            import time as _time
+            now_ts = int(_time.time())
+            restart_lines = ["Recent restarts (errors within 3min after restart are suppressed):"]
+            for container, ts in sorted(restart_events.items()):
+                display = SERVICE_DISPLAY.get(container, container.replace("trading_", ""))
+                mins_ago = int((now_ts - ts) / 60)
+                suppressed = suppressed_counts.get(container, 0)
+                suppress_note = f"  -  {suppressed} cascade errors suppressed" if suppressed else ""
+                restart_lines.append(f"  {display}: restarted {mins_ago}m ago{suppress_note}")
+            total_suppressed = sum(suppressed_counts.values())
+            if total_suppressed:
+                restart_lines.append(
+                    f"  TOTAL SUPPRESSED: {total_suppressed} restart-induced cascade errors "
+                    f"excluded from issue count above"
+                )
+            restart_ctx = "\n".join(restart_lines) + "\n"
+
         digest_lines = [
-            f"Trading system log digest — last {log_bundle['window_minutes']} minutes",
+            f"Trading system log digest  -  last {log_bundle['window_minutes']} minutes",
             f"Containers scanned: {log_bundle['containers_scanned']}",
             f"Total issues found: {log_bundle['total_issues']} "
             f"across {log_bundle['containers_with_issues']} containers",
             pipeline_ctx,
+            restart_ctx,
             "",
         ]
 
@@ -1454,7 +1548,7 @@ class LogReporter:
                 f"[{display}] {len(errors)} errors, {len(warnings)} warnings"
             )
 
-            # Deduplicate by event name — repeated identical events bloat the
+            # Deduplicate by event name  -  repeated identical events bloat the
             # digest and push the AI toward over-counting a single root cause.
             # Keep one representative sample + occurrence count per unique event.
             def _dedup(items: list[dict], limit: int) -> list[tuple[dict, int]]:
@@ -1509,15 +1603,26 @@ You will receive a log digest and must produce a clear, actionable system health
 Be direct and specific. Prioritise critical issues. Group related problems together.
 Use emojis sparingly for visual scanning. Do not repeat the raw log lines back.
 
-The following patterns are known benign operational noise — dismiss them without listing as issues:
+The following patterns are known benign operational noise  -  dismiss them without listing as issues:
 - Redpanda "topic_already_exists": every service attempts to auto-create its topics on startup; duplicates are rejected harmlessly.
 - Grafana "flag evaluation succeeded" / "pluginsAutoUpdate": routine plugin update checks, always INFO level.
 - Prometheus "out-of-order samples" / "ingesting out-of-order": post-restart metric catch-up, self-resolving within minutes.
 - Redpanda raft/controller_backend log lines: internal consensus heartbeats, not errors.
 - asyncpg "connection was closed in the middle of operation": connection pool recycling during idle periods, harmless.
 
-If you see these, acknowledge them in the "What's Working" section as expected behavior, not in warnings."""
+If you see these, acknowledge them in the "What's Working" section as expected behavior, not in warnings.
 
+RESTART SUPPRESSION: The digest includes a "Recent restarts" section listing containers
+that were recently restarted and how many cascade errors were suppressed. When a container
+was restarted within the last 30 minutes:
+- rdkafka "Connection refused", "Failed to resolve", "Name or service not known" errors
+  in OTHER services are restart-induced cascade noise  -  do NOT list them as independent issues.
+- Group all restart-related noise under one note: "X services lost Kafka connectivity during
+  <container> restart at HH:MM  -  self-resolved on reconnect."
+- Only flag as a real issue if errors PERSIST beyond the restart window (still occurring now)
+  or if the restarted container itself has errors AFTER it came back up.
+
+"""
         user_prompt = f"""Analyse the following log digest from the trading system.
 
 Format your response using ONLY these section headers (plain text, no ## or ###):
@@ -1532,7 +1637,7 @@ Each issue as: [SERVICE] Short title
 - Fix: concrete command or code change (be specific)
 
 WARNINGS
-Each as: [SERVICE] Short title — impact — recommended action
+Each as: [SERVICE] Short title - impact - recommended action
 
 ROOT CAUSES
 Group related errors across services. Identify shared causes (e.g. schema migration needed, rate limit budget shared across services).
@@ -1544,7 +1649,7 @@ Rules:
 - No markdown headers (## ###). Use CAPS section titles only.
 - No ** bold. Use CAPS for emphasis if needed.
 - Be concise. Max 1200 words total.
-- If an error count says [x48] that means 48 identical occurrences — treat as one issue.
+- If an error count says [x48] that means 48 identical occurrences  -  treat as one issue.
 - Do not list Redpanda topic_already_exists, Grafana flag evaluation, or Prometheus out-of-order samples as issues.
 
 ---
@@ -1593,7 +1698,7 @@ Rules:
                  cost_usd=round(cost, 5))
 
             header = (
-                f"🤖 *System Log Report* — "
+                f"🤖 *System Log Report*  -  "
                 f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC\n"
                 f"_{log_bundle['total_issues']} issues · "
                 f"{log_bundle['containers_with_issues']} containers · "
@@ -1612,7 +1717,7 @@ Rules:
     def _format_raw_summary(self, log_bundle: dict) -> str:
         """Compact plain-text summary used as fallback when Claude is unavailable."""
         lines = [
-            f"📋 Raw Log Summary — last {log_bundle['window_minutes']}m",
+            f"📋 Raw Log Summary  -  last {log_bundle['window_minutes']}m",
             f"Scanned {log_bundle['containers_scanned']} containers, "
             f"{log_bundle['lines_scanned']:,} lines",
             f"Found {log_bundle['total_issues']} issues\n",
@@ -1621,7 +1726,7 @@ Rules:
             display = SERVICE_DISPLAY.get(container, container.replace("trading_", ""))
             errors   = [e for e in entries if e["level"] == "error"]
             warnings = [e for e in entries if e["level"] == "warning"]
-            lines.append(f"*{display}* — {len(errors)}E {len(warnings)}W")
+            lines.append(f"*{display}*  -  {len(errors)}E {len(warnings)}W")
             for e in errors[:5]:
                 msg = (e.get("event") or e.get("message") or "")[:120]
                 lines.append(f"  🔴 {msg}")
