@@ -63,6 +63,7 @@ from typing import Any
 from app.models.news import CatalystType, FloatSensitivity, SessionContext
 from app.pipeline.llm_validation import (
     INTERPRETIVE_MAX_CONVICTION,
+    INTERPRETIVE_MAX_CONVICTION_HIGH_IMPACT,
     REGIME_CONVICTION_ADJ,
 )
 
@@ -592,11 +593,18 @@ def compute_conviction_breakdown(
     step_pi = min(1.0, step_pi)
 
     # ── Step 4: interpretive ceiling ──────────────────────────────────────
+    # Use a slightly higher cap (0.65) when impact_day >= 0.9 to avoid
+    # hard-dropping extremely high-impact interpretive signals (Option B).
     cap_applied = False
-    if (features.direction_source == "interpretive_prior"
-            and step_pi > INTERPRETIVE_MAX_CONVICTION):
-        step_cap    = round(INTERPRETIVE_MAX_CONVICTION, 4)
-        cap_applied = True
+    if features.direction_source == "interpretive_prior":
+        _cap = (INTERPRETIVE_MAX_CONVICTION_HIGH_IMPACT
+                if features.impact_day >= 0.9
+                else INTERPRETIVE_MAX_CONVICTION)
+        if step_pi > _cap:
+            step_cap    = round(_cap, 4)
+            cap_applied = True
+        else:
+            step_cap = round(step_pi, 4)
     else:
         step_cap = round(step_pi, 4)
 

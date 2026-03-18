@@ -280,6 +280,11 @@ class FactsJson(BaseModel):
     estimate_value: float | None = None
     prior_value: float | None = None
 
+    # Headline price action (cross-validated against Polygon before use)
+    headline_move_pct: float | None = None   # e.g. -25.0 for "sinks 25%", +40.0 for "surges 40%"
+    # Set to True by signal_aggregator ONLY after Polygon cross-validation passes
+    headline_move_validated: bool = False
+
 
 class SummarizedRecord(EnrichedRecord):
     """

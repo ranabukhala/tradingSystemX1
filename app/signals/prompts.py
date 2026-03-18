@@ -3,7 +3,7 @@ Prompt templates for the AI summarizer.
 All prompts versioned — bump PROMPT_VERSION when changing.
 """
 
-PROMPT_VERSION = "v1.4"
+PROMPT_VERSION = "v1.5"
 
 # ── T1 Prompt: Fast facts extraction ─────────────────────────────────────────
 T1_SYSTEM = """You are a financial news analyst. Extract structured facts from news headlines.
@@ -40,7 +40,8 @@ Respond with this exact JSON structure:
     "deal_type": null,
     "fda_outcome": null,
     "actual_value": null,
-    "estimate_value": null
+    "estimate_value": null,
+    "headline_move_pct": null
   }}
 }}
 
@@ -53,6 +54,12 @@ Rules:
 - For M&A: fill deal_price, deal_premium_pct, deal_type
 - For FDA: fill fda_outcome
 - For macro: fill actual_value, estimate_value
+- headline_move_pct: percentage move explicitly stated in the headline/snippet about TODAY's price action.
+  ONLY extract this when the headline describes a move that ALREADY HAPPENED or IS HAPPENING today.
+  Examples that SHOULD be extracted: "Stock sinks 25%", "Shares surge 40% on deal", "Drops 15% after earnings miss"
+  Examples that MUST be null: "Could drop 25% if...", "Has risen 198% this year", "Analyst sees 30% upside"
+  Sign convention: negative for drops (e.g. -25.0), positive for gains (e.g. +40.0)
+  Must be null if the move is hypothetical, historical, or about a different company than the primary ticker.
 - tickers_extracted: list of US stock ticker symbols for companies DIRECTLY discussed in the article (e.g., ["BA", "DOCU", "FDX"]). Maximum 3 tickers. Return empty list if no specific company is identified.
 - If the Tickers field above is "unknown" or empty, you MUST attempt to identify the relevant ticker(s) from the title and snippet. Examples: "Boeing" = BA, "DocuSign" = DOCU, "FedEx" = FDX, "Carnival" = CCL, "Palantir" = PLTR, "Snowflake" = SNOW. Only include companies directly and primarily discussed — not tangential or sympathy mentions."""
 

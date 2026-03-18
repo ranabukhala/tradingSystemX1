@@ -70,6 +70,17 @@ INTERPRETIVE_MAX_CONVICTION: float = float(
     os.environ.get("INTERPRETIVE_MAX_CONVICTION", "0.60")
 )
 
+# Slightly elevated cap for interpretive signals when impact_day >= 0.9.
+# Conservative bump (+0.05) — allows very high-impact interpretive reads to
+# reach 0.65 rather than being hard-capped at 0.60.
+INTERPRETIVE_MAX_CONVICTION_HIGH_IMPACT: float = float(
+    os.environ.get("INTERPRETIVE_MAX_CONVICTION_HIGH_IMPACT", "0.65")
+)
+
+# Minimum absolute headline move (%) required for factual direction promotion.
+# Sub-threshold moves ("dips 3%") are too small to be a strong directional signal.
+HEADLINE_MOVE_FACTUAL_THRESHOLD: float = 10.0
+
 # Regime-flag conviction multipliers (interpretive — scale only, never set direction)
 REGIME_CONVICTION_ADJ: dict[str, float] = {
     "risk_on":     1.00,   # Neutral: supportive regime, no change
@@ -311,12 +322,24 @@ def direction_from_facts(facts_json) -> str:
         if any(w in outcome for w in ("rejected", "denied", "failed", "complete_response")):
             return "short"
 
+    # Headline price action (must be pre-validated against Polygon by signal_aggregator)
+    # headline_move_validated is False by default; it becomes True only after the
+    # Polygon cross-validation call in signal_aggregator.process().
+    if (facts_json.headline_move_pct is not None
+            and facts_json.headline_move_validated is True):
+        if facts_json.headline_move_pct <= -HEADLINE_MOVE_FACTUAL_THRESHOLD:
+            return "short"
+        if facts_json.headline_move_pct >= HEADLINE_MOVE_FACTUAL_THRESHOLD:
+            return "long"
+        # Between -10% and +10%: too small for strong directional signal → fall through
+
     return "neutral"
 
 
 def apply_conviction_cap(
     conviction: float,
     direction_source: str,
+    impact_day: float = 0.0,
 ) -> tuple[float, bool]:
     """
     Apply the interpretive ceiling when direction came from LLM bias only.
@@ -324,10 +347,16 @@ def apply_conviction_cap(
     Returns (final_conviction, cap_was_applied).
     The cap is never applied to fact-driven signals — factual evidence can
     generate high-conviction trades; LLM opinion cannot.
+
+    When impact_day >= 0.9, a slightly higher cap is used (0.65 vs 0.60)
+    to avoid dropping extremely high-impact interpretive signals.
     """
     if direction_source == "interpretive_prior":
-        if conviction > INTERPRETIVE_MAX_CONVICTION:
-            return round(INTERPRETIVE_MAX_CONVICTION, 3), True
+        cap = (INTERPRETIVE_MAX_CONVICTION_HIGH_IMPACT
+               if impact_day >= 0.9
+               else INTERPRETIVE_MAX_CONVICTION)
+        if conviction > cap:
+            return round(cap, 3), True
     return conviction, False
 
 
@@ -343,6 +372,67 @@ def apply_regime_adjustment(conviction: float, regime_flag: str | None) -> float
         return conviction
     multiplier = REGIME_CONVICTION_ADJ.get(regime_flag, 1.00)
     return round(conviction * multiplier, 3)
+
+
+async def validate_headline_move(
+    ticker: str,
+    headline_move_pct: float,
+    http_client,       # httpx.AsyncClient
+    api_key: str,
+    tolerance: float = 0.5,   # actual move must be ≥ tolerance × headline claim
+) -> bool:
+    """
+    Cross-validate headline_move_pct against actual Polygon price data.
+
+    Returns True if the actual price movement confirms the headline direction
+    and magnitude (within tolerance).  Returns False if:
+      - Polygon data is unavailable (fail-safe: reject factual promotion)
+      - Actual move contradicts headline direction
+      - Actual move is less than tolerance × headline magnitude
+
+    tolerance=0.5 means: "sinks 25%" requires the stock to be down at least
+    12.5% intraday.  Deliberately loose because headlines round ("sinks 25%"
+    when actual is -22%) but tight enough to catch fabricated/historical claims.
+    """
+    if not api_key or not http_client:
+        return False  # No API access — cannot validate, reject promotion
+
+    try:
+        resp = await http_client.get(
+            f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}",
+            params={"apiKey": api_key},
+            timeout=5.0,
+        )
+        if resp.status_code != 200:
+            return False
+
+        snap = resp.json().get("ticker", {})
+        today_change = snap.get("todaysChangePerc", 0.0)
+
+        if today_change is None or today_change == 0.0:
+            # Try computing from prevDay vs current
+            prev_close = snap.get("prevDay", {}).get("c", 0)
+            current    = snap.get("day", {}).get("c", 0) or snap.get("lastTrade", {}).get("p", 0)
+            if prev_close and current and prev_close > 0:
+                today_change = ((current - prev_close) / prev_close) * 100
+            else:
+                return False  # Can't compute — reject
+
+        # Direction must match
+        if headline_move_pct > 0 and today_change <= 0:
+            return False
+        if headline_move_pct < 0 and today_change >= 0:
+            return False
+
+        # Magnitude check: actual move must be at least tolerance × headline claim
+        min_expected = abs(headline_move_pct) * tolerance
+        if abs(today_change) < min_expected:
+            return False
+
+        return True
+
+    except Exception:
+        return False  # Any error — fail safe, reject promotion
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────

@@ -514,6 +514,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       REDIS_URL: redis://redis:6379/0
+      POLYGON_API_KEY: ${POLYGON_API_KEY:-}
       # Signal event gate — prevents duplicate signals for same news event
       ENABLE_SIGNAL_EVENT_GATE: ${ENABLE_SIGNAL_EVENT_GATE:-true}
       MULTI_SIGNAL_POLICY: ${MULTI_SIGNAL_POLICY:-deny}

@@ -20,6 +20,7 @@ import pytz
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import redis.asyncio as aioredis
 from pydantic import BaseModel, Field
 
@@ -37,6 +38,7 @@ from app.pipeline.llm_validation import (
     apply_conviction_cap,
     apply_regime_adjustment,
     INTERPRETIVE_MAX_CONVICTION,
+    validate_headline_move,
 )
 from app.pipeline.fact_cross_validator import (
     FactCrossValidationResult,
@@ -444,6 +446,8 @@ class SignalAggregatorService(BaseConsumer):
         self._db_pool = None                              # asyncpg pool for validation + logging
         self._fact_validator: FactCrossValidator | None = None
         self._calibrator: ConvictionCalibrator | None = None
+        self._http = None                                 # httpx.AsyncClient for Polygon calls
+        self._polygon_key: str = os.environ.get("POLYGON_API_KEY", "")
 
     async def on_start(self) -> None:
         self._producer = self._make_producer()
@@ -451,6 +455,7 @@ class SignalAggregatorService(BaseConsumer):
             os.environ.get("REDIS_URL", "redis://redis:6379/0"),
             decode_responses=True,
         )
+        self._http = httpx.AsyncClient(timeout=10.0)
         if _ENABLE_SIGNAL_EVENT_GATE:
             self._cluster_store = EventClusterStore(self._redis)
 
@@ -488,6 +493,8 @@ class SignalAggregatorService(BaseConsumer):
             await self._redis.aclose()
         if self._db_pool:
             await self._db_pool.close()
+        if self._http:
+            await self._http.aclose()
 
     async def _get_intraday_return(self, ticker: str) -> float | None:
         """
@@ -652,6 +659,32 @@ class SignalAggregatorService(BaseConsumer):
                  issue_count=len(validation.issues),
                  issues=[{"field": i.field, "reason": i.reason}
                          for i in validation.issues[:5]])
+
+        # ── Cross-validate headline price action before direction classification ──
+        # headline_move_pct is extracted by T1 but treated as untrusted until
+        # Polygon confirms the actual price move matches the claim.  Only moves
+        # >= HEADLINE_MOVE_FACTUAL_THRESHOLD (10%) are eligible for factual promotion.
+        if (summarized.facts_json is not None
+                and summarized.facts_json.headline_move_pct is not None
+                and abs(summarized.facts_json.headline_move_pct) >= 10.0):
+            validated = await validate_headline_move(
+                ticker=primary_ticker,
+                headline_move_pct=summarized.facts_json.headline_move_pct,
+                http_client=self._http,
+                api_key=self._polygon_key,
+            )
+            if validated:
+                summarized.facts_json.headline_move_validated = True
+                _log("info", "signal_aggregator.headline_move_validated",
+                     ticker=primary_ticker,
+                     headline_pct=summarized.facts_json.headline_move_pct)
+            else:
+                _log("info", "signal_aggregator.headline_move_rejected",
+                     ticker=primary_ticker,
+                     headline_pct=summarized.facts_json.headline_move_pct,
+                     note="Polygon price does not confirm headline — falling to interpretive path")
+                # headline_move_validated stays False; direction_from_facts will skip this field
+        # ──────────────────────────────────────────────────────────────────────
 
         # Classify direction first — conviction formula depends on direction_source
         direction, direction_source = classify_direction(summarized, validation)
