@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -77,6 +78,11 @@ class FinnhubSentimentService(BaseConsumer):
         )
         _log("info", "finnhub_sentiment.ready",
              api_key_set=bool(self._api_key))
+        # Startup jitter: 5–15 s to stagger behind finnhub_news (0–8 s) and
+        # before finnhub_fundamentals (10–20 s) at minute boundaries.
+        jitter = random.uniform(5, 15)
+        _log("debug", "finnhub_sentiment.startup_jitter", sleep_s=round(jitter, 1))
+        await asyncio.sleep(jitter)
 
     async def on_stop(self) -> None:
         if self._http:

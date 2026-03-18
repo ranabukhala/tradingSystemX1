@@ -73,6 +73,7 @@ class FinnhubNewsConnector(BaseConnector):
     def __init__(self) -> None:
         self._seen_ids: set[str] = set()
         self._http: httpx.AsyncClient | None = None
+        self._redis: aioredis.Redis | None = None
         self._api_key = settings.finnhub_api_key
         super().__init__()
 
@@ -98,6 +99,15 @@ class FinnhubNewsConnector(BaseConnector):
             )
         return self._http
 
+    async def _get_redis(self) -> aioredis.Redis:
+        """Return (or lazily create) a shared Redis connection for rate-limit checks."""
+        if not self._redis:
+            self._redis = await aioredis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+            )
+        return self._redis
+
     async def fetch(self) -> int:
         if not self._api_key:
             return 0
@@ -114,10 +124,7 @@ class FinnhubNewsConnector(BaseConnector):
         producer = get_producer()
         emitted = 0
 
-        redis_conn = await aioredis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-        )
+        redis_conn = await self._get_redis()
 
         today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -206,8 +213,6 @@ class FinnhubNewsConnector(BaseConnector):
                     _log("error", "finnhub.company_news_error",
                          ticker=ticker, error=str(e) or repr(e),
                          error_type=type(e).__name__)
-        finally:
-            await redis_conn.aclose()
 
         return emitted
 

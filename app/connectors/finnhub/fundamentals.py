@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from datetime import datetime, timezone
 
 import httpx
@@ -49,6 +50,12 @@ class FinnhubFundamentalsConnector(BaseConnector):
     Writes to Redis for AI summarizer to pull during T2 analysis.
     """
 
+    def __init__(self) -> None:
+        self._redis: aioredis.Redis | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._jitter_done: bool = False
+        super().__init__()
+
     @property
     def source_name(self) -> str:
         return "finnhub_fundamentals"
@@ -61,20 +68,38 @@ class FinnhubFundamentalsConnector(BaseConnector):
         if not settings.finnhub_api_key:
             _log("warning", "finnhub_fundamentals.no_key")
 
+    def _get_http(self) -> httpx.AsyncClient:
+        """Return (or lazily create) a shared HTTP client."""
+        if not self._http:
+            self._http = httpx.AsyncClient(
+                base_url=FINNHUB_BASE,
+                headers={"X-Finnhub-Token": settings.finnhub_api_key},
+                timeout=10.0,
+            )
+        return self._http
+
+    async def _get_redis(self) -> aioredis.Redis:
+        """Return (or lazily create) a shared Redis connection for rate-limit checks."""
+        if not self._redis:
+            self._redis = await aioredis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+            )
+        return self._redis
+
     async def fetch(self) -> int:
-        api_key = settings.finnhub_api_key
-        if not api_key:
+        if not settings.finnhub_api_key:
             return 0
 
-        redis_conn = await aioredis.from_url(
-            settings.redis_url,
-            decode_responses=True,
-        )
-        http = httpx.AsyncClient(
-            base_url=FINNHUB_BASE,
-            headers={"X-Finnhub-Token": api_key},
-            timeout=10.0,
-        )
+        # Startup jitter: 10–20 s to stagger behind finnhub_news (0–8 s) and
+        # finnhub_sentiment (5–15 s) so all three containers don't burst the
+        # Finnhub rate window simultaneously on container start.
+        if not self._jitter_done:
+            self._jitter_done = True
+            await asyncio.sleep(random.uniform(10, 20))
+
+        redis_conn = await self._get_redis()
+        http = self._get_http()
 
         updated = 0
         for ticker in TRACKED_TICKERS:
@@ -137,8 +162,6 @@ class FinnhubFundamentalsConnector(BaseConnector):
                      ticker=ticker, error=str(e))
 
         _log("info", "finnhub_fundamentals.updated", tickers=updated)
-        await http.aclose()
-        await redis_conn.aclose()
         return updated
 
     async def _get_earnings_surprises(

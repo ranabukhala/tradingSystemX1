@@ -787,6 +787,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
       FINNHUB_POLL_INTERVAL: "30"
+      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-55}
     ports:
       - "8061:8061"
 
@@ -829,6 +830,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
       FINNHUB_INPUT_TOPIC: ${FINNHUB_INPUT_TOPIC:-news.fmp_enriched}
+      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-55}
     ports:
       - "8063:8063"
 
@@ -849,6 +851,7 @@ services:
       METRICS_PORT: "8064"
       REDIS_URL: redis://redis:6379/0
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
+      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-55}
     ports:
       - "8064:8064"
     healthcheck:
@@ -869,7 +872,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       FINNHUB_API_KEY: ${FINNHUB_API_KEY:-}
-      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-250}
+      FINNHUB_PER_MINUTE_CALL_LIMIT: ${FINNHUB_PER_MINUTE_CALL_LIMIT:-55}
     ports:
       - "8065:8065"
     depends_on:
