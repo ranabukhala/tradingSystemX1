@@ -1,10 +1,13 @@
 """
-Finnhub News Connector (REST polling fallback).
+Finnhub News Connector (REST polling).
 
-Polls /news and /company-news every 30s for breaking news.
+Polls /news (general, near-real-time ~6 min) and /company-news every 30s.
 Also enriches each article with Finnhub's pre-computed NLP sentiment score.
 
-Finnhub free tier: 60 req/min — very generous.
+Paid Fundamental-1 tier: 300 req/min.
+  - /news?category=general   → ~6 min latency (re-enabled)
+  - /company-news?symbol=X   → ~77 min avg latency, but ticker-tagged
+
 Sentiment score: -1.0 (bearish) to +1.0 (bullish), pre-computed by Finnhub NLP.
 
 This connector runs alongside Benzinga/Polygon as an additional news source.
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 from datetime import datetime, timezone, timedelta
 
@@ -53,6 +57,11 @@ WATCHLIST_TICKERS = [
     "AMD", "COIN", "MSTR", "PLTR", "SOFI", "HOOD", "RIVN",
     "SPY", "QQQ", "IWM",
 ]
+
+# Feature flags / tuning
+ENABLE_GENERAL_NEWS   = os.environ.get("FINNHUB_ENABLE_GENERAL_NEWS",  "true").lower() == "true"
+GENERAL_NEWS_CACHE_S  = int(os.environ.get("FINNHUB_NEWS_CACHE_TTL",   "120"))   # 2 min
+COMPANY_NEWS_CACHE_S  = int(os.environ.get("FINNHUB_NEWS_CACHE_TTL",   "120"))   # 2 min (was 300)
 
 
 class FinnhubNewsConnector(BaseConnector):
@@ -110,11 +119,45 @@ class FinnhubNewsConnector(BaseConnector):
             decode_responses=True,
         )
 
-        # General news disabled - geopolitical noise
+        today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # ── 1. General news (near-real-time, ~6 min latency on paid tier) ─────
+        # Process first so the freshest articles enter the pipeline before the
+        # slower company-specific loop. Deduplicator handles any overlap.
+        if ENABLE_GENERAL_NEWS:
+            try:
+                general_cache_key = f"finnhub:news:general:{today}"
+                cached_general = await redis_conn.get(general_cache_key)
+
+                if cached_general is not None:
+                    articles = json.loads(cached_general)
+                    cnt = await self._process_articles(articles, producer)
+                    emitted += cnt
+                else:
+                    allowed, count = await try_acquire(
+                        redis_conn, settings.finnhub_per_minute_call_limit
+                    )
+                    if allowed:
+                        resp = await http.get("/news", params={"category": "general"})
+                        if resp.status_code == 200:
+                            articles = resp.json() or []
+                            await redis_conn.setex(
+                                general_cache_key, GENERAL_NEWS_CACHE_S, json.dumps(articles)
+                            )
+                            cnt = await self._process_articles(articles, producer)
+                            emitted += cnt
+                            _log("info", "finnhub.general_news.fetched",
+                                 articles=len(articles), new=cnt)
+                        else:
+                            _log("warning", "finnhub.general_news.http_error",
+                                 status=resp.status_code)
+                    else:
+                        _log("warning", "finnhub.general_news.rate_limited", count=count)
+            except Exception as e:
+                _log("warning", "finnhub.general_news.error", error=str(e))
 
         # ── 2. Company-specific news for watchlist (sequential) ───────────────
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
         try:
             for ticker in WATCHLIST_TICKERS:
@@ -127,7 +170,7 @@ class FinnhubNewsConnector(BaseConnector):
                         _log("info", "finnhub.cache.hit", ticker=ticker)
                         articles = json.loads(cached)
                         emitted += await self._process_articles(articles, producer, ticker=ticker)
-                        await asyncio.sleep(0.35)
+                        await asyncio.sleep(0.15)
                         continue
 
                     _log("debug", "finnhub.cache.miss", ticker=ticker)
@@ -151,13 +194,13 @@ class FinnhubNewsConnector(BaseConnector):
                     if resp.status_code == 200:
                         articles = resp.json() or []
                         await redis_conn.setex(
-                            cache_key, CACHE_TTL["news"], json.dumps(articles)
+                            cache_key, COMPANY_NEWS_CACHE_S, json.dumps(articles)
                         )
                         emitted += await self._process_articles(articles, producer, ticker=ticker)
                     else:
                         _log("warning", "finnhub.company_news_http_error",
                              ticker=ticker, status=resp.status_code)
-                    await asyncio.sleep(0.35)  # 350ms: ~2 calls/s burst cap, 34 calls/min
+                    await asyncio.sleep(0.15)  # 150ms: ~6 calls/s, well within 300/min
 
                 except Exception as e:
                     _log("error", "finnhub.company_news_error",
