@@ -97,8 +97,8 @@ services:
       - --rpc-addr redpanda:33145
       - --advertise-rpc-addr redpanda:33145
       - --smp 1
-      - --memory 512M
-      - --mode dev-container
+      - --memory 1024M
+      - --overprovisioned
       - --default-log-level=warn
     ports:
       - "19092:19092"

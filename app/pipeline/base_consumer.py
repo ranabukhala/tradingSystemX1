@@ -26,6 +26,12 @@ import os as _os
 _LAG_CHECK_INTERVAL_S = float(_os.environ.get("LAG_CHECK_INTERVAL_SECONDS", "30"))
 _LAG_WARN_THRESHOLD   = int(_os.environ.get("LAG_WARN_MESSAGES", "100"))
 
+# ── Service heartbeat ─────────────────────────────────────────────────────────
+# Written every _HEARTBEAT_INTERVAL_S to service:heartbeat:<name> with a TTL of
+# _HEARTBEAT_TTL_S.  The watchdog alerts if the key goes missing (service frozen).
+_HEARTBEAT_INTERVAL_S = 30   # how often to write the heartbeat key
+_HEARTBEAT_TTL_S      = 90   # Redis key TTL — watchdog alerts if missing after this
+
 log = get_logger("base_consumer")
 
 
@@ -249,6 +255,25 @@ class BaseConsumer(ABC):
         """
         return self._current_lag > threshold
 
+    # ── Heartbeat ─────────────────────────────────────────────────────────────
+
+    async def _heartbeat_loop(self, redis_client) -> None:
+        """
+        Background task: writes service:heartbeat:<name> to Redis every
+        _HEARTBEAT_INTERVAL_S seconds with a TTL of _HEARTBEAT_TTL_S.
+
+        Runs until self._running is False. Errors are swallowed — a Redis
+        blip must never crash the main consume loop.
+        """
+        key = f"service:heartbeat:{self.service_name}"
+        while self._running:
+            try:
+                await redis_client.setex(key, _HEARTBEAT_TTL_S, "1")
+            except Exception as e:
+                _log("debug", "service.heartbeat_error",
+                     service=self.service_name, error=str(e))
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
     # ── Main consume loop ─────────────────────────────────────────────────────
 
     async def run(self) -> None:
@@ -268,6 +293,25 @@ class BaseConsumer(ABC):
         loop = asyncio.get_running_loop()
         self._redis_idem = await self._init_redis_idempotency()
         idem = self._redis_idem
+
+        # ── Heartbeat task ────────────────────────────────────────────────────
+        import redis.asyncio as _hb_redis
+        _hb_redis_client = _hb_redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=2,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        _heartbeat_task = asyncio.create_task(
+            self._heartbeat_loop(_hb_redis_client),
+            name=f"heartbeat-{self.service_name}",
+        )
+        _log("info", "service.heartbeat_started",
+             service=self.service_name,
+             key=f"service:heartbeat:{self.service_name}",
+             interval_s=_HEARTBEAT_INTERVAL_S,
+             ttl_s=_HEARTBEAT_TTL_S)
 
         try:
             while self._running:
@@ -382,6 +426,23 @@ class BaseConsumer(ABC):
                 # SQLite store — used as Redis fallback and by execution engine
                 # for order / loss tracking.
                 self._idempotency.close()
+            # Cancel heartbeat task and delete the key so the watchdog knows the
+            # service stopped cleanly (rather than treating absence as a freeze).
+            _heartbeat_task.cancel()
+            try:
+                await _heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await _hb_redis_client.delete(
+                    f"service:heartbeat:{self.service_name}"
+                )
+            except Exception:
+                pass
+            try:
+                await _hb_redis_client.aclose()
+            except Exception:
+                pass
             await self.on_stop()
             _log("info", "service.stopped", service=svc)
 

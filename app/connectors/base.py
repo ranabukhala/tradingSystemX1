@@ -10,6 +10,7 @@ import sys
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
+import redis.asyncio as aioredis
 from prometheus_client import Counter, Histogram, Gauge, start_http_server
 from tenacity import (
     AsyncRetrying,
@@ -26,6 +27,11 @@ def _log(level: str, event: str, **kw) -> None:
     """Simple inline logger — no structlog dependency."""
     entry = {"ts": datetime.now(timezone.utc).isoformat(), "level": level, "event": event, **kw}
     print(json.dumps(entry), flush=True)
+
+
+# ── Service heartbeat ─────────────────────────────────────────────────────────
+_HEARTBEAT_INTERVAL_S = 30   # how often to write the heartbeat key
+_HEARTBEAT_TTL_S      = 90   # Redis key TTL — watchdog alerts if missing after this
 
 
 class BaseConnector(ABC):
@@ -68,11 +74,52 @@ class BaseConnector(ABC):
         self.metric_up = Gauge(
             "connector_up", "1 if connector running", ["source"])
 
+    async def _heartbeat_loop(self, redis_client) -> None:
+        """
+        Background task: writes service:heartbeat:<name> to Redis every
+        _HEARTBEAT_INTERVAL_S seconds with TTL _HEARTBEAT_TTL_S.
+        Errors are swallowed — never crashes the main fetch loop.
+        """
+        key = f"service:heartbeat:{self.source_name}"
+        while self._running:
+            try:
+                await redis_client.setex(key, _HEARTBEAT_TTL_S, "1")
+            except Exception as e:
+                _log("debug", "connector.heartbeat_error",
+                     source=self.source_name, error=str(e))
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+
     async def run(self) -> None:
         self._running = True
         source = self.source_name
         _log("info", "connector.started", source=source, poll_interval=self.poll_interval_seconds)
         self.metric_up.labels(source=source).set(1)
+
+        # ── Heartbeat task ────────────────────────────────────────────────────
+        # Wrapped in try/except — connectors that don't have REDIS_URL configured
+        # will fail silently here; the heartbeat key simply won't be written.
+        _hb_redis = None
+        _heartbeat_task = None
+        try:
+            _hb_redis = aioredis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                max_connections=2,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            _heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(_hb_redis),
+                name=f"heartbeat-{self.source_name}",
+            )
+            _log("info", "connector.heartbeat_started",
+                 source=self.source_name,
+                 key=f"service:heartbeat:{self.source_name}",
+                 interval_s=_HEARTBEAT_INTERVAL_S,
+                 ttl_s=_HEARTBEAT_TTL_S)
+        except Exception as e:
+            _log("warning", "connector.heartbeat_unavailable",
+                 source=self.source_name, error=str(e))
 
         while self._running:
             start = datetime.now(timezone.utc)
@@ -106,6 +153,24 @@ class BaseConnector(ABC):
                 _log("error", "connector.fetch.error", source=source, error=str(e))
 
             await asyncio.sleep(self.poll_interval_seconds)
+
+        # Clean up heartbeat — delete the key so the watchdog treats this as a
+        # clean stop rather than a frozen service.
+        if _heartbeat_task is not None:
+            _heartbeat_task.cancel()
+            try:
+                await _heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        if _hb_redis is not None:
+            try:
+                await _hb_redis.delete(f"service:heartbeat:{self.source_name}")
+            except Exception:
+                pass
+            try:
+                await _hb_redis.aclose()
+            except Exception:
+                pass
 
         _log("info", "connector.stopped", source=source)
 
