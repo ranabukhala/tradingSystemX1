@@ -144,6 +144,52 @@ class RedisIdempotencyStore:
         except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
             return await self._fallback_check_and_mark(stage, event_id, payload_hash, exc)
 
+    async def is_processed(self, stage: str, event_id: str) -> bool:
+        """
+        Read-only check: returns True if (stage, event_id) has already been
+        processed, False otherwise.  Does NOT set the key.
+
+        Used as the first half of the split check/mark pattern in BaseConsumer
+        so that a crash between check and process does not permanently lose the
+        message (it will be retried on restart because mark_processed was never
+        called).
+        """
+        key = f"idem:{stage}:{event_id}"
+        try:
+            exists = await self._redis.exists(key)
+            if self._fallback_mode:
+                self._fallback_mode = False
+                log.info(
+                    "redis_idempotency.redis_recovered",
+                    stage=stage,
+                    event_id=event_id,
+                )
+            return bool(exists)
+        except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+            return await self._fallback_is_processed(stage, event_id, exc)
+
+    async def mark_processed(self, stage: str, event_id: str) -> None:
+        """
+        Write the (stage, event_id) key into Redis (SET NX EX).
+
+        Called after process() returns successfully (None=drop or dict=emit).
+        NOT called when process() raises — the message stays unmarked so it
+        can be retried after the crash.
+        """
+        key = f"idem:{stage}:{event_id}"
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            await self._redis.set(key, now, ex=self._ttl, nx=True)
+            if self._fallback_mode:
+                self._fallback_mode = False
+                log.info(
+                    "redis_idempotency.redis_recovered",
+                    stage=stage,
+                    event_id=event_id,
+                )
+        except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+            await self._fallback_mark_processed(stage, event_id, exc)
+
     async def close(self) -> None:
         """
         Close the owned Redis client.
@@ -194,6 +240,83 @@ class RedisIdempotencyStore:
         )
         return False  # False = "new event" — allow through
 
+    async def _fallback_is_processed(
+        self,
+        stage: str,
+        event_id: str,
+        exc: Exception,
+    ) -> bool:
+        """Read-only fallback for is_processed when Redis is unreachable."""
+        if not self._fallback_mode:
+            self._fallback_mode = True
+            log.warning(
+                "redis_idempotency.fallback_activated",
+                stage=stage,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                fallback_available=self._fallback is not None,
+            )
+
+        if self._fallback is not None:
+            try:
+                conn = self._fallback._get_conn()
+                row = conn.execute(
+                    "SELECT 1 FROM processed_events WHERE stage = ? AND event_id = ?",
+                    (stage, event_id),
+                ).fetchone()
+                return row is not None
+            except Exception as exc2:
+                log.error(
+                    "redis_idempotency.fallback_also_failed",
+                    stage=stage,
+                    event_id=event_id,
+                    error=str(exc2),
+                )
+
+        log.error(
+            "redis_idempotency.fail_open",
+            stage=stage,
+            event_id=event_id,
+            reason="Redis unreachable and no fallback configured",
+        )
+        return False  # Fail-open: treat as new event
+
+    async def _fallback_mark_processed(
+        self,
+        stage: str,
+        event_id: str,
+        exc: Exception,
+    ) -> None:
+        """Write fallback for mark_processed when Redis is unreachable."""
+        if not self._fallback_mode:
+            self._fallback_mode = True
+            log.warning(
+                "redis_idempotency.fallback_activated",
+                stage=stage,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                fallback_available=self._fallback is not None,
+            )
+
+        if self._fallback is not None:
+            try:
+                self._fallback.check_and_mark(stage, event_id, None)
+                return
+            except Exception as exc2:
+                log.error(
+                    "redis_idempotency.fallback_also_failed",
+                    stage=stage,
+                    event_id=event_id,
+                    error=str(exc2),
+                )
+        else:
+            log.error(
+                "redis_idempotency.fail_open",
+                stage=stage,
+                event_id=event_id,
+                reason="Redis unreachable and no fallback configured — mark_processed skipped",
+            )
+
 
 # ── SQLite compatibility shim ─────────────────────────────────────────────────
 
@@ -219,6 +342,19 @@ class _SQLiteAsyncAdapter:
         payload_hash: str | None = None,
     ) -> bool:
         return self._store.check_and_mark(stage, event_id, payload_hash)
+
+    async def is_processed(self, stage: str, event_id: str) -> bool:
+        """Read-only check against the processed_events table."""
+        conn = self._store._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM processed_events WHERE stage = ? AND event_id = ?",
+            (stage, event_id),
+        ).fetchone()
+        return row is not None
+
+    async def mark_processed(self, stage: str, event_id: str) -> None:
+        """Insert (stage, event_id) into processed_events; no-op if already present."""
+        self._store.check_and_mark(stage, event_id, None)
 
     async def close(self) -> None:
         pass  # Owner (BaseConsumer.run finally block) handles this

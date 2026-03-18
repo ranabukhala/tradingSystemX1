@@ -300,8 +300,8 @@ class BaseConsumer(ABC):
                 event_id = raw.get("event_id") or str(uuid4())
                 bind_event_context(event_id, service=svc, topic=self.input_topic)
 
-                # ── Idempotency check (async Redis SET NX) ────────────
-                already = await idem.check_and_mark(svc, event_id)
+                # ── Idempotency check — read-only, does NOT mark yet ──
+                already = await idem.is_processed(svc, event_id)
                 # Track messages that fell back to SQLite (Redis unreachable)
                 if idem._fallback_mode:
                     self.metric_idem_fallback.labels(service=svc).inc()
@@ -333,6 +333,11 @@ class BaseConsumer(ABC):
                             key=str(key) if key else None,
                         )
                         self.metric_emitted.labels(service=svc).inc()
+
+                    # Mark as processed only after process() returns cleanly
+                    # (whether drop or emit).  If process() raised, we do NOT
+                    # mark — the message stays retryable on the next restart.
+                    await idem.mark_processed(svc, event_id)
 
                 except Exception as e:
                     _log("error", "service.process_error",
