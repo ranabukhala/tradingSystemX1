@@ -492,6 +492,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       LLM_DAILY_BUDGET_USD: ${LLM_DAILY_BUDGET_USD:-25.0}
+      LLM_MONTHLY_BUDGET_USD: ${LLM_MONTHLY_BUDGET_USD:-500.0}
       LLM_T2_IMPACT_THRESHOLD: ${LLM_T2_IMPACT_THRESHOLD:-0.6}
     ports:
       - "8021:8021"

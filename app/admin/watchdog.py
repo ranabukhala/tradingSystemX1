@@ -535,42 +535,89 @@ class WatchdogService:
     # ── LLM Budget ────────────────────────────────────────────────────────────
 
     async def _check_budget(self) -> None:
-        """
-        Check LLM daily budget from Redis.
-        Alerts once per day per threshold crossing (80% and 95%).
-        """
+        """Check LLM daily + monthly budget from Redis. Alerts once per threshold crossing."""
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
-            spent = await self._redis.get(f"llm:budget:{today}")
-            if not spent:
-                return
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            month = datetime.now(timezone.utc).strftime("%Y-%m")
 
-            self._snapshot.llm_budget_used  = float(spent)
-            limit = float(settings.llm_daily_budget_usd)
-            self._snapshot.llm_budget_limit = limit
-            pct = self._snapshot.llm_budget_used / limit
+            # Read all budget keys in one mget
+            keys = [
+                f"llm:budget:{today}",
+                f"llm:budget:{today}:anthropic",
+                f"llm:budget:{today}:openai",
+                f"llm:budget:monthly:{month}",
+                f"llm:budget:monthly:{month}:anthropic",
+                f"llm:budget:monthly:{month}:openai",
+            ]
+            values = await self._redis.mget(*keys)
 
-            for threshold, label in [(0.95, "95%"), (BUDGET_WARN_PCT, "80%")]:
-                if pct >= threshold:
-                    dedup_key = f"budget_{today}_{label}"
-                    already = await self._redis.get(
-                        f"{_REDIS_BUDGET_ALERTED}{dedup_key}"
-                    )
-                    if not already:
-                        await self._redis.setex(
-                            f"{_REDIS_BUDGET_ALERTED}{dedup_key}",
-                            86400, "1"
+            def _f(v): return float(v) if v else 0.0
+
+            daily_total     = _f(values[0])
+            daily_anthropic = _f(values[1])
+            daily_openai    = _f(values[2])
+            monthly_total   = _f(values[3])
+            monthly_anthro  = _f(values[4])
+            monthly_openai  = _f(values[5])
+
+            daily_limit   = float(settings.llm_daily_budget_usd)
+            monthly_limit = float(getattr(settings, "llm_monthly_budget_usd", 500.0))
+
+            # Update snapshot (watchdog keeps daily totals for the /status command)
+            self._snapshot.llm_budget_used  = daily_total
+            self._snapshot.llm_budget_limit = daily_limit
+
+            # ── Daily alerts ───────────────────────────────────────────────────
+            if daily_limit > 0:
+                daily_pct = daily_total / daily_limit
+                for threshold, label in [(0.95, "95%"), (BUDGET_WARN_PCT, "80%")]:
+                    if daily_pct >= threshold:
+                        dedup_key = f"budget_{today}_daily_{label}"
+                        already = await self._redis.get(
+                            f"{_REDIS_BUDGET_ALERTED}{dedup_key}"
                         )
-                        emoji = "🚨" if threshold >= 0.95 else "⚠️"
-                        _log("warning", "watchdog.budget_warning",
-                             used=self._snapshot.llm_budget_used,
-                             limit=limit, pct=round(pct * 100))
-                        await self._alert(
-                            f"{emoji} *LLM Budget {label}*\n"
-                            f"Used: ${self._snapshot.llm_budget_used:.2f} "
-                            f"/ ${limit:.2f} ({pct*100:.0f}%)"
+                        if not already:
+                            await self._redis.setex(
+                                f"{_REDIS_BUDGET_ALERTED}{dedup_key}", 86400, "1"
+                            )
+                            emoji = "🚨" if threshold >= 0.95 else "⚠️"
+                            _log("warning", "watchdog.daily_budget_warning",
+                                 total=daily_total, limit=daily_limit,
+                                 anthropic=daily_anthropic, openai=daily_openai,
+                                 pct=round(daily_pct * 100))
+                            await self._alert(
+                                f"{emoji} *LLM Daily Budget {label}*\n"
+                                f"Total: ${daily_total:.3f} / ${daily_limit:.2f}\n"
+                                f"  Anthropic: ${daily_anthropic:.3f}\n"
+                                f"  OpenAI:    ${daily_openai:.4f}"
+                            )
+                        break  # only fire highest threshold
+
+            # ── Monthly alerts ─────────────────────────────────────────────────
+            if monthly_limit > 0:
+                monthly_pct = monthly_total / monthly_limit
+                for threshold, label in [(0.95, "95%"), (0.80, "80%")]:
+                    if monthly_pct >= threshold:
+                        dedup_key = f"budget_{month}_monthly_{label}"
+                        already = await self._redis.get(
+                            f"{_REDIS_BUDGET_ALERTED}{dedup_key}"
                         )
-                    break  # only fire highest threshold
+                        if not already:
+                            await self._redis.setex(
+                                f"{_REDIS_BUDGET_ALERTED}{dedup_key}", 86400 * 32, "1"
+                            )
+                            emoji = "🚨" if threshold >= 0.95 else "⚠️"
+                            _log("warning", "watchdog.monthly_budget_warning",
+                                 total=monthly_total, limit=monthly_limit,
+                                 anthropic=monthly_anthro, openai=monthly_openai,
+                                 pct=round(monthly_pct * 100))
+                            await self._alert(
+                                f"{emoji} *LLM Monthly Budget {label}* ({month})\n"
+                                f"Total: ${monthly_total:.2f} / ${monthly_limit:.2f}\n"
+                                f"  Anthropic: ${monthly_anthro:.2f}\n"
+                                f"  OpenAI:    ${monthly_openai:.3f}"
+                            )
+                        break  # only fire highest threshold
 
         except Exception as e:
             _log("debug", "watchdog.budget_check_error", error=str(e))

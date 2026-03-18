@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -32,6 +32,7 @@ from app.models.news import (
 from app.pipeline.base_consumer import BaseConsumer, _log
 from app.pipeline.route_classifier import classify_route
 from app.pipeline.fast_path_builder import build_fast_path_summary
+from app.signals.budget import LLMBudgetTracker
 from app.signals.prompts import (
     PROMPT_VERSION, T1_SYSTEM, T1_USER, T2_SYSTEM, T2_USER,
 )
@@ -61,42 +62,11 @@ except Exception:  # prometheus_client absent or registry conflict in tests
     _ROUTE_COUNTER = _NoopCounter()  # type: ignore[assignment]
 
 
-class BudgetTracker:
-    """Simple daily spend tracker. Resets at midnight UTC."""
-
-    def __init__(self, daily_limit: float) -> None:
-        self.daily_limit = daily_limit
-        self._spend: float = 0.0
-        self._day: date = date.today()
-
-    def _maybe_reset(self) -> None:
-        today = date.today()
-        if today != self._day:
-            self._spend = 0.0
-            self._day = today
-
-    def can_spend(self, estimated: float) -> bool:
-        self._maybe_reset()
-        return (self._spend + estimated) <= self.daily_limit
-
-    def record(self, cost: float) -> None:
-        self._maybe_reset()
-        self._spend += cost
-        _log("debug", "budget.recorded",
-             cost_usd=round(cost, 5),
-             daily_total=round(self._spend, 4),
-             daily_limit=self.daily_limit)
-
-    @property
-    def remaining(self) -> float:
-        self._maybe_reset()
-        return max(0.0, self.daily_limit - self._spend)
-
-
 class AISummarizerService(BaseConsumer):
 
     def __init__(self) -> None:
-        self._budget = BudgetTracker(settings.llm_daily_budget_usd)
+        # Budget tracker initialized in on_start() once Redis is available
+        self._budget: LLMBudgetTracker | None = None
         self._http: httpx.AsyncClient | None = None
         self._Session: Any | None = None
         # Simple rate limit: max 50 req/min to Claude API
@@ -142,6 +112,24 @@ class AISummarizerService(BaseConsumer):
         else:
             _log("warning", "ai_summarizer.no_database_url",
                  note="LLM ticker DB back-fill disabled")
+
+        # ── Budget tracker ────────────────────────────────────────────────────
+        import redis.asyncio as _budget_redis
+        _redis_client = _budget_redis.from_url(
+            settings.redis_url,
+            decode_responses=True,
+            max_connections=3,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
+        self._budget = LLMBudgetTracker(
+            redis_client=_redis_client,
+            daily_limit=settings.llm_daily_budget_usd,
+            monthly_limit=getattr(settings, "llm_monthly_budget_usd", 500.0),
+        )
+        _log("info", "ai_summarizer.budget_tracker_ready",
+             daily_limit=settings.llm_daily_budget_usd,
+             monthly_limit=getattr(settings, "llm_monthly_budget_usd", 500.0))
 
         _log("info", "ai_summarizer.ready",
              model_t1=CLAUDE_MODEL,
@@ -490,9 +478,9 @@ class AISummarizerService(BaseConsumer):
         # ─────────────────────────────────────────────────────────────────────
 
         # Budget check
-        if not self._budget.can_spend(0.01):  # Minimum T1 cost estimate
+        if self._budget and not await self._budget.can_spend("anthropic", 0.01):
             _log("warning", "ai_summarizer.budget_exhausted",
-                 remaining=self._budget.remaining,
+                 daily_limit=settings.llm_daily_budget_usd,
                  vendor_id=enriched.vendor_id)
             summarized = SummarizedRecord(**enriched.model_dump())
             return summarized.to_kafka_dict()
@@ -507,7 +495,8 @@ class AISummarizerService(BaseConsumer):
             t1_result, t1_tokens, t1_cost = await self._run_t1(enriched)
             total_tokens += t1_tokens
             total_cost += t1_cost
-            self._budget.record(t1_cost)
+            if self._budget:
+                await self._budget.record("anthropic", t1_cost)
 
             _log("info", "ai_summarizer.t1_complete",
                  vendor_id=enriched.vendor_id,
@@ -570,12 +559,13 @@ class AISummarizerService(BaseConsumer):
 
         # ── T2: High-impact items only ────────────────────────────────────────
         if impact_day >= settings.llm_t2_impact_threshold:
-            if self._budget.can_spend(0.05):  # T2 cost estimate
+            if not self._budget or await self._budget.can_spend("anthropic", 0.05):
                 try:
                     t2_result, t2_tokens, t2_cost = await self._run_t2(enriched, t1_result, raw_record=record)
                     total_tokens += t2_tokens
                     total_cost += t2_cost
-                    self._budget.record(t2_cost)
+                    if self._budget:
+                        await self._budget.record("anthropic", t2_cost)
 
                     _log("info", "ai_summarizer.t2_complete",
                          vendor_id=enriched.vendor_id,

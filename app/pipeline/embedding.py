@@ -81,6 +81,17 @@ def _make_client():
 _client = None
 _client_error: str | None = None   # cached failure message so we log once
 
+# ── Budget tracker ─────────────────────────────────────────────────────────
+# Set by the deduplicator via set_budget_tracker() during on_start().
+# None when running outside the full pipeline (tests, standalone).
+_budget_tracker = None
+
+
+def set_budget_tracker(tracker) -> None:
+    """Called by the deduplicator during on_start() to wire in the shared tracker."""
+    global _budget_tracker
+    _budget_tracker = tracker
+
 
 def _get_client():
     """Return (or lazily create) the shared AsyncOpenAI client.
@@ -139,7 +150,21 @@ async def compute_embedding(text: str) -> Optional[list[float]]:
                     model=_MODEL,
                     dimensions=_DIMENSIONS,
                 )
-                return response.data[0].embedding
+                embedding = response.data[0].embedding
+
+                # Record OpenAI spend
+                tokens_used = getattr(response, "usage", None)
+                if tokens_used:
+                    cost = (tokens_used.total_tokens / 1_000_000) * 0.020
+                else:
+                    cost = 10 / 1_000_000 * 0.020  # estimate: ~10 tokens per headline
+                if _budget_tracker is not None:
+                    try:
+                        await _budget_tracker.record("openai", cost)
+                    except Exception:
+                        pass
+
+                return embedding
 
     except Exception as exc:
         logger.warning(

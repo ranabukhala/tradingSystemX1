@@ -93,6 +93,33 @@ class DeduplicatorService(BaseConsumer):
         self._Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         if _EMIT_DROPPED:
             self._dropped_producer = self._make_producer()
+
+        # ── Embedding budget tracker ──────────────────────────────────────────
+        # Wire a shared LLMBudgetTracker into the embedding module so each
+        # OpenAI call records its cost to Redis automatically.
+        try:
+            from app.pipeline.embedding import set_budget_tracker
+            from app.signals.budget import LLMBudgetTracker
+            import redis.asyncio as _budget_redis
+
+            _budget_redis_client = _budget_redis.from_url(
+                settings.redis_url,
+                decode_responses=True,
+                max_connections=2,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+            )
+            _embedding_budget = LLMBudgetTracker(
+                redis_client=_budget_redis_client,
+                daily_limit=settings.llm_daily_budget_usd,
+                monthly_limit=getattr(settings, "llm_monthly_budget_usd", 500.0),
+            )
+            set_budget_tracker(_embedding_budget)
+            _log("info", "deduplicator.embedding_budget_tracker_ready")
+        except Exception as bt_err:
+            _log("warning", "deduplicator.embedding_budget_tracker_failed",
+                 error=str(bt_err))
+
         _log("info", "deduplicator.connections_ready",
              semantic_dedup=_SEMANTIC_DEDUP,
              emit_dropped=_EMIT_DROPPED)

@@ -389,29 +389,65 @@ class AdminBot:
             await self._send(f"❌ Error fetching logs: {e}")
 
     async def _cmd_budget(self, args: list) -> None:
-        """LLM daily budget summary."""
-        snapshot_raw = await self._redis.get("watchdog:snapshot")
-        if snapshot_raw:
-            snap = json.loads(snapshot_raw)
-            used = snap.get("llm_budget_used", 0)
-            limit = snap.get("llm_budget_limit", 5)
-        else:
-            used, limit = 0.0, 5.0
+        """LLM daily + monthly budget summary."""
+        try:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            month = datetime.now(timezone.utc).strftime("%Y-%m")
 
-        pct = used / limit * 100 if limit else 0
-        bar = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
-        remaining = limit - used
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            keys = [
+                f"llm:budget:{today}",
+                f"llm:budget:{today}:anthropic",
+                f"llm:budget:{today}:openai",
+                f"llm:budget:monthly:{month}",
+                f"llm:budget:monthly:{month}:anthropic",
+                f"llm:budget:monthly:{month}:openai",
+                f"llm:calls:{today}:anthropic",
+                f"llm:calls:{today}:openai",
+            ]
+            values = await self._redis.mget(*keys)
 
-        await self._send(
-            f"💰 *LLM Budget — {today}*\n\n"
-            f"`{bar}` {pct:.1f}%\n\n"
-            f"Spent:     ${used:.4f}\n"
-            f"Remaining: ${remaining:.4f}\n"
-            f"Limit:     ${limit:.2f}/day\n\n"
-            f"T1 (Haiku):  ~$0.0008/item\n"
-            f"T2 (Sonnet): ~$0.011/item"
-        )
+            def _f(v): return float(v) if v else 0.0
+
+            d_total  = _f(values[0])
+            d_anthro = _f(values[1])
+            d_openai = _f(values[2])
+            m_total  = _f(values[3])
+            m_anthro = _f(values[4])
+            m_openai = _f(values[5])
+            c_anthro = int(values[6] or 0)
+            c_openai = int(values[7] or 0)
+
+            # Read limits from watchdog snapshot if available
+            snap_raw = await self._redis.get("watchdog:snapshot")
+            d_limit = 25.0
+            m_limit = 500.0
+            if snap_raw:
+                snap = json.loads(snap_raw)
+                d_limit = snap.get("llm_budget_limit", 25.0)
+
+            d_pct = d_total / d_limit * 100 if d_limit else 0
+            m_pct = m_total / m_limit * 100 if m_limit else 0
+            d_bar = "█" * int(d_pct / 10) + "░" * (10 - int(d_pct / 10))
+            m_bar = "█" * int(m_pct / 10) + "░" * (10 - int(m_pct / 10))
+
+            await self._send(
+                f"LLM BUDGET\n\n"
+                f"TODAY ({today})\n"
+                f"{d_bar} {d_pct:.1f}%\n"
+                f"  Total:     ${d_total:.4f} / ${d_limit:.2f}\n"
+                f"  Anthropic: ${d_anthro:.4f}  ({c_anthro} calls)\n"
+                f"  OpenAI:    ${d_openai:.5f}  ({c_openai} embeddings)\n"
+                f"  Remaining: ${max(0, d_limit - d_total):.4f}\n\n"
+                f"THIS MONTH ({month})\n"
+                f"{m_bar} {m_pct:.1f}%\n"
+                f"  Total:     ${m_total:.2f} / ${m_limit:.2f}\n"
+                f"  Anthropic: ${m_anthro:.2f}\n"
+                f"  OpenAI:    ${m_openai:.3f}\n"
+                f"  Remaining: ${max(0, m_limit - m_total):.2f}",
+                markdown=False,
+            )
+        except Exception as e:
+            await self._send(f"Budget error: {e}", markdown=False)
 
     async def _cmd_signals(self, args: list) -> None:
         """Recent signals from Redis."""
