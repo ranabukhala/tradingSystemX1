@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     market_afterhours_end: str = "20:00"
 
     # ── LLM Cost Controls ─────────────────────────────────────
-    llm_daily_budget_usd: float = 25.0
+    llm_daily_budget_usd: float = 15.0
     llm_monthly_budget_usd: float = 500.0  # Monthly LLM budget cap (all providers)
     llm_t2_impact_threshold: float = 0.6
     llm_fulltext_impact_threshold: float = 0.7

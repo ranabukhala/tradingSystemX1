@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -463,6 +464,61 @@ class AISummarizerService(BaseConsumer):
             # Still emit but without AI fields — downstream can join on cluster_id
             summarized = SummarizedRecord(**enriched.model_dump())
             return summarized.to_kafka_dict()
+
+        # ── Staleness gate — skip articles delivered too late ──────────────
+        _STALENESS_ENABLED = os.environ.get(
+            "ENABLE_STALENESS_GATE", "true").lower() == "true"
+        _STALENESS_MULTIPLIER = float(os.environ.get(
+            "STALENESS_MULTIPLIER", "1.5"))
+
+        if _STALENESS_ENABLED and enriched.published_at and enriched.received_at:
+            pub = enriched.published_at
+            rec = enriched.received_at
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if rec.tzinfo is None:
+                rec = rec.replace(tzinfo=timezone.utc)
+
+            staleness_minutes = (rec - pub).total_seconds() / 60
+            max_staleness = (enriched.decay_minutes or 60) * _STALENESS_MULTIPLIER
+
+            if staleness_minutes > max_staleness:
+                _log("info", "ai_summarizer.skip_stale",
+                     vendor_id=enriched.vendor_id,
+                     staleness_min=round(staleness_minutes),
+                     max_staleness_min=round(max_staleness),
+                     decay_min=enriched.decay_minutes,
+                     ticker=enriched.tickers[0] if enriched.tickers else "unknown",
+                     title=enriched.title[:60])
+                summarized = SummarizedRecord(**enriched.model_dump())
+                return summarized.to_kafka_dict()
+        # ──────────────────────────────────────────────────────────────────
+
+        # ── Skip articles with no tickers — saves LLM budget ─────────────
+        # Articles without resolved tickers will always hit skip_no_tickers
+        # at the aggregator. Running T1 on them is pure cost waste.
+        # Exception: keep articles with high-value catalyst types since
+        # the LLM might extract tickers from the title.
+        _SKIP_NO_TICKER_ENABLED = os.environ.get(
+            "SKIP_NO_TICKER_ARTICLES", "true").lower() == "true"
+
+        _HIGH_VALUE_CATALYSTS = {
+            CatalystType.EARNINGS,
+            CatalystType.MA,
+            CatalystType.REGULATORY,
+            CatalystType.ANALYST,
+        }
+
+        if (_SKIP_NO_TICKER_ENABLED
+                and not enriched.tickers
+                and enriched.catalyst_type not in _HIGH_VALUE_CATALYSTS):
+            _log("debug", "ai_summarizer.skip_no_tickers_pre_llm",
+                 vendor_id=enriched.vendor_id,
+                 catalyst=enriched.catalyst_type.value,
+                 title=enriched.title[:60])
+            summarized = SummarizedRecord(**enriched.model_dump())
+            return summarized.to_kafka_dict()
+        # ──────────────────────────────────────────────────────────────────
 
         # ── Fast-path routing ─────────────────────────────────────────────────
         # Check whether structured vendor data is sufficient to bypass T1/T2 LLM.

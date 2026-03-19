@@ -415,8 +415,10 @@ services:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       POSTGRES_HOST: postgres
       FINLIGHT_API_KEY: ${FINLIGHT_API_KEY}
+      FINLIGHT_WS_KEY: ${FINLIGHT_WS_KEY}
       FINLIGHT_LANGUAGE: en
       FINLIGHT_COUNTRIES: US
+      FINLIGHT_USE_KNOWN_TICKERS: "true"
       ENABLE_REDIS_SENTIMENT: "true"
     ports:
       - "8007:8007"
@@ -517,9 +519,13 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      LLM_DAILY_BUDGET_USD: ${LLM_DAILY_BUDGET_USD:-25.0}
+      LLM_DAILY_BUDGET_USD: ${LLM_DAILY_BUDGET_USD:-15.0}
       LLM_MONTHLY_BUDGET_USD: ${LLM_MONTHLY_BUDGET_USD:-500.0}
       LLM_T2_IMPACT_THRESHOLD: ${LLM_T2_IMPACT_THRESHOLD:-0.6}
+      SKIP_NO_TICKER_ARTICLES: "true"
+      ENABLE_STALENESS_GATE: "true"
+      STALENESS_MULTIPLIER: "1.5"
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8021:8021"
 

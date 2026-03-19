@@ -58,10 +58,15 @@ class FinlightConnector:
     """
 
     def __init__(self) -> None:
-        self._api_key: str = os.environ.get("FINLIGHT_API_KEY", "")
+        # Prefer dedicated WS key; fall back to general API key
+        self._api_key: str = os.environ.get("FINLIGHT_WS_KEY", "") or os.environ.get("FINLIGHT_API_KEY", "")
         self._language: str = os.environ.get("FINLIGHT_LANGUAGE", "en")
         self._countries: str = os.environ.get("FINLIGHT_COUNTRIES", "US")
         self._query: str = os.environ.get("FINLIGHT_QUERY", "")
+        self._tickers_env: str = os.environ.get("FINLIGHT_TICKERS", "")
+        self._use_known_tickers: bool = (
+            os.environ.get("FINLIGHT_USE_KNOWN_TICKERS", "true").lower() == "true"
+        )
         self._redis_url: str = os.environ.get("REDIS_URL", "redis://redis:6379/0")
         self._enable_redis_sentiment: bool = (
             os.environ.get("ENABLE_REDIS_SENTIMENT", "true").lower() == "true"
@@ -137,6 +142,29 @@ class FinlightConnector:
         self._running = False
         _log("info", "finlight_ws.stop_requested")
 
+    def _resolve_tickers(self) -> list[str]:
+        """Resolve ticker list for WebSocket subscription filter."""
+        # 1. Explicit env var takes priority
+        if self._tickers_env:
+            tickers = [t.strip() for t in self._tickers_env.split(",") if t.strip()]
+            _log("info", "finlight_ws.ticker_filter",
+                 source="env", count=len(tickers))
+            return tickers
+
+        # 2. Use shared known-ticker universe
+        if self._use_known_tickers:
+            from app.known_tickers import KNOWN_TICKERS
+            tickers = sorted(KNOWN_TICKERS)
+            _log("info", "finlight_ws.ticker_filter",
+                 source="known_tickers", count=len(tickers))
+            return tickers
+
+        # 3. Wildcard fallback (not recommended — high volume + cost)
+        _log("warning", "finlight_ws.ticker_filter",
+             source="wildcard", count=0,
+             msg="Using wildcard — consider enabling FINLIGHT_USE_KNOWN_TICKERS")
+        return ["*"]
+
     async def _connect_and_stream(self) -> None:
         from finlight_client import ApiConfig, FinlightApi, WebSocketOptions
         from finlight_client.models import GetArticlesWebSocketParams
@@ -147,10 +175,14 @@ class FinlightConnector:
             websocket_options=WebSocketOptions(takeover=True),
         )
 
+        tickers = self._resolve_tickers()
+
         params = GetArticlesWebSocketParams(
             language=self._language,
             includeEntities=True,
         )
+        if tickers != ["*"]:
+            params.tickers = tickers
         if self._query:
             params.query = self._query
         if self._countries:
@@ -158,7 +190,8 @@ class FinlightConnector:
 
         _log("info", "finlight_ws.connecting",
              language=self._language,
-             countries=self._countries)
+             countries=self._countries,
+             ticker_count=len(tickers))
 
         # finlight-client handles the 2-hour AWS API Gateway reconnect internally
         await client.websocket.connect(
