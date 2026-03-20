@@ -49,7 +49,7 @@ def _log(level: str, event: str, **kw) -> None:
 POLYGON_BASE = "https://api.polygon.io"
 
 # Minimum 0-10 score required to pass; override via env var
-SCORE_THRESHOLD = int(os.environ.get("TECHNICAL_SCORE_THRESHOLD", "7"))
+SCORE_THRESHOLD = int(os.environ.get("TECHNICAL_SCORE_THRESHOLD", "6"))
 
 
 # ── Data model ─────────────────────────────────────────────────────────────────
