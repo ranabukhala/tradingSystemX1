@@ -304,13 +304,16 @@ class PreTradeFilterService(BaseConsumer):
         # threshold (7, 8, or 9) based on trend regime and price cleanliness.
         # We re-evaluate the block decision here — without touching technicals.py.
         tech_score_val = getattr(tech, "technical_score", None)
+        _max_ctx_threshold = int(os.environ.get("MAX_CONTEXT_THRESHOLD", "10"))
         if stock_ctx is not None and tech_score_val is not None:
-            ctx_threshold = int(stock_ctx.get("adjusted_threshold", 8))
+            raw_ctx_threshold = int(stock_ctx.get("adjusted_threshold", 7))
+            ctx_threshold = min(raw_ctx_threshold, _max_ctx_threshold)
             if tech_score_val < ctx_threshold and not getattr(tech, "blocked", False):
                 # Context requires a higher bar than the static env var
                 ctx_block_reason = (
                     f"Context threshold {ctx_threshold}/10 not met "
-                    f"(score={tech_score_val}, "
+                    f"(raw={raw_ctx_threshold}, cap={_max_ctx_threshold}, "
+                    f"score={tech_score_val}, "
                     f"trend={stock_ctx.get('trend_regime')}, "
                     f"cleanliness={stock_ctx.get('cleanliness')})"
                 )
@@ -318,6 +321,8 @@ class PreTradeFilterService(BaseConsumer):
                      ticker=ticker, direction=direction,
                      tech_score=tech_score_val,
                      ctx_threshold=ctx_threshold,
+                     raw_threshold=raw_ctx_threshold,
+                     max_cap=_max_ctx_threshold,
                      trend=stock_ctx.get("trend_regime"),
                      cleanliness=stock_ctx.get("cleanliness"))
                 await self._update_signal_log(record, conviction_in, 0.0,

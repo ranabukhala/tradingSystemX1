@@ -681,6 +681,15 @@ services:
       RISK_TAKE_PROFIT_PCT: ${RISK_TAKE_PROFIT_PCT:-0.10}
       RISK_STOP_LOSS_PCT: ${RISK_STOP_LOSS_PCT:-0.04}
       RISK_USE_BRACKET_ORDERS: ${RISK_USE_BRACKET_ORDERS:-true}
+      # Staleness windows — relaxed for paper trading pipeline latency (seconds)
+      STALENESS_EARNINGS_MAX_AGE: "1200"
+      STALENESS_MA_MAX_AGE: "3600"
+      STALENESS_REGULATORY_MAX_AGE: "1800"
+      STALENESS_ANALYST_MAX_AGE: "5400"
+      STALENESS_MACRO_MAX_AGE: "2400"
+      STALENESS_FILING_MAX_AGE: "3600"
+      STALENESS_LEGAL_MAX_AGE: "10800"
+      STALENESS_OTHER_MAX_AGE: "3600"
     ports:
       - "8041:8041"
 
@@ -973,6 +982,16 @@ services:
       USE_PRETRADE_FILTER: "true"
       TECHNICAL_SCORE_THRESHOLD: "7"    # 0-10 composite score; min to pass filter (static fallback)
       CONTEXT_SERVICE_URL: "http://stock_context_service:8082"  # dynamic threshold source
+      MAX_CONTEXT_THRESHOLD: "7"       # Cap context escalation for paper trading
+      # Staleness windows — relaxed for paper trading pipeline latency (seconds)
+      STALENESS_EARNINGS_MAX_AGE: "1200"
+      STALENESS_MA_MAX_AGE: "3600"
+      STALENESS_REGULATORY_MAX_AGE: "1800"
+      STALENESS_ANALYST_MAX_AGE: "5400"
+      STALENESS_MACRO_MAX_AGE: "2400"
+      STALENESS_FILING_MAX_AGE: "3600"
+      STALENESS_LEGAL_MAX_AGE: "10800"
+      STALENESS_OTHER_MAX_AGE: "3600"
     ports:
       - "8074:8074"
     healthcheck:
