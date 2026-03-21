@@ -21,6 +21,9 @@ async def run_service(name: str) -> None:
     elif name == "telegram_alerts":
         from app.signals.telegram_alerts import TelegramAlertsService
         service = TelegramAlertsService()
+    elif name == "diagnostics_reporter":
+        from app.signals.diagnostics_reporter import DiagnosticsReporter
+        service = DiagnosticsReporter()
     else:
         _log("error", "unknown_service", name=name)
         sys.exit(1)

@@ -586,6 +586,29 @@ services:
       start_period: 20s
 
 
+  signals_diagnostics_reporter:
+    <<: *connector
+    container_name: trading_diagnostics_reporter
+    entrypoint: ["python", "-m", "app.signals.__main__"]
+    command: ["diagnostics_reporter"]
+    environment:
+      SERVICE_NAME: diagnostics_reporter
+      METRICS_PORT: "8025"
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      TELEGRAM_TRAINING_BOT_TOKEN: ${TELEGRAM_TRAINING_BOT_TOKEN:-}
+      TELEGRAM_TRAINING_CHAT_ID: "-1003763136763"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-trading}:${POSTGRES_PASSWORD:-tradingpass}@postgres:5432/${POSTGRES_DB:-trading_db}
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8025:8025"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+
   # ══════════════════════════════════════════════════════════
   #  LAYER 6 — ADMIN SERVICES (Watchdog + Admin Bot)
   # ══════════════════════════════════════════════════════════
